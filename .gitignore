@@ -70,3 +70,5 @@ docs/tutorials
 
 # macOS temp files
 .DS_Store
+
+examples/ViT/imagenette2
