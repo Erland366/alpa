@@ -17,6 +17,10 @@ from alpa.util import (auto_donate_argnums, auto_static_argnums,
                        abstractify_with_aval, GradFuncTransformContext)
 from alpa.version import check_alpa_jaxlib_version
 
+from alpa.adaptdl import pollux_agent
+from flax.training import train_state
+import time
+
 traceback_util.register_exclusion(__file__)
 
 is_initialized = False
@@ -127,7 +131,12 @@ class ParallelizedFunc:
         """Launch the computation on the driver."""
         executable, _, out_tree, args_flat = (
             self._decode_args_and_get_executable(*args))
+        
+        iter_start = time.time()
         out = executable.launch_on_driver(*args_flat)
+        t_iter = time.time() - iter_start
+        # TODO: handle isinstance() with typing instead
+        pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)
         return tree_unflatten(out_tree(), out)
 
     def get_executable(self, *args):

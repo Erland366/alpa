@@ -63,6 +63,8 @@ ray_worker = try_import_ray_worker()
 if global_config.backend == "gpu" and global_config.has_cuda:
     from alpa.collective import worker_nccl_util
 
+from alpa.adaptdl import pollux_agent
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -867,6 +869,7 @@ class LocalPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.devices = devices if devices is not None else xb.local_devices()
         self.num_hosts = 1
         self.num_devices_per_host = len(self.devices)
+        pollux_agent.alloc_vector = [self.num_devices_per_host]
         self.mesh_id = -1
         self.device_strs = []
         self.operation_executables = {}
@@ -2166,6 +2169,8 @@ class DeviceCluster:
             number = host_info["Resources"][global_config.ray_accelerator_name]
             assert number.is_integer()
             all_host_num_devices.append(int(number))
+        
+        pollux_agent.alloc_vector = all_host_num_devices
 
         # adjust the resource allocations
         # if `num_nodes` is set, use it.
