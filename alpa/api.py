@@ -129,8 +129,10 @@ class ParallelizedFunc:
     @traceback_util.api_boundary
     def __call__(self, *args):
         """Launch the computation on the driver."""
+        compil_start = time.time()
         executable, _, out_tree, args_flat = (
             self._decode_args_and_get_executable(*args))
+        print(f"Compil took {time.time() - compil_start} seconds") # TODO: remove this
         
         iter_start = time.time()
         out = executable.launch_on_driver(*args_flat)

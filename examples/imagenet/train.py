@@ -45,6 +45,8 @@ import tensorflow_datasets as tfds
 import input_pipeline
 import models
 
+from alpa.adaptdl import pollux_agent
+
 
 NUM_CLASSES = 1000
 
@@ -311,9 +313,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   # step_offset > 0 if restarting from checkpoint
   step_offset = int(state.step)
 
+  method = alpa.PipeshardParallel(stage_option="uniform")
+  # method = alpa.ShardParallel()
   p_train_step = alpa.parallelize(
-      functools.partial(train_step, learning_rate_fn=learning_rate_fn))
+      functools.partial(train_step, learning_rate_fn=learning_rate_fn), method=method)
   p_eval_step = alpa.parallelize(eval_step, donate_argnums=())
+  
+  pollux_agent.total_batch_size = config.batch_size
 
   logging.info('Initial compilation. This might take some minutes...')
   batch = {

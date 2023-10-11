@@ -11,6 +11,7 @@ class PolluxAgent:
         self.t_compilation = None
         self.dataset_size = None
         self.alloc_vector = None # allocation vector in AdaptDL
+        self.training_dp_cost = None
         print("PolluxAgent initialized.")
     
     def report_iteration(self, state, t_iter):
@@ -21,6 +22,7 @@ class PolluxAgent:
         self.throughputs.append(self.total_batch_size / t_iter)
         if self.iter % 20 == 0: # printing for debugging purposes # TODO remove this
             print(f"Iteration #{self.iter}. Time taken - {t_iter} seconds. Throughput - {self.throughputs[-1]} samples/sec. \
-                All-time average throughput - {sum(self.throughputs) / len(self.throughputs)}.")
+                All-time average throughput - {sum(self.throughputs) / len(self.throughputs)}.\n \
+                    Training DP cost - {self.training_dp_cost}")
     
 pollux_agent = PolluxAgent()

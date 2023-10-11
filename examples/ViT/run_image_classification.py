@@ -54,6 +54,10 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
 from alpa.adaptdl import pollux_agent
+import numpy as np
+
+def count_params(model):
+    return sum(x.size for x in jax.tree_leaves(model))
 
 alpa.init(cluster="ray")
 logger = logging.getLogger(__name__)
@@ -474,12 +478,14 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    # method = alpa.Zero2Parallel()
-    method = alpa.PipeshardParallel()
-    # method = alpa.ShardParallel()
-    p_train_step = alpa.parallelize(train_step,
-                                    method=method,
-                                    donate_argnums=(0,))
+    # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
+    method = alpa.PipeshardParallel(stage_option="auto")
+    # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
+    # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
+    # p_train_step = alpa.parallelize(train_step,
+                                    # method=method,
+                                    # donate_argnums=(0,))
+    p_train_step = alpa.parallelize(train_step, method=method)
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -489,6 +495,8 @@ def main():
     logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
     logger.info(f"  Total optimization steps = {total_train_steps}")
+    
+    logger.info(f"Number of parameters - {count_params(model.params)}")
 
     train_time = 0
     last_time = time.time()
@@ -507,6 +515,19 @@ def main():
         # train
         for step, batch in enumerate(train_loader):
             # print("Entering new iteration (step):")
+            # print(f"Shape - {batch['pixel_values'].shape}, type - {type(batch['pixel_values'])}") # keys -  ['pixel_values', 'labels']
+            # print(f"Shape - {batch['labels'].shape}, type - {type(batch['labels'])}")
+            
+            # ##
+            
+            # print(f"Shape - {np.concatenate([batch['pixel_values'], batch['pixel_values']]).shape}") # keys -  ['pixel_values', 'labels']
+            # print(f"Shape - {np.concatenate([batch['labels'], batch['labels']]).shape}")
+            
+            # if epoch == 1 or epoch == 3:
+                # print("Increasing batch size twice.")
+                # batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
+                # batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
+            
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
