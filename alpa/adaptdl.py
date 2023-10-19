@@ -1,4 +1,5 @@
 import time
+import numpy as np
 
 class PolluxAgent:
     def __init__(self, state=None):
@@ -22,7 +23,9 @@ class PolluxAgent:
         self.throughputs.append(self.total_batch_size / t_iter)
         if self.iter % 20 == 0: # printing for debugging purposes # TODO remove this
             print(f"Iteration #{self.iter}. Time taken - {t_iter} seconds. Throughput - {self.throughputs[-1]} samples/sec. \
-                All-time average throughput - {sum(self.throughputs) / len(self.throughputs)}.\n \
-                    Training DP cost - {self.training_dp_cost}")
+                Median/mean throughput - {np.median(np.array(self.throughputs))} / {np.mean(np.array(self.throughputs))}.\n \
+                    Training DP cost - {self.training_dp_cost} \
+                        Median/mean iteration time - {np.median(np.array(self.t_iters))} / {np.mean(np.array(self.t_iters))} \
+                            Compilation time - {self.t_compilation}")
     
 pollux_agent = PolluxAgent()

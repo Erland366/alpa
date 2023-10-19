@@ -20,7 +20,7 @@ Here is the full list of checkpoints on the hub that can be fine-tuned by this s
 https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
-
+import torch
 import json
 import logging
 import math
@@ -62,6 +62,11 @@ from transformers import (
 )
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
+
+from alpa.adaptdl import pollux_agent
+
+def count_params(model):
+    return sum(x.size for x in jax.tree_leaves(model))
 
 alpa.init(cluster="ray")
 tf.config.experimental.set_visible_devices([], 'GPU')
@@ -621,6 +626,8 @@ def main():
     eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
+    
+    pollux_agent.total_batch_size = train_batch_size
 
     # Create learning rate schedule
     linear_decay_lr_schedule_fn = create_learning_rate_fn(
@@ -729,7 +736,9 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
+    # method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
+    # method = alpa.PipeshardParallel()
+    method = alpa.PipeshardParallel(stage_option='auto')
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
@@ -744,6 +753,7 @@ def main():
     logger.info(f"  Batch size per device (w. accumulation) = {training_args.per_device_train_batch_size}")
     logger.info(f"  Global train batch size (w. parallel & distributed) = {train_batch_size}")
     logger.info(f"  Total optimization steps = {total_train_steps}")
+    logger.info(f"Number of parameters - {count_params(model.params)}")
 
     train_time = 0
     train_metrics = []
@@ -816,42 +826,42 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            if cur_step % training_args.eval_steps == 0 and cur_step > 0:
-                # ======================== Evaluating ==============================
-                eval_metrics = []
-                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size, min_batch_size)
-                eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
-                    # Model forward
-                    batch = next(eval_loader)
-                    metrics = p_eval_step(state.params, batch)
-                    eval_metrics.append(metrics)
+            # if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+            #     # ======================== Evaluating ==============================
+            #     eval_metrics = []
+            #     eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size, min_batch_size)
+            #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+            #     for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+            #         # Model forward
+            #         batch = next(eval_loader)
+            #         metrics = p_eval_step(state.params, batch)
+            #         eval_metrics.append(metrics)
 
-                    if dump_debug_info_eval_step:
-                        dump_debug_info_eval_step = False
-                        executable = p_eval_step.get_last_executable()
-                        executable.dump_debug_info("alpa_debug_info")
+            #         if dump_debug_info_eval_step:
+            #             dump_debug_info_eval_step = False
+            #             executable = p_eval_step.get_last_executable()
+            #             executable.dump_debug_info("alpa_debug_info")
 
-                # normalize eval metrics
-                eval_metrics = alpa.util.get_metrics(eval_metrics)
-                eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+            #     # normalize eval metrics
+            #     eval_metrics = alpa.util.get_metrics(eval_metrics)
+            #     eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                try:
-                    eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-                except OverflowError:
-                    eval_metrics["perplexity"] = float("inf")
+            #     try:
+            #         eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+            #     except OverflowError:
+            #         eval_metrics["perplexity"] = float("inf")
 
-                # Print metrics and update progress bar
-                desc = (
-                    f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
-                    f" {eval_metrics['perplexity']})"
-                )
-                epochs.write(desc)
-                epochs.desc = desc
+            #     # Print metrics and update progress bar
+            #     desc = (
+            #         f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+            #         f" {eval_metrics['perplexity']})"
+            #     )
+            #     epochs.write(desc)
+            #     epochs.desc = desc
 
-                # Save metrics
-                if has_tensorboard:
-                    write_eval_metric(summary_writer, eval_metrics, cur_step)
+            #     # Save metrics
+            #     if has_tensorboard:
+            #         write_eval_metric(summary_writer, eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
