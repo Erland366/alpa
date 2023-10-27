@@ -53,7 +53,7 @@ from transformers import (
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
-from alpa.adaptdl import pollux_agent
+from alpa.adaptdl.pollux_agent import pollux_agent
 import numpy as np
 
 def count_params(model):
@@ -479,7 +479,7 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    method = alpa.PipeshardParallel(stage_option="auto")
+    method = alpa.PipeshardParallel(stage_option="uniform")
     # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
     # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,

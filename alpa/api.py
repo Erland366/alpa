@@ -17,7 +17,7 @@ from alpa.util import (auto_donate_argnums, auto_static_argnums,
                        abstractify_with_aval, GradFuncTransformContext)
 from alpa.version import check_alpa_jaxlib_version
 
-from alpa.adaptdl import pollux_agent
+from alpa.adaptdl.pollux_agent import pollux_agent
 from flax.training import train_state
 import time
 
@@ -138,6 +138,7 @@ class ParallelizedFunc:
         
         iter_start = time.time()
         out = executable.launch_on_driver(*args_flat)
+        executable.sync() # synchronization for correct time measurement (TODO: remove after experimenting)
         t_iter = time.time() - iter_start
         # TODO: handle isinstance() with typing instead
         pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)

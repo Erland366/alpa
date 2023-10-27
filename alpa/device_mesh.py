@@ -63,7 +63,7 @@ ray_worker = try_import_ray_worker()
 if global_config.backend == "gpu" and global_config.has_cuda:
     from alpa.collective import worker_nccl_util
 
-from alpa.adaptdl import pollux_agent
+from alpa.adaptdl.pollux_agent import pollux_agent
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

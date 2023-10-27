@@ -20,7 +20,7 @@ from alpa.shard_parallel.auto_sharding import AutoShardingOption
 from alpa.timer import timers
 from alpa.util import OrderedSet, maybe_numba_jit, jaxpr_to_hlo
 
-from alpa.adaptdl import pollux_agent
+from alpa.adaptdl.pollux_agent import pollux_agent
 import time
 
 logger = logging.getLogger(__name__)
