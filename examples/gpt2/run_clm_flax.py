@@ -63,7 +63,7 @@ from transformers import (
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
-from alpa.adaptdl import pollux_agent
+from alpa.adaptdl.pollux_agent import pollux_agent
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
