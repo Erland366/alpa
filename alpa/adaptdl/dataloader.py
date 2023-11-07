@@ -256,9 +256,10 @@ class AdaptiveDataLoaderHelper(object):
         if not self._state.current_local_bsz:
             # self._state.current_local_bsz = 1
             self._state.current_local_bsz = math.ceil(
-                self.batch_size / alpa.get_global_num_devices()) # TODO: change 4 to actual number of GPUs
+                self.batch_size / alpa.get_global_num_devices())
             self._state.accumulation_steps = 0
-        elif (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
+        elif self.max_batch_size is not None and \
+            (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
                 self._state.current_local_bsz += 2
         return self._state.current_local_bsz * alpa.get_global_num_devices()
         # goodput_fn = get_goodput_fn()
