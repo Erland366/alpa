@@ -88,7 +88,8 @@ install_require_list = [
     "chex==0.1.5",
     "flax==0.6.2",
     "pulp>=2.6.0",
-    "numpy>=1.20",
+    "numpy==1.23.0",
+    "grpcio=1.43.0",
     "numba",
 ]
 
@@ -96,7 +97,7 @@ dev_require_list = ["yapf==0.32.0", "pylint==2.14.0", "cmake", "pybind11"]
 
 if HAS_CUDA:
     dev_require_list += [
-        f"cupy-cuda{get_cuda_version_str(no_dot=True)}",
+        f"cupy-cuda11x",
     ]
 
 doc_require_list = [

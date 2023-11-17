@@ -214,7 +214,7 @@ def get_bazel_version(bazel_path):
 
 
 def write_bazelrc(*, python_bin_path, remote_build,
-                  cuda_toolkit_path, cudnn_install_path,
+                  cuda_toolkit_path, cudnn_install_path, nccl_install_path, 
                   cuda_version, cudnn_version, rocm_toolkit_path,
                   cpu, cuda_compute_capabilities,
                   rocm_amdgpu_targets, bazel_options, target_cpu_features,
@@ -268,6 +268,7 @@ def write_bazelrc(*, python_bin_path, remote_build,
 
     for o in bazel_options:
       f.write(f"build {o}\n")
+    f.write(f"build --action_env NCCL_INSTALL_PATH={nccl_install_path}\n")
     if target_cpu_features == "release":
       if wheel_cpu == "x86_64":
         f.write("build --config=avx_windows\n" if is_windows()
@@ -414,6 +415,10 @@ def main():
       default=None,
       help="Path to CUDNN libraries.")
   parser.add_argument(
+      "--nccl_path",
+      default=None,
+      help="Path to NCCL libraries.")
+  parser.add_argument(
       "--cuda_version",
       default=None,
       help="CUDA toolkit version, e.g., 11.1")
@@ -509,6 +514,7 @@ def main():
 
   cuda_toolkit_path = args.cuda_path
   cudnn_install_path = args.cudnn_path
+  nccl_install_path = args.nccl_path
   rocm_toolkit_path = args.rocm_path
   print("CUDA enabled: {}".format("yes" if args.enable_cuda else "no"))
   if args.enable_cuda:
@@ -540,6 +546,7 @@ def main():
       remote_build=args.remote_build,
       cuda_toolkit_path=cuda_toolkit_path,
       cudnn_install_path=cudnn_install_path,
+      nccl_install_path=nccl_install_path,
       cuda_version=args.cuda_version,
       cudnn_version=args.cudnn_version,
       rocm_toolkit_path=rocm_toolkit_path,
