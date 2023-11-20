@@ -83,13 +83,13 @@ def get_cuda_version_str(no_dot=False):
 
 install_require_list = [
     "tqdm",
-    "ray",
+    "ray==2.1.0",
     "jax==0.3.22",
     "chex==0.1.5",
     "flax==0.6.2",
     "pulp>=2.6.0",
     "numpy==1.23.0",
-    "grpcio=1.43.0",
+    "grpcio==1.43.0",
     "numba",
 ]
 
