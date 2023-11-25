@@ -55,6 +55,7 @@ from transformers.utils import get_full_repo_name, send_example_telemetry
 
 from alpa.adaptdl.pollux_agent import pollux_agent
 import numpy as np
+from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
@@ -479,8 +480,12 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    method = alpa.PipeshardParallel(stage_option="uniform")
-    # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
+    method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="manual", 
+                                                                      manually_specified_submeshes=[(1, 4)]))
+    # method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="power_of_two"))
+    # method = alpa.PipeshardParallel(stage_option="auto")
+    # method = alpa.PipeshardParallel(stage_option="uniform")
+    # method = alpa.PipeshardParallel() # average throughput for per-GPU batch size 64 - 16023
     # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
@@ -501,6 +506,8 @@ def main():
     train_time = 0
     last_time = time.time()
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+
+    switched_bs = False
 
     for epoch in epochs:
         # ======================== Training ================================
@@ -523,10 +530,52 @@ def main():
             # print(f"Shape - {np.concatenate([batch['pixel_values'], batch['pixel_values']]).shape}") # keys -  ['pixel_values', 'labels']
             # print(f"Shape - {np.concatenate([batch['labels'], batch['labels']]).shape}")
             
+            # if isinstance(state.step, alpa.device_mesh.DistributedArray):
+            #     step_backup = state.step._value
+            # else:
+            #     step_backup = state.step
+                
+            # flattened_opt_state = tree_flatten(state.opt_state)
+            # for i, leaf in enumerate(flattened_opt_state[0]):
+            #     if isinstance(leaf, alpa.device_mesh.DistributedArray):
+            #         flattened_opt_state[0][i] = leaf._value
+            # unflattened_opt_state = tree_unflatten(flattened_opt_state[1], flattened_opt_state[0])
+            
+            # flattened_params = tree_flatten(state.params)
+            # for i, leaf in enumerate(flattened_params[0]):
+            #     if isinstance(leaf, alpa.device_mesh.DistributedArray):
+            #         flattened_params[0][i] = leaf._value
+            # unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
+            
+            # state = state.replace(step=step_backup, opt_state=unflattened_opt_state, params=unflattened_params)
+            
             # if epoch == 1 or epoch == 3:
-                # print("Increasing batch size twice.")
-                # batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
-                # batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
+            # if epoch == 1:
+            #     batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
+            #     batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
+            # if epoch == 1 and not switched_bs:
+            #     print(f"GLOBAL PHYSICAL MESH before shutdown - {alpa.get_global_physical_mesh(create_if_not_exist=False)}")
+            #     switched_bs = True
+            #     step_val = state.step._value
+                
+            #     flattened_opt_state = tree_flatten(state.opt_state)
+            #     for i, leaf in enumerate(flattened_opt_state[0]):
+            #         if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+            #             flattened_opt_state[0][i] = leaf._value
+            #     unflattened_opt_state = tree_unflatten(flattened_opt_state[1], flattened_opt_state[0])
+                
+            #     flattened_params = tree_flatten(state.params)
+            #     for i, leaf in enumerate(flattened_params[0]):
+            #         if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+            #             flattened_params[0][i] = leaf._value
+            #     unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
+                
+            #     state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params)
+            #     print("Increasing batch size twice.")
+            #     alpa.shutdown()
+            #     alpa.clear_executable_cache()
+            #     alpa.init(cluster='ray')
+            #     # print(f"GLOBAL PHYSICAL MESH after shutdown - {alpa.get_global_cluster().get_physical_mesh()}")
             
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
@@ -554,6 +603,15 @@ def main():
             f" {train_metric['learning_rate']}), "
             f"Throughput: {images_per_second:.2f} images/s"
         )
+        
+        # print("RESTARTING ALPA")
+        # restart_start = time.time()
+        # alpa.shutdown()
+        # alpa.init(cluster='ray')
+        # print(f"TIME TO RESTART - {time.time() - restart_start} seconds")
+        # p_train_step = alpa.parallelize(train_step, method=method)
+        # p_eval_step = alpa.parallelize(eval_step)
+        # dump_debug_info_train_step = dump_debug_info_eval_step = True
 
         # # ======================== Evaluating ==============================
         # eval_metrics = []
