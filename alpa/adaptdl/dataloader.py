@@ -533,6 +533,12 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     # Increment by the number of data samples processed
                     self._elastic.current_index += \
                         num_replicas * self.batch_sampler.batch_size
+                    
+                    # if idx == 20: # #TODO: invoking batch size change between iteration - works
+                    #     self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
+                    #     LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
+                    #     LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
+                    #     LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
                         
                     # TODO: below code should be uncommented and progress 
                     # should be based on PGNS from JAX
