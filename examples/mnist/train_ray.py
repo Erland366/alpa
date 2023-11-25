@@ -35,6 +35,7 @@ import ml_collections
 import numpy as np
 import optax
 import tensorflow_datasets as tfds
+from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 
 
 class CNN(nn.Module):
@@ -55,7 +56,6 @@ class CNN(nn.Module):
     return x
 
 
-@alpa.parallelize
 def train_step(state, images, labels):
   """Computes gradients, loss and accuracy for a single batch."""
   def loss_fn(params):
@@ -80,13 +80,13 @@ def eval_step(state, images, labels):
   return loss, accuracy
 
 
-def train_epoch(state, train_data_loader, steps_per_epoch):
+def train_epoch(state, train_data_loader, steps_per_epoch, train_step):
   """Train for a single epoch."""
   epoch_loss = []
   epoch_accuracy = []
 
   for i in range(steps_per_epoch):
-    batch_images, batch_labels = next(train_data_loader)
+    batch_images, batch_labels = next(train_data_loader)     
     state, loss, accuracy = train_step(state, batch_images, batch_labels)
     epoch_loss.append(loss)
     epoch_accuracy.append(accuracy)
@@ -118,7 +118,7 @@ def create_train_state(rng, config):
       apply_fn=cnn.apply, params=params, tx=tx)
 
 
-def get_train_data_loader(train_ds, state, batch_size):
+def get_train_data_loader(train_ds, state, batch_size, train_step):
   images_np = train_ds['image']
   labels_np = train_ds['label']
   steps_per_epoch = len(images_np) // batch_size
@@ -163,13 +163,23 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   rng = jax.random.PRNGKey(0)
   state = create_train_state(rng, config)
 
+  p_train_step = alpa.parallelize(train_step, method=alpa.ShardParallel())
+
   train_data_loader, steps_per_epoch = get_train_data_loader(
-      train_ds, state, config.batch_size)
+      train_ds, state, config.batch_size, p_train_step)
 
   for epoch in range(1, config.num_epochs + 1):
     tic = time.time()
     state, train_loss, train_accuracy = train_epoch(state, train_data_loader,
-                                                    steps_per_epoch)
+                                                    steps_per_epoch, p_train_step)
+    print(f"GLOBAL PHYSICAL MESH - {alpa.get_global_physical_mesh()}")
+    # flattened_opt_state = tree_flatten(state.opt_state)
+    # flattened_opt_state[0][0] = flattened_opt_state[0][0]._value
+    # for i, leaf in enumerate(flattened_opt_state[0]):
+    #   if isinstance(leaf, alpa.device_mesh.DistributedArray):
+    #     flattened_opt_state[0][i] = leaf._value
+    # print(flattened_opt_state[0])
+    # unflattened_opt_state = tree_unflatten(flattened_opt_state[1], flattened_opt_state[0])
     epoch_time = time.time() - tic
     test_loss, test_accuracy = eval_step(state, test_ds['image'], test_ds['label'])
     test_accuracy = np.array(test_accuracy)
@@ -182,6 +192,37 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     summary_writer.scalar('train_accuracy', train_accuracy, epoch)
     summary_writer.scalar('test_loss', test_loss, epoch)
     summary_writer.scalar('test_accuracy', test_accuracy, epoch)
+    
+    if epoch == 10:
+      step_val = state.step._value
+      
+      flattened_opt_state = tree_flatten(state.opt_state)
+      for i, leaf in enumerate(flattened_opt_state[0]):
+        if isinstance(leaf, alpa.device_mesh.DistributedArray):
+          flattened_opt_state[0][i] = leaf._value
+      unflattened_opt_state = tree_unflatten(flattened_opt_state[1], flattened_opt_state[0])
+      
+      flattened_params = tree_flatten(state.params)
+      for i, leaf in enumerate(flattened_params[0]):
+        if isinstance(leaf, alpa.device_mesh.DistributedArray):
+          flattened_params[0][i] = leaf._value
+      unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
+      
+      state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params)
+      print(f"GLOBAL PHYSICAL MESH before shutdown - {alpa.get_global_physical_mesh()}")
+      # print(f"MESH WORKERS before shutdown - {alpa.get_global_physical_mesh().workers}")
+      # print(f"PHYSICAL MESH FROM CLUSTER before shutdown - {alpa.get_global_cluster().get_physical_mesh()}")
+      alpa.shutdown()
+      # alpa.clear_executable_cache()
+      # time.sleep(2)
+      alpa.init(cluster='ray')
+      print(f"GLOBAL PHYSICAL MESH after shutdown - {alpa.get_global_physical_mesh()}")
+      # print(f"MESH WORKERS after shutdown - {alpa.get_global_physical_mesh().workers}")
+      # print(f"GLOBAL CLUSTER - {alpa.get_global_cluster()}")
+      # print(f"PHYSICAL MESH FROM CLUSTER - {alpa.get_global_cluster().get_physical_mesh()}")
+      # print(f"MESH WORKERS after shutdown FROM CLUSTER after shutdown - {alpa.get_global_cluster().get_physical_mesh().workers}")
+      p_train_step = alpa.parallelize(train_step, method=alpa.ShardParallel())
+      train_data_loader, steps_per_epoch = get_train_data_loader(train_ds, state, config.batch_size, p_train_step)
 
   summary_writer.flush()
   return state
