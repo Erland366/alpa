@@ -1,14 +1,21 @@
+#!/bin/bash
+
+# EasyLM: 9757be87571e714da83f9311531c81db47953f63
 export PYTHONPATH=$HOME/EasyLM:$PYTHONPATH
+
+# ShareGPT dataset
+# https://github.com/lm-sys/FastChat/issues/90#issuecomment-1493250773
+
 python3 run_easylm_flax.py \
     --output_dir="./output" \
-    --model_name_or_path="/root/llama/llama-7b" \
-    --dataset_name="/root/data/sharegpt.json" \
+    --model_name_or_path="huggyllama/llama-7b" \
+    --dataset_name="$HOME/alpa_data/data/sg_90k_part1.json" \
     --do_train \
     --block_size="1024" \
     --per_device_train_batch_size="32" \
     --per_device_eval_batch_size="16" \
     --num_micro_batches 32 \
-    --operator_parallel 1 \
+    --operator_parallel 2 \
     --pipeline_parallel 1 \
     --dtype="float16" \
     --learning_rate="5e-4" --warmup_ratio="0.03" \
