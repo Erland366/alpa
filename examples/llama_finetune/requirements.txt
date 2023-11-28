@@ -1,9 +1,9 @@
 transformers==4.27.2
-datasets==2.9.0
+datasets
 sentencepiece
 tensorflow==2.11.0
 ml_collections
 mlxu==0.1.9
 fschat==0.2.5
 pydantic<2
-torch==1.13.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+torch==1.13.1+cpu -f https://download.pytorch.org/whl/cpu
