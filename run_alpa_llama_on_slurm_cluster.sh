@@ -4,6 +4,7 @@
 #SBATCH -N 2
 #SBATCH -n 2
 #SBATCH --gres=gpu:8
+#SBATCH --exclusive
 
 # Get names of nodes assigned
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -35,9 +36,6 @@ for ((i = 1; i <= worker_num; i++)); do
         ray start --address "$ip_head" --block &
     sleep 5
 done
-
-# Run Alpa test
-python3 -m alpa.test_install
 
 cd $HOME/alpa/examples/llama_finetune
 
