@@ -39,7 +39,7 @@ done
 
 cd $HOME/alpa/examples/llama_finetune
 
-# EasyLM: 9757be87571e714da83f9311531c81db47953f63
+# git clone https://github.com/zigzagcai/EasyLM
 export PYTHONPATH=$HOME/EasyLM:$PYTHONPATH
 
 # ShareGPT dataset
@@ -55,7 +55,7 @@ python3 run_easylm_flax.py \
     --per_device_eval_batch_size="16" \
     --num_micro_batches 32 \
     --operator_parallel 2 \
-    --pipeline_parallel 1 \
+    --pipeline_parallel 2 \
     --dtype="float16" \
     --learning_rate="5e-4" --warmup_ratio="0.03" \
     --weight_decay="0.0" \

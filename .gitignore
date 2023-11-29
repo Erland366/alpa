@@ -29,6 +29,7 @@ build_jaxlib/dist
 
 # Examples build and tmp files
 examples/build/
+examples/llama_finetune/output
 examples/mnist/mnist
 examples/imagenet/imagenet
 examples/ViT/imagenette2
