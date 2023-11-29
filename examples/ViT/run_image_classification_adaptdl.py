@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
+from jax.tree_util import tree_flatten, tree_unflatten
 
 # for dataset and preprocessing
 import torch
@@ -52,8 +53,11 @@ from transformers import (
     set_seed,
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
-
-import numpy as np
+from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale, extract_values_with_key, flatten
+from alpa.adaptdl.dataloader import current_dataloader
+from alpa.adaptdl.metrics import update_grad_params, update_progress
+from jax._src.config import flags
+#import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
@@ -401,7 +405,9 @@ def main():
         collate_fn=collate_fn,
     )
     
-    train_loader.autoscale_batch_size(max_batch_size = 96 * alpa.get_global_num_devices())
+    train_loader.autoscale_batch_size(max_batch_size = 96 * alpa.get_global_num_devices(), 
+                                      #local_bsz_bounds=(16, 96), gradient_accumulation=False)
+                                        local_bsz_bounds=(16, 96), gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
@@ -455,6 +461,14 @@ def main():
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
+    print('state is saved on: ', jax.tree_map(lambda x: x.device_buffer.device(), state.params))
+    pgns_gradients = extract_values_with_key(state.params)
+    #pgns_params = jax.device_put(pgns_params, jax.local_devices(backend='gpu')[0])
+    gns = GradientNoiseScale(state=pgns_gradients, 
+                             mp_scaler=None, 
+                             num_workers=alpa.get_global_num_devices(), 
+                             init_batch_size=train_batch_size)
+    
 
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
@@ -468,14 +482,75 @@ def main():
             logits = state.apply_fn(**batch, params=params, train=True)[0]
             loss = loss_fn(logits, labels)
             return loss
+        
+        def extract_values_with_key_2(structure):
+            flat_structure, tree_def = tree_flatten(structure)
+            #flattened_gradients = [node._value for node in flat_structure]
+            flattened_gradients = [node for node in flat_structure]
+    
+            #jax_tree = jax.tree_util.tree_map(lambda x: x if isinstance(x, jnp.ndarray) else jnp.asarray(x), flattened_gradients)
+            return (flattened_gradients)
+        
+        def sum_normsqr(normsqr):
+            return jnp.sum(normsqr)
+        
+        def normsqr_groups(grads, pinvs):
+            #ret = []
+            rett =  0.0
+            for group, pinv_group in zip(grads, pinvs):
+                temp = 0.0
+                for g, pinv in zip(group, pinv_group):
+                    temp += jnp.sum((g/pinv)**2)
+                rett += temp
+            return rett
+        
+        def normsqr_groups_2(grads, pinvs):
+            def inner_norm(group, pinv_group):
+                return jnp.sum(jnp.sum((group / pinv_group) ** 2, axis=-1))
+
+            normsqr_list = [
+                inner_norm(group, pinv_group) 
+                for group, pinv_group in zip(grads, pinvs)
+                ]
+    
+            return jnp.sum(jnp.array(normsqr_list))
+
+        def compute_gradsnorms(gradients, preconditioners, num_replicas, accum_scale, accum_count=False):
+            local_sqr_val = 0.0
+            #print('start computing local_sqr_val')
+            for grad, preconditioner in zip(gradients, preconditioners):
+                local_sqr_val += jnp.sum((grad/preconditioner)**2)
+            #print('end computing local_sqr_val')
+            #print('start computing grads_normsqr')
+            
+            grads_normsqr = normsqr_groups_2(gradients, preconditioners)
+            #print('end computing grads_normsqr')
+            count = num_replicas
+            scale = accum_scale
+
+            #return local_sqr_val, grads_normsqr, count, scale
+            return local_sqr_val
 
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
-
+        
+        pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
+        gradients=extract_values_with_key_2(grad)
+        preconditioners=extract_values_with_key_2(pinv)
+        
+        local_sqr_val = compute_gradsnorms(gradients=gradients, 
+                                            preconditioners=preconditioners, 
+                                            num_replicas=2, 
+                                            accum_scale=2)
+        
+        
+        #metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step), "local_sqr_val": local_sqr_val,
+                   #"grads_normsqr": grads_normsqr, "count": count, "scale": scale}
+        
         metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
 
-        return new_state, metrics
+        return new_state, metrics, pinv
 
     # Define eval fn
     def eval_step(params, batch):
@@ -490,13 +565,15 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    method = alpa.PipeshardParallel(stage_option="uniform")
+    method = alpa.PipeshardParallel(stage_option="uniform") #uniform
     # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
     # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
                                     # donate_argnums=(0,))
+    print('parallelize train_step - start')
     p_train_step = alpa.parallelize(train_step, method=method)
+    print('parallelize train_step - end')
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -526,21 +603,25 @@ def main():
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for step, batch in enumerate(train_loader):
-            # print("Entering new iteration (step):")
-            # print(f"Shape - {batch['pixel_values'].shape}, type - {type(batch['pixel_values'])}") # keys -  ['pixel_values', 'labels']
-            # print(f"Shape - {batch['labels'].shape}, type - {type(batch['labels'])}")
             
-            # ##
+            #print(f'jax.devices inside training loop: {jax.devices()}')
+            state, train_metric, pinv = p_train_step(state, batch)
+            #print('state.params is saved on: ', jax.tree_map(lambda x: x.device(), state.params))
+            #dataload = current_dataloader()
+            #gns.update_state(state)
+            #print(state)
+
+            #print(f'pinv: {pinv}')
+            print('------------------------------------------')
+            #print(f'metrics: {train_metric}')
             
-            # print(f"Shape - {np.concatenate([batch['pixel_values'], batch['pixel_values']]).shape}") # keys -  ['pixel_values', 'labels']
-            # print(f"Shape - {np.concatenate([batch['labels'], batch['labels']]).shape}")
+            if step == len(train_loader) -1:
+                timer = time.time()
+                #with jax.default_device(jax.devices()[0]):
+                #gns.compute_pgns(flattened_pinv)
+                #update_grad_params(gns.sqr_avg(), gns.var_avg())
+                print(f'time for pgns computation: {time.time() - timer}')
             
-            # if epoch == 1 or epoch == 3:
-                # print("Increasing batch size twice.")
-                # batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
-                # batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
-            
-            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step

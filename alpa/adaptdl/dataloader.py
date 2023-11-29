@@ -8,11 +8,17 @@ import pickle
 import random
 import torch
 from torch.utils.data import DataLoader, Sampler
+from alpa.adaptdl.metrics import set_batch_size, get_goodput_fn, get_progress
+from alpa.adaptdl.epoch import current_epoch
 
 import alpa
 import alpa.adaptdl
 import alpa.adaptdl.checkpoint
 import alpa.adaptdl.env
+
+import jax
+import jax.numpy as jnp
+
 from alpa.adaptdl.epoch import current_epoch
 
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +43,8 @@ class ElasticSampler(Sampler):
     def __init__(self, dataset, shuffle=True):
         self.dataset = dataset
         self.shuffle = shuffle
-        self.num_replicas = alpa.adaptdl.env.num_replicas() # should be 1 for Alpa because Alpa handles batch distribution by itself
+        #self.num_replicas = alpa.adaptdl.env.num_replicas() # should be 1 for Alpa because Alpa handles batch distribution by itself
+        self.num_replicas = alpa.get_global_num_devices()
         self.rank = 0 # alpa.adaptdl.env.replica_rank() TODO: currently hardcoded
         self.epoch = 0
         self.index = 0
@@ -132,6 +139,8 @@ class AdaptiveDataLoaderHelper(object):
         self._gradient_accumulation = False
         self._speedup_threshold = 1.05
         self._accum_count = 0
+        self._num_replicas = alpa.get_global_num_devices()
+        self._num_nodes = 1
 
     @property
     def current_index(self):
@@ -217,8 +226,8 @@ class AdaptiveDataLoaderHelper(object):
         """
         if AdaptiveDataLoaderHelper._training is None:
             AdaptiveDataLoaderHelper._training = self
-        # set_batch_size(self.batch_size, self.max_batch_size,
-                    #    self.local_bsz_bounds, self._gradient_accumulation)
+        set_batch_size(self.batch_size, self.max_batch_size,
+                       self.local_bsz_bounds, self._gradient_accumulation)
 
     def autoscale_batch_size(self, max_batch_size, local_bsz_bounds=None,
                              gradient_accumulation=False):
@@ -253,50 +262,55 @@ class AdaptiveDataLoaderHelper(object):
         Updates batch size if the newly suggested one is better by a significant margin.
         Temporarly for Alpa, this just periodically increases current batch size by increments of 2.
         """
-        if not self._state.current_local_bsz:
-            # self._state.current_local_bsz = 1
-            self._state.current_local_bsz = math.ceil(
-                self.batch_size / alpa.get_global_num_devices())
-            self._state.accumulation_steps = 0
-        elif self.max_batch_size is not None and \
-            (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
-                self._state.current_local_bsz += 2
-        return self._state.current_local_bsz * alpa.get_global_num_devices()
-        # goodput_fn = get_goodput_fn()
-        # if self.max_batch_size is None or goodput_fn is None:
-        #     # No autoscale batch size, just divide batch size evenly.
+        # if not self._state.current_local_bsz:
+        #     # self._state.current_local_bsz = 1
         #     self._state.current_local_bsz = math.ceil(
-        #         self.batch_size / adaptdl.env.num_replicas())
+        #         self.batch_size / alpa.get_global_num_devices())
         #     self._state.accumulation_steps = 0
-        # elif not self._state.current_local_bsz:
-        #     # if init, use the batch size suggested
-        #     _, atomic_bsz, accum_steps = goodput_fn.optimize(
-        #         adaptdl.env.num_nodes(), adaptdl.env.num_replicas(),
-        #         max_batch_size=self._max_batch_size,
-        #         atomic_bsz_range=self._local_bsz_bounds,
-        #         accumulation=self._gradient_accumulation)
-        #     self._state.current_local_bsz = atomic_bsz
-        #     self._state.accumulation_steps = accum_steps
-        # else:
-        #     # if not first time, we check against the relative speedup
-        #     suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
-        #         adaptdl.env.num_nodes(), adaptdl.env.num_replicas(),
-        #         max_batch_size=self._max_batch_size,
-        #         atomic_bsz_range=self._local_bsz_bounds,
-        #         accumulation=self._gradient_accumulation)
-        #     # get current goodput
-        #     current_goodput = goodput_fn(
-        #         adaptdl.env.num_nodes(), adaptdl.env.num_replicas(),
-        #         self.current_local_bsz, self.accumulation_steps)
-        #     # use only if speedup is significant
-        #     speedup = suggest_goodput / max(current_goodput, 1e-8)
-        #     if speedup > self._speedup_threshold:
-        #         self._state.current_local_bsz = atomic_bsz
-        #         self._state.accumulation_steps = accum_steps
-        # self._state.current_local_bsz, self._state.accumulation_steps = \
-        #     adaptdl.collective.broadcast((self._state.current_local_bsz,
-        #                                   self._state.accumulation_steps))
-        # return self.current_local_bsz
+        # elif self.max_batch_size is not None and \
+        #     (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
+        #         self._state.current_local_bsz += 2
+        # return self._state.current_local_bsz * alpa.get_global_num_devices()
+        goodput_fn = get_goodput_fn()
+        if self.max_batch_size is None or goodput_fn is None:
+            print(f'self.batch_size: {self.batch_size}')
+            print(f'self.num_replicas: {self._num_replicas}')
+            self._state.current_local_bsz = np.ceil(self.batch_size / self._num_replicas).astype(np.int32)
+            self._state.accumulation_steps = 0
+        elif not self._state.current_local_bsz:
+            suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
+                self._num_nodes, self._num_replicas,
+                max_batch_size=self._max_batch_size,
+                atomic_bsz_range=self._local_bsz_bounds,
+                accumulation=self._gradient_accumulation
+            )
+            self._state.current_local_bsz = atomic_bsz
+            self._state.accumulation_steps = accum_steps
+            print(f'best SE: {suggest_goodput}')
+            #self._best_se = suggest_goodput
+        else:
+            suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
+                self._num_nodes, self._num_replicas,
+                max_batch_size=self._max_batch_size,
+                atomic_bsz_range=self._local_bsz_bounds,
+                accumulation=self._gradient_accumulation
+            )
+            current_goodput= goodput_fn(
+                self._num_nodes, self._num_replicas,
+                self.current_local_bsz,
+                self.accumulation_steps
+            )
+            print(f'current_goodput: {current_goodput}')
+            print(f'suggest_goodput: {suggest_goodput}')
+            print(jnp.maximum(current_goodput, 1e-8))
+            speedup = suggest_goodput / jnp.maximum(current_goodput, 1e-8)
+            if speedup > self._speedup_threshold:
+                self._state.current_local_bsz = atomic_bsz
+                self._state.accumulation_steps = accum_steps
+                print(f'best SE: {suggest_goodput}')
+                #self._best_se = suggest_goodput
+            print(f'best SE: {current_goodput}')
+        return self.current_local_bsz
 
     @property
     def training(self):
@@ -352,7 +366,9 @@ class AdaptiveDataLoaderHelper(object):
     @property
     def current_batch_size(self):
         return (self.current_local_bsz * (self.accumulation_steps + 1) *
-                alpa.adaptdl.env.num_replicas()) # TODO: ensure that num of replicas is retrieved from Ray, hardcode for now?
+                alpa.get_global_num_devices())
+        #return (self.current_local_bsz * (self.accumulation_steps + 1) *
+                #alpa.adaptdl.env.num_replicas()) # TODO: ensure that num of replicas is retrieved from Ray, hardcode for now?
 
     def skipdone(self):
         """
@@ -514,7 +530,8 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
         restart, and continue where it left off.
         """
         epoch = current_epoch()
-        num_replicas = alpa.adaptdl.env.num_replicas()
+        #num_replicas = alpa.adaptdl.env.num_replicas()
+        num_replicas = alpa.get_global_num_devices()
         with self._elastic.context():
             if self._elastic.skipdone():
                 return
@@ -522,7 +539,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
             while not done:
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
-                self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
+                self.batch_sampler.batch_size = (self._elastic._sync_local_bsz()) * num_replicas
                 LOG.info(f"Current local batch size - {self.current_local_bsz}")
                 LOG.info(f"Current total batch size - {self.batch_sampler.batch_size}")
                 LOG.info(f"Current epoch - {current_epoch()}")
