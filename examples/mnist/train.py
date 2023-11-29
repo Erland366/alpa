@@ -35,6 +35,8 @@ import ml_collections
 import numpy as np
 import optax
 import tensorflow_datasets as tfds
+from tensorflow_datasets.core.utils import gcs_utils
+
 
 
 class CNN(nn.Module):
@@ -102,6 +104,7 @@ def train_epoch(state, train_ds, batch_size):
 
 def get_datasets():
   """Load MNIST train and test datasets into memory."""
+  gcs_utils._is_gcs_disabled = True
   ds_builder = tfds.builder('mnist')
   ds_builder.download_and_prepare()
   train_ds = tfds.as_numpy(ds_builder.as_dataset(split='train', batch_size=-1))

@@ -29,7 +29,10 @@ build_jaxlib/dist
 
 # Examples build and tmp files
 examples/build/
+examples/mnist/mnist
 examples/imagenet/imagenet
+examples/ViT/imagenette2
+examples/ViT/vit-base-patch16-imagenette
 examples/llm_serving/dataset/*.so
 examples/llm_serving/dataset/*.c
 examples/llm_serving/dataset/*.cpp

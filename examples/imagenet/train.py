@@ -41,6 +41,7 @@ import optax
 import ray
 import tensorflow as tf
 import tensorflow_datasets as tfds
+from tensorflow_datasets.core.utils import gcs_utils
 
 import input_pipeline
 import models
@@ -248,6 +249,10 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   Returns:
     Final TrainState.
   """
+  
+  gcs_utils._is_gcs_disabled = True
+  ds_builder = tfds.builder('imagenet2012')
+  ds_builder.download_and_prepare()
   # Initialize ray.
   # The `runtime_env` argument is used to upload local python scripts to
   # remote workers while excluding checkpoints, profiling events, etc.
