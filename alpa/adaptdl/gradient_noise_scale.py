@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import time
+import alpa
 
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax.lib import xla_bridge
@@ -163,67 +164,59 @@ class GradientNoiseScale():
         self._state[param_name] = biased / unbias
 
     
-    def compute_pgns(self, preconditioners):
-        #gradients = extract_values_with_key(self.state.params)
-        #print("gradients", gradients)
-        print('------------------------------------------------------------------------')
-        time1 = time.time()
-        #for grad in gradients:
-        #print(self.state)
-        for grad, preconditioner in zip (self.state, preconditioners):
-            #print('****************************************************')
-            #grad = jax.device_put(grad, jax_device)
-            #preconditioner = self.set_preconditioner(grad)
-            #preconditioner = jax.device_put(preconditioner, jax_device)
-            #####self._local_sqr += jnp.sum((grad/preconditioner)**2)
-            self._local_sqr = update_total_local_sqr(self._local_sqr, grad, preconditioner)
-        time1 = time.time() - time1
-        print(f'time1: {time1}')
+    def compute_pgns(self, grads_normsqr, local_sqr_):  
 
-        #preconditioners = self.set_preconditioner(gradients)
-        #preconditioners = self.set_preconditioner(self.state)
-        #preconditioners = jax.device_put(preconditioners, jax_device)
-
-        #self._local_sqr = [update_total_local_sqr(self._local_sqr, grad, preconditioner) for grad, preconditioner in zip(gradients, preconditioners)]
-        #self._local_sqr = jnp.array(self._local_sqr)[0]
-
-        time2 = time.time()
-        #grads_normsqr = _normsqr_groups(gradients, preconditioners)
-        grads_normsqr = _normsqr_groups(self.state, preconditioners)  
-        time2 = time.time() - time2  
-        print(f'time2: {time2}')
-           
+        self._local_sqr = local_sqr_
         count = self._num_replicas * self._accum_count if self._accum_count is not None else self._num_replicas
         scale = self._accum_scale * self._accum_count if self._accum_count is not None else self._accum_scale
         if count > 1:
-            local_sqr = self._local_sqr / count
+            local_sqr = local_sqr_ / count
             total_sqr = grads_normsqr
             if self._state['biased']:
                 self._reset_avg("sqr_avg")
                 self._reset_avg("var_avg")
             self._state['biased'] = False
             self._prev_grads = None
-        else:
-            if self._prev_grads is not None:
-                local_sqr = (_normsqr_groups(self._prev_grads, preconditioners) + grads_normsqr) / 2
-                #avg_grads = _average_groups(gradients, self._prev_grads)
-                avg_grads = _average_groups(self.state, self._prev_grads)
-                total_sqr = _normsqr_groups(avg_grads, preconditioners)
-                count = 2
-                scale = 2 * self._accum_scale
-            self._state["biased"] = True
-            self._prev_grads = [[g.clone() if g is not None else None for g in group] for group in gradients]
-        if count > 1:
+        #else:
+            #if self._prev_grads is not None:
+                #TODO fix this when single GPU is available
+                #local_sqr = (_normsqr_groups(self._prev_grads, preconditioners) + grads_normsqr) / 2
+                #avg_grads = _average_groups(self.state, self._prev_grads)
+                #total_sqr = _normsqr_groups(avg_grads, preconditioners)
+                #count = 2
+                #scale = 2 * self._accum_scale
+            #self._state["biased"] = True
+            #self._prev_grads = [[g.clone() if g is not None else None for g in group] for group in self.state]
+        #if count > 1:
             grad_sqr = (count * total_sqr - local_sqr) / (count -1)
             grad_var = (local_sqr - total_sqr) * scale / (count -1)
-            print(f'grad_sqr: {grad_sqr}')
-            print(f'grad_var: {grad_var}')
             theta = self._smoothing * scale
             self._update_avg('sqr_avg', grad_sqr, theta)
             self._update_avg('var_avg', grad_var, theta)
-            #print(f'self._state: {self._state}')
         self.set_progress(self.get_progress() + self.gain(scale))
-        print(f'pgns: {self._state}')
+        return self._state
+    
+    def compute_pgns_p(self, grads_normsqr, local_sqr_):  
+
+        self._local_sqr = local_sqr_._value
+        count = self._num_replicas * self._accum_count if self._accum_count is not None else self._num_replicas
+        scale = self._accum_scale * self._accum_count if self._accum_count is not None else self._accum_scale
+        
+        local_sqr = local_sqr_._value / count
+        total_sqr = grads_normsqr._value
+        if self._state['biased']:
+            self._reset_avg("sqr_avg")
+            self._reset_avg("var_avg")
+        self._state['biased'] = False
+        self._prev_grads = None
+        
+        grad_sqr = (count * total_sqr - local_sqr) / (count -1)
+        grad_var = (local_sqr - total_sqr) * scale / (count -1)
+        theta = self._smoothing * scale
+        self._update_avg('sqr_avg', grad_sqr, theta)
+        self._update_avg('var_avg', grad_var, theta)
+        self.set_progress(self.get_progress() + self.gain(scale))
+        return self._state
         
 
 

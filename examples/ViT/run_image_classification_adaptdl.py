@@ -53,7 +53,7 @@ from transformers import (
     set_seed,
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
-from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale, extract_values_with_key, flatten
+from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale, extract_values_with_key
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
@@ -461,10 +461,9 @@ def main():
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
-    print('state is saved on: ', jax.tree_map(lambda x: x.device_buffer.device(), state.params))
-    pgns_gradients = extract_values_with_key(state.params)
-    #pgns_params = jax.device_put(pgns_params, jax.local_devices(backend='gpu')[0])
-    gns = GradientNoiseScale(state=pgns_gradients, 
+    #print('state is saved on: ', jax.tree_map(lambda x: x.device_buffer.device(), state.params))
+    #pgns_gradients = extract_values_with_key(state.params)
+    gns = GradientNoiseScale(state=extract_values_with_key(state.params), 
                              mp_scaler=None, 
                              num_workers=alpa.get_global_num_devices(), 
                              init_batch_size=train_batch_size)
@@ -483,28 +482,14 @@ def main():
             loss = loss_fn(logits, labels)
             return loss
         
-        def extract_values_with_key_2(structure):
+        def extract_values_with_key_p(structure):
             flat_structure, tree_def = tree_flatten(structure)
             #flattened_gradients = [node._value for node in flat_structure]
             flattened_gradients = [node for node in flat_structure]
-    
             #jax_tree = jax.tree_util.tree_map(lambda x: x if isinstance(x, jnp.ndarray) else jnp.asarray(x), flattened_gradients)
             return (flattened_gradients)
         
-        def sum_normsqr(normsqr):
-            return jnp.sum(normsqr)
-        
         def normsqr_groups(grads, pinvs):
-            #ret = []
-            rett =  0.0
-            for group, pinv_group in zip(grads, pinvs):
-                temp = 0.0
-                for g, pinv in zip(group, pinv_group):
-                    temp += jnp.sum((g/pinv)**2)
-                rett += temp
-            return rett
-        
-        def normsqr_groups_2(grads, pinvs):
             def inner_norm(group, pinv_group):
                 return jnp.sum(jnp.sum((group / pinv_group) ** 2, axis=-1))
 
@@ -517,40 +502,32 @@ def main():
 
         def compute_gradsnorms(gradients, preconditioners, num_replicas, accum_scale, accum_count=False):
             local_sqr_val = 0.0
-            #print('start computing local_sqr_val')
+
             for grad, preconditioner in zip(gradients, preconditioners):
                 local_sqr_val += jnp.sum((grad/preconditioner)**2)
-            #print('end computing local_sqr_val')
-            #print('start computing grads_normsqr')
             
-            grads_normsqr = normsqr_groups_2(gradients, preconditioners)
-            #print('end computing grads_normsqr')
-            count = num_replicas
-            scale = accum_scale
-
-            #return local_sqr_val, grads_normsqr, count, scale
-            return local_sqr_val
+            grads_normsqr = normsqr_groups(gradients, preconditioners)
+            return local_sqr_val, grads_normsqr
 
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
         
         pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
-        gradients=extract_values_with_key_2(grad)
-        preconditioners=extract_values_with_key_2(pinv)
+        gradients=extract_values_with_key_p(grad)
+        preconditioners=extract_values_with_key_p(pinv)
         
-        local_sqr_val = compute_gradsnorms(gradients=gradients, 
+        local_sqr_val, grads_normsqr = compute_gradsnorms(gradients=gradients, 
                                             preconditioners=preconditioners, 
                                             num_replicas=2, 
                                             accum_scale=2)
         
-        
-        #metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step), "local_sqr_val": local_sqr_val,
-                   #"grads_normsqr": grads_normsqr, "count": count, "scale": scale}
-        
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        metrics = {"loss": loss, 
+                   "learning_rate": linear_decay_lr_schedule_fn(state.step), 
+                   "pgns_grads_norms": grads_normsqr, "local_sqr_val": local_sqr_val 
+                   }
 
-        return new_state, metrics, pinv
+        return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch):
@@ -605,20 +582,17 @@ def main():
         for step, batch in enumerate(train_loader):
             
             #print(f'jax.devices inside training loop: {jax.devices()}')
-            state, train_metric, pinv = p_train_step(state, batch)
+            state, train_metric = p_train_step(state, batch)
             #print('state.params is saved on: ', jax.tree_map(lambda x: x.device(), state.params))
             #dataload = current_dataloader()
-            #gns.update_state(state)
-            #print(state)
-
-            #print(f'pinv: {pinv}')
-            print('------------------------------------------')
-            #print(f'metrics: {train_metric}')
+            gns.update_state(state)
+            
             
             if step == len(train_loader) -1:
                 timer = time.time()
-                #with jax.default_device(jax.devices()[0]):
-                #gns.compute_pgns(flattened_pinv)
+                print("local_sqr_val",train_metric["local_sqr_val"])
+                gns.compute_pgns_p(train_metric["pgns_grads_norms"], 
+                             train_metric["local_sqr_val"])
                 #update_grad_params(gns.sqr_avg(), gns.var_avg())
                 print(f'time for pgns computation: {time.time() - timer}')
             
@@ -645,7 +619,9 @@ def main():
         epochs.write(
             f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
             f" {train_metric['learning_rate']}), "
-            f"Throughput: {images_per_second:.2f} images/s"
+            f"Throughput: {images_per_second:.2f} images/s, "
+            f"pgns_grads_norms: {train_metric['pgns_grads_norms']},)"
+            f"local_sqr_val: {train_metric['local_sqr_val']})"   
         )
 
         # # ======================== Evaluating ==============================
