@@ -14,6 +14,9 @@ import alpa.adaptdl
 import alpa.adaptdl.checkpoint
 import alpa.adaptdl.env
 from alpa.adaptdl.epoch import current_epoch
+from alpa.adaptdl.pollux_agent import pollux_agent
+
+import time
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
@@ -261,7 +264,9 @@ class AdaptiveDataLoaderHelper(object):
         elif self.max_batch_size is not None and \
             (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
                 self._state.current_local_bsz += 2
-        return self._state.current_local_bsz * alpa.get_global_num_devices()
+        new_total_bsz = self._state.current_local_bsz * alpa.get_global_num_devices()
+        pollux_agent.total_batch_size = new_total_bsz
+        return new_total_bsz
         # goodput_fn = get_goodput_fn()
         # if self.max_batch_size is None or goodput_fn is None:
         #     # No autoscale batch size, just divide batch size evenly.
@@ -519,26 +524,41 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
             if self._elastic.skipdone():
                 return
             done = False
+            bs_changed = False
             while not done:
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
-                self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
-                LOG.info(f"Current local batch size - {self.current_local_bsz}")
-                LOG.info(f"Current total batch size - {self.batch_sampler.batch_size}")
-                LOG.info(f"Current epoch - {current_epoch()}")
+                if not bs_changed:
+                    self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
+                    bs_changed = True
+                    LOG.info(f"Current local batch size - {self.current_local_bsz}")
+                    LOG.info(f"Current total batch size - {self.batch_sampler.batch_size}")
+                    LOG.info(f"Current epoch - {current_epoch()}")
                 for idx, batch in enumerate(super().__iter__()):
                     # with self._elastic.profile(self.training and idx >= 1):
                     # TODO: above profiler should be implemented and below code indented
                     yield batch
+                    if bs_changed:
+                        LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
+                        pollux_agent.bs_sync_starttime = time.time()
+                        bs_changed = False
                     # Increment by the number of data samples processed
                     self._elastic.current_index += \
                         num_replicas * self.batch_sampler.batch_size
-                    
+                    if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
+                        self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
+                        LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
+                        LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
+                        LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
+                        bs_changed = True
+                        break
                     # if idx == 20: # #TODO: invoking batch size change between iteration - works
                     #     self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
                     #     LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
                     #     LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
                     #     LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
+                    #     bs_changed = True
+                    #     break
                         
                     # TODO: below code should be uncommented and progress 
                     # should be based on PGNS from JAX
@@ -550,9 +570,10 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                         # break
                 # if self._elastic.max_batch_size is None:
                     # done = True
-                done = True # TODO: similarly, above code should be uncommented and this removed
-                self._elastic.current_index -= \
-                    self._elastic.current_index % -len(self.dataset)
+                if not bs_changed:
+                    done = True # TODO: similarly, above code should be uncommented and this removed
+                    self._elastic.current_index -= \
+                        self._elastic.current_index % -len(self.dataset)
                 # alpa.adaptdl.checkpoint.save_all_states()
 
 

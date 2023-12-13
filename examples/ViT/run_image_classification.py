@@ -54,6 +54,7 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
 from alpa.adaptdl.pollux_agent import pollux_agent
+from alpa.adaptdl.api import update_state_on_bs_change
 import numpy as np
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 
@@ -380,6 +381,7 @@ def main():
         return batch
 
     pollux_agent.total_batch_size = train_batch_size
+    pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
 
     # Create data loaders
@@ -480,12 +482,14 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="manual", 
-                                                                      manually_specified_submeshes=[(1, 4)]))
+    # method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="manual", 
+    #                                                                   manually_specified_submeshes=[(1, 4)]))
+    # method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="manual", 
+                                                                    # manually_specified_submeshes=[(1, 2)]))
     # method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="power_of_two"))
     # method = alpa.PipeshardParallel(stage_option="auto")
     # method = alpa.PipeshardParallel(stage_option="uniform")
-    # method = alpa.PipeshardParallel() # average throughput for per-GPU batch size 64 - 16023
+    method = alpa.PipeshardParallel() # average throughput for per-GPU batch size 64 - 16023
     # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
@@ -493,7 +497,7 @@ def main():
     p_train_step = alpa.parallelize(train_step, method=method)
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
-
+    
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
@@ -550,35 +554,43 @@ def main():
             # state = state.replace(step=step_backup, opt_state=unflattened_opt_state, params=unflattened_params)
             
             # if epoch == 1 or epoch == 3:
-            # if epoch == 1:
-            #     batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
-            #     batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
-            # if epoch == 1 and not switched_bs:
-            #     print(f"GLOBAL PHYSICAL MESH before shutdown - {alpa.get_global_physical_mesh(create_if_not_exist=False)}")
-            #     switched_bs = True
-            #     step_val = state.step._value
+            if epoch == 1:
+                batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
+                batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
+            if (epoch == 1 and not switched_bs) or (epoch == 2 and switched_bs):
+                # print(f"GLOBAL PHYSICAL MESH before shutdown - {alpa.get_global_physical_mesh(create_if_not_exist=False)}")
+                if epoch == 1:
+                    pollux_agent.total_batch_size = 2 * train_batch_size
+                else:
+                    pollux_agent.total_batch_size = train_batch_size
+                switched_bs = not switched_bs
+                step_val = state.step._value
                 
-            #     flattened_opt_state = tree_flatten(state.opt_state)
-            #     for i, leaf in enumerate(flattened_opt_state[0]):
-            #         if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-            #             flattened_opt_state[0][i] = leaf._value
-            #     unflattened_opt_state = tree_unflatten(flattened_opt_state[1], flattened_opt_state[0])
+                # flattened_opt_state = tree_flatten(state.opt_state)
+                # for i, leaf in enumerate(flattened_opt_state[0]):
+                #     if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                #         flattened_opt_state[0][i] = leaf._value
+                # unflattened_opt_state = tree_unflatten(flattened_opt_state[1], flattened_opt_state[0])
                 
-            #     flattened_params = tree_flatten(state.params)
-            #     for i, leaf in enumerate(flattened_params[0]):
-            #         if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-            #             flattened_params[0][i] = leaf._value
-            #     unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
+                # flattened_params = tree_flatten(state.params)
+                # for i, leaf in enumerate(flattened_params[0]):
+                #     if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                #         flattened_params[0][i] = leaf._value
+                # unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
                 
-            #     state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params)
-            #     print("Increasing batch size twice.")
-            #     alpa.shutdown()
-            #     alpa.clear_executable_cache()
-            #     alpa.init(cluster='ray')
-            #     # print(f"GLOBAL PHYSICAL MESH after shutdown - {alpa.get_global_cluster().get_physical_mesh()}")
+                # state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params)
+                # print("Increasing batch size twice.")
+                # alpa.shutdown()
+                # alpa.clear_executable_cache()
+                # alpa.init(cluster='ray')
+                # print(f"GLOBAL PHYSICAL MESH after shutdown - {alpa.get_global_cluster().get_physical_mesh()}")
             
+            state = update_state_on_bs_change(state)
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
+            
+            # if (step == 1 or step == 2) and epoch == 0:
+            #     print(f"EXEC TIME COSTS - {p_train_step.get_last_executable().get_execution_time_costs()}")
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
@@ -591,6 +603,9 @@ def main():
                              f"Time elapsed: {time.time() - train_start:.2f} s")
                              
             train_step_progress_bar.update(1)
+            
+        if epoch == 1:
+            print(f"Predict - {pollux_agent.predict_throughput([1,2,4,8,16,32,64,128,256])}")
 
         latency = time.time() - last_time
         images_per_second = len(train_dataset) / latency

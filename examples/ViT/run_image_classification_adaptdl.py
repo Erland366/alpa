@@ -55,6 +55,7 @@ from transformers.utils import get_full_repo_name, send_example_telemetry
 
 import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
+from alpa.adaptdl.api import update_state_on_bs_change
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 
@@ -381,6 +382,7 @@ def main():
         return batch
 
     pollux_agent.total_batch_size = train_batch_size
+    pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
 
     # Create data loaders
@@ -398,6 +400,7 @@ def main():
         dataset=train_dataset,
         batch_size=train_batch_size,
         shuffle=False, # TODO: handle shuffle=True
+        num_workers=data_args.preprocessing_num_workers,
         collate_fn=collate_fn,
     )
     
@@ -490,9 +493,11 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    method = alpa.PipeshardParallel(stage_option="uniform")
+    # method = alpa.PipeshardParallel(stage_option="uniform")
+    # method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="manual", 
+                                                                    #   manually_specified_submeshes=[(1, 4)]))
     # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
-    # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
+    method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
                                     # donate_argnums=(0,))
@@ -540,6 +545,10 @@ def main():
                 # batch['pixel_values'] = np.concatenate([batch['pixel_values'], batch['pixel_values']])
                 # batch['labels'] = np.concatenate([batch['labels'], batch['labels']])
             
+            # print(f"Last batch shape - {batch['pixel_values'].shape}")
+            if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
+                (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
+                state = update_state_on_bs_change(state)
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
