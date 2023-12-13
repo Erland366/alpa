@@ -72,3 +72,4 @@ docs/tutorials
 .DS_Store
 
 examples/ViT/imagenette2
+examples/ViT/vit-base-patch16-imagenette/
