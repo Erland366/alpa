@@ -10,7 +10,7 @@ from jax.core import AbstractValue
 from jax.experimental.maps import FrozenDict
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 
-from alpa.device_mesh import init_global_cluster, shutdown_global_cluster
+from alpa.device_mesh import init_global_cluster, shutdown_global_cluster, get_global_physical_mesh
 from alpa.parallel_method import ParallelMethod, ShardParallel
 from alpa.pipeline_parallel.primitive_def import mark_gradient
 from alpa.util import (auto_donate_argnums, auto_static_argnums,
@@ -141,7 +141,8 @@ class ParallelizedFunc:
         executable.sync() # synchronization for correct time measurement (TODO: remove after experimenting)
         t_iter = time.time() - iter_start
         # TODO: handle isinstance() with typing instead
-        pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)
+        pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, 
+                                      t_iter, executable.get_execution_time_costs()[-1])
         return tree_unflatten(out_tree(), out)
 
     def get_executable(self, *args):
@@ -214,6 +215,9 @@ class ParallelizedFunc:
                                                   static_argnums,
                                                   donated_invars, batch_invars,
                                                   self.method, *abstract_args)
+
+        # if executable.physical_mesh is not get_global_physical_mesh(create_if_not_exist=False):
+            # executable.physical_mesh = get_global_physical_mesh(create_if_not_exist=False)
 
         self.last_executable = executable
         return executable, in_tree, out_tree, args_flat

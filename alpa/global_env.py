@@ -38,7 +38,7 @@ class GlobalConfig:
         ########## Options of shard_parallel ##########
         # Whether to sync before and after the executable for accurate internal
         # timer
-        self.shard_parallel_sync_for_timer = False
+        self.shard_parallel_sync_for_timer = True
 
         ########## Options of pipeline_parallel ##########
         # Whether to debug with pipeshard runtime. If turned on, no physical
@@ -59,7 +59,7 @@ class GlobalConfig:
         ########## Options of pipeline runtime ##########
         # Whether to sync before and after the executable for accurate internal
         # timer
-        self.pipeline_sync_for_timer = False
+        self.pipeline_sync_for_timer = True
         # Whether to use distributed compilation in pipeline parallel for
         # each stage. Disabling it helps debug.
         self.pipeline_distributed_compile = True
