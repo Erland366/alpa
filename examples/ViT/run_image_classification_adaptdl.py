@@ -497,7 +497,8 @@ def main():
     # method = alpa.PipeshardParallel(stage_option=alpa.AutoStageOption(submesh_physical_shape_space="manual", 
                                                                     #   manually_specified_submeshes=[(1, 4)]))
     # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
-    method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
+    # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
+    method = alpa.PipeshardParallel()
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
                                     # donate_argnums=(0,))

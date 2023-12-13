@@ -261,9 +261,13 @@ class AdaptiveDataLoaderHelper(object):
             self._state.current_local_bsz = math.ceil(
                 self.batch_size / alpa.get_global_num_devices())
             self._state.accumulation_steps = 0
+        # elif self.max_batch_size is not None and \
+        #     (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
+        #         self._state.current_local_bsz += 2
+        # BELOW IS TEMPORARILY FOR TESTING BATCH SIZES OF POWER 2
         elif self.max_batch_size is not None and \
-            (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
-                self._state.current_local_bsz += 2
+            (self._state.current_local_bsz * 2) * alpa.get_global_num_devices() <= self.max_batch_size:
+                self._state.current_local_bsz *= 2
         new_total_bsz = self._state.current_local_bsz * alpa.get_global_num_devices()
         pollux_agent.total_batch_size = new_total_bsz
         return new_total_bsz
@@ -539,7 +543,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     # TODO: above profiler should be implemented and below code indented
                     yield batch
                     if bs_changed:
-                        LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
+                        # LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
                         pollux_agent.bs_sync_starttime = time.time()
                         bs_changed = False
                     # Increment by the number of data samples processed

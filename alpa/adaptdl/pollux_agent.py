@@ -4,6 +4,7 @@ from numpy.typing import NDArray
 from typing import TypeVar
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
+import pickle
 
 class PolluxAgent:
     def __init__(self, state=None):
@@ -26,7 +27,7 @@ class PolluxAgent:
         self.bs_t_diff = defaultdict(list)
         
         self.bs_sync_starttime = None
-        self.bs_sync_interval = 120 # seconds
+        self.bs_sync_interval = 30 # seconds
         print("PolluxAgent initialized.")
         
     @property
@@ -58,6 +59,9 @@ class PolluxAgent:
                 print(f"Median current BS {self.total_batch_size} iteration time - {np.median(np.array(self.bs_t_iter[self.total_batch_size]))} \
                     Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
                     Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
+        if self.iter % 500 == 0:
+            self._save_objects(f'pickle_objects/4gp/objects_iteration{self.iter}.pkl')
+            
             
     def _fit_batchsize_dynp(self):
         assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to fit the regressor."
@@ -92,5 +96,15 @@ class PolluxAgent:
             return np.array(batch_sizes).reshape(-1, 1) / self.predict_dynp_cost(np.array(batch_sizes).reshape(-1, 1))
         else:
             return np.array(batch_sizes).reshape(-1, 1) / self.predict_exectime(np.array(batch_sizes).reshape(-1, 1))
+        
+    def _save_objects(self, filename):
+        with open(filename,'wb') as f:
+            pickle.dump({'iter': self.iter, 't_iters': self.t_iters, 't_grads': self.t_grads, 'throughputs': self.throughputs, 
+                        '_total_batch_size': self._total_batch_size, 'last_state_retrieved_batch_size': self.last_state_retrieved_batch_size,
+                        't_compilation': self.t_compilation, 'dataset_size': self.dataset_size, 'alloc_vector': self.alloc_vector,
+                        'training_dp_cost': self.training_dp_cost, 'bs_dp': self.bs_dp, 'bs_dp_regressor': self.bs_dp_regressor,
+                        'bs_exectime_regressor': self.bs_exectime_regressor, 'bs_t_iter': self.bs_t_iter,
+                        'bs_t_exec_timecosts': self.bs_t_exec_timecosts, 'bs_t_diff': self.bs_t_diff},
+                        f)
     
 pollux_agent = PolluxAgent()
