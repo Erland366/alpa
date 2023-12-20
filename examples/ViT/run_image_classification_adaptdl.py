@@ -53,12 +53,14 @@ from transformers import (
     set_seed,
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
-from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale, extract_values_with_key
+#from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale
+from alpa.adaptdl.gns_util import extract_values_with_key_p, normsqr_groups, compute_gradsnorms
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
+#from alpa.adaptdl.gradient_noise_scale import gns
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 
@@ -91,10 +93,10 @@ class TrainingArguments:
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
     num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
     per_device_train_batch_size: int = field(
-        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
+        default=4, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
-        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
+        default=4, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
@@ -247,9 +249,15 @@ def create_learning_rate_fn(
 
 
 def main():
+    
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    try:
+        from alpa.adaptdl.gradient_noise_scale import gns
+    except Exception as e:
+        print(f'could not import gns: {e}')
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -385,6 +393,7 @@ def main():
         return batch
 
     pollux_agent.total_batch_size = train_batch_size
+    pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
 
     # Create data loaders
@@ -405,9 +414,9 @@ def main():
         collate_fn=collate_fn,
     )
     
-    train_loader.autoscale_batch_size(max_batch_size = 96 * alpa.get_global_num_devices(), 
+    train_loader.autoscale_batch_size(max_batch_size = 60 * alpa.get_global_num_devices(), 
                                       #local_bsz_bounds=(16, 96), gradient_accumulation=False)
-                                        local_bsz_bounds=(16, 96), gradient_accumulation=False)
+                                        local_bsz_bounds=(32, 64), gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
@@ -461,12 +470,14 @@ def main():
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
-    #print('state is saved on: ', jax.tree_map(lambda x: x.device_buffer.device(), state.params))
-    #pgns_gradients = extract_values_with_key(state.params)
-    gns = GradientNoiseScale(state=extract_values_with_key(state.params), 
-                             mp_scaler=None, 
-                             num_workers=alpa.get_global_num_devices(), 
-                             init_batch_size=train_batch_size)
+    gns.state = extract_values_with_key_p(state.params)
+    gns.init_batch_size = train_batch_size
+    gns.num_replicas = alpa.get_global_num_devices()
+    gns.accum_scale = alpa.get_global_num_devices()
+    #gns(state=extract_values_with_key_p(state.params), 
+                             #mp_scaler=None, 
+                             #num_workers=alpa.get_global_num_devices(), 
+                             #init_batch_size=train_batch_size)
     
 
     def loss_fn(logits, labels):
@@ -482,33 +493,6 @@ def main():
             loss = loss_fn(logits, labels)
             return loss
         
-        def extract_values_with_key_p(structure):
-            flat_structure, tree_def = tree_flatten(structure)
-            #flattened_gradients = [node._value for node in flat_structure]
-            flattened_gradients = [node for node in flat_structure]
-            #jax_tree = jax.tree_util.tree_map(lambda x: x if isinstance(x, jnp.ndarray) else jnp.asarray(x), flattened_gradients)
-            return (flattened_gradients)
-        
-        def normsqr_groups(grads, pinvs):
-            def inner_norm(group, pinv_group):
-                return jnp.sum(jnp.sum((group / pinv_group) ** 2, axis=-1))
-
-            normsqr_list = [
-                inner_norm(group, pinv_group) 
-                for group, pinv_group in zip(grads, pinvs)
-                ]
-    
-            return jnp.sum(jnp.array(normsqr_list))
-
-        def compute_gradsnorms(gradients, preconditioners, num_replicas, accum_scale, accum_count=False):
-            local_sqr_val = 0.0
-
-            for grad, preconditioner in zip(gradients, preconditioners):
-                local_sqr_val += jnp.sum((grad/preconditioner)**2)
-            
-            grads_normsqr = normsqr_groups(gradients, preconditioners)
-            return local_sqr_val, grads_normsqr
-
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
@@ -570,6 +554,7 @@ def main():
     # for epoch in epochs:
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================
+        
         train_start = time.time()
 
         # Create sampling rng
@@ -580,21 +565,15 @@ def main():
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for step, batch in enumerate(train_loader):
-            
-            #print(f'jax.devices inside training loop: {jax.devices()}')
             state, train_metric = p_train_step(state, batch)
-            #print('state.params is saved on: ', jax.tree_map(lambda x: x.device(), state.params))
-            #dataload = current_dataloader()
-            gns.update_state(state)
+            gns.update_state(state, train_metric["local_sqr_val"], train_metric["pgns_grads_norms"])
             
-            
-            if step == len(train_loader) -1:
-                timer = time.time()
-                print("local_sqr_val",train_metric["local_sqr_val"])
-                gns.compute_pgns_p(train_metric["pgns_grads_norms"], 
-                             train_metric["local_sqr_val"])
+            #if step == len(train_loader) -1:
+                #timer = time.time()
+                #gns.compute_pgns_p(train_metric["pgns_grads_norms"], 
+                #            train_metric["local_sqr_val"])
                 #update_grad_params(gns.sqr_avg(), gns.var_avg())
-                print(f'time for pgns computation: {time.time() - timer}')
+                #print(f'time for pgns computation: {time.time() - timer}')
             
             train_metrics.append(train_metric)
 

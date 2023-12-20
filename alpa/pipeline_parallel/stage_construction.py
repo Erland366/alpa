@@ -654,6 +654,7 @@ def cluster_layers_and_slice_mesh(
                                       num_autosharding_configs, compute_cost,
                                       max_n_succ_stages)
             pollux_agent.training_dp_cost = training_dp_cost
+            pollux_agent.bs_dp[pollux_agent.total_batch_size] = training_dp_cost
 
         assert solution is not None, "no solution in auto stage construction."
 
