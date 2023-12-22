@@ -73,3 +73,4 @@ docs/tutorials
 
 examples/ViT/imagenette2
 examples/ViT/vit-base-patch16-imagenette/
+*.tgz

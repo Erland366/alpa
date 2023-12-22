@@ -550,6 +550,8 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     self._elastic.current_index += \
                         num_replicas * self.batch_sampler.batch_size
                     if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
+                    # BELOW IS TEMPORARY
+                    # if (pollux_agent.iter + 1) % 500 == 0:
                         self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
                         LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
                         LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")

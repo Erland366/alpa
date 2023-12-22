@@ -97,7 +97,7 @@ class TrainingArguments:
     adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
+    num_train_epochs: float = field(default=10000000.0, metadata={"help": "Total number of training epochs to perform."})
     warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
     logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
     save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
