@@ -252,9 +252,9 @@ class AdaptiveDataLoaderHelper(object):
             raise ValueError("invalid max_batch_size")
         if local_bsz_bounds is not None and (
                 local_bsz_bounds[0] is not None and
-                local_bsz_bounds[0] > self.batch_size or
+                local_bsz_bounds[0] > jnp.round(self.batch_size / self._num_replicas)  or
                 local_bsz_bounds[1] is not None and
-                local_bsz_bounds[1] < self.batch_size):
+                local_bsz_bounds[1] < jnp.round(self.batch_size / self._num_replicas)):
             raise ValueError("invalid local_bsz_bounds")
         self._max_batch_size = max_batch_size
         self._local_bsz_bounds = local_bsz_bounds

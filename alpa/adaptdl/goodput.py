@@ -3,11 +3,23 @@ from typing import Any
 import numpy as np
 import jax
 import jax.numpy as jnp
+import logging
+
+
 
 from alpa.adaptdl.pollux_agent import pollux_agent
 
 GradParams = collections.namedtuple("GradParams", ["sqr", "var"])
 
+
+LOGGER = logging.getLogger("vit logger")
+LOGGER.setLevel(logging.INFO)
+handler = logging.FileHandler('/home/haifatl/Documents/alpa/alpa-adaptdl4/alpa-adaptdl/examples/ViT/sevit.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+LOGGER.addHandler(handler)
+LOGGER.info('testing vit logger')
+   
 class GoodputFunction(object):
     def __init__(self, 
                  grad_params, 
@@ -20,10 +32,16 @@ class GoodputFunction(object):
         return self.evaluate(num_nodes, num_replicas, atomic_bsz, accum_steps)
     
     def evaluate(self, num_nodes, num_replicas, atomic_bsz, accum_steps):
+        global LOGGER
         batch_size = num_replicas * atomic_bsz * (accum_steps + 1)
         assert np.all(self._init_batch_size <= batch_size)
-        print(f'se: {self.efficiency(batch_size)}')
-        print(f'Throughput: {jnp.ravel(self.throughtput(batch_size))}')
+        bsz_logs = atomic_bsz
+        selogs = self.efficiency(batch_size)
+        throughput_logs = jnp.ravel(self.throughtput(batch_size))
+        try:
+            LOGGER.info(f"atomic_bsz {bsz_logs}: SE = {selogs}, Throughput: {throughput_logs}")
+        except Exception as e:
+            print(f'cannot write to selogs.log: {e}')
         return self.efficiency(batch_size) * jnp.ravel(self.throughtput(batch_size))
     
     def efficiency_2(self, batch_size):

@@ -1385,8 +1385,9 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
         try:
             for w in self.workers:
                 w.delete_executable.remote(exec_uuid)
-        except AttributeError:
-            pass
+        except AttributeError as e:
+            print(f'error is: {e}')
+            #pass
 
     def set_runtime_random_seed(self, seed: int):
         for w in self.workers:
