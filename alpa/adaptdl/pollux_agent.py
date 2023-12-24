@@ -5,6 +5,7 @@ from typing import TypeVar
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
 import pickle
+import os
 
 class PolluxAgent:
     def __init__(self, state=None):
@@ -46,6 +47,7 @@ class PolluxAgent:
         self.bs_t_iter[self.total_batch_size].append(t_iter)
         if executable_time_cost is not None:
             self.bs_t_exec_timecosts[self.total_batch_size].append(executable_time_cost)
+            # self.bs_t_exec_timecosts[self.total_batch_size].append(t_iter)
             self.bs_t_diff[self.total_batch_size].append(t_iter - executable_time_cost)
         self.iter += 1
         self.throughputs.append(self.total_batch_size / t_iter if self.total_batch_size is not None else 1 / t_iter)
@@ -98,6 +100,8 @@ class PolluxAgent:
             return np.array(batch_sizes).reshape(-1, 1) / self.predict_exectime(np.array(batch_sizes).reshape(-1, 1))
         
     def _save_objects(self, filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
         with open(filename,'wb') as f:
             pickle.dump({'iter': self.iter, 't_iters': self.t_iters, 't_grads': self.t_grads, 'throughputs': self.throughputs, 
                         '_total_batch_size': self._total_batch_size, 'last_state_retrieved_batch_size': self.last_state_retrieved_batch_size,

@@ -269,6 +269,10 @@ class AdaptiveDataLoaderHelper(object):
             (self._state.current_local_bsz * 2) * alpa.get_global_num_devices() <= self.max_batch_size:
                 self._state.current_local_bsz *= 2
         new_total_bsz = self._state.current_local_bsz * alpa.get_global_num_devices()
+        if len(pollux_agent.bs_t_exec_timecosts) >= 2:
+            print(f"Seen batch sizes: {pollux_agent.bs_t_exec_timecosts.keys()}")
+            print(f"Predicting throughput for [1, 2, 4, 8, 16, 32]:")
+            print(f"Predicted throughput: {pollux_agent.predict_throughput([1, 2, 4, 8, 16, 32])}")
         pollux_agent.total_batch_size = new_total_bsz
         return new_total_bsz
         # goodput_fn = get_goodput_fn()
