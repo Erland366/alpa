@@ -413,6 +413,7 @@ def main():
         batch_size=train_batch_size,
         shuffle=False, # TODO: handle shuffle=True
         num_workers=data_args.preprocessing_num_workers,
+        drop_last=True,
         collate_fn=collate_fn,
         # num_workers=data_args.preprocessing_num_workers
     )
