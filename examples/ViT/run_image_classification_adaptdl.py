@@ -568,6 +568,9 @@ def main():
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for step, batch in enumerate(train_loader):
+            if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
+                (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
+                state = update_state_on_bs_change(state)
             state, train_metric = p_train_step(state, batch)
             gns.update_state(state, train_metric["local_sqr_val"], train_metric["pgns_grads_norms"])
             
@@ -579,10 +582,6 @@ def main():
                 #print(f'time for pgns computation: {time.time() - timer}')
             
             # print(f"Last batch shape - {batch['pixel_values'].shape}")
-            if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
-                (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
-                state = update_state_on_bs_change(state)
-            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
