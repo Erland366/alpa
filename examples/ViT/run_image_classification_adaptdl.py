@@ -412,6 +412,7 @@ def main():
         batch_size=train_batch_size,
         shuffle=False, # TODO: handle shuffle=True
         collate_fn=collate_fn,
+        # num_workers=data_args.preprocessing_num_workers
     )
     
     train_loader.autoscale_batch_size(max_batch_size = 60 * alpa.get_global_num_devices(), 
@@ -526,9 +527,9 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    method = alpa.PipeshardParallel(stage_option="uniform") #uniform
+    # method = alpa.PipeshardParallel(stage_option="uniform") #uniform
     # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
-    # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
+    method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
                                     # donate_argnums=(0,))

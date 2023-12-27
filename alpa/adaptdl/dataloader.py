@@ -48,7 +48,8 @@ class ElasticSampler(Sampler):
         self.dataset = dataset
         self.shuffle = shuffle
         #self.num_replicas = alpa.adaptdl.env.num_replicas() # should be 1 for Alpa because Alpa handles batch distribution by itself
-        self.num_replicas = alpa.get_global_num_devices()
+        # self.num_replicas = alpa.get_global_num_devices()
+        self.num_replicas = 1
         self.rank = 0 # alpa.adaptdl.env.replica_rank() TODO: currently hardcoded
         self.epoch = 0
         self.index = 0
@@ -511,6 +512,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
         # Custom sampler is incompatible with shuffle=True, so we always set
         # shuffle=False in __init__ and let our own sampler do the shuffling.
         kwargs["sampler"] = ElasticSampler(dataset, shuffle=shuffle)
+        print("DATALOADER INITIALIZATION")
         kwargs["worker_init_fn"] = _worker_init_wrapper(
             kwargs.get("worker_init_fn"), kwargs.get("num_workers"))
         super().__init__(dataset, batch_size, shuffle=False, **kwargs)
@@ -548,6 +550,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     epoch, index=self._elastic.current_index)
                 if not bs_changed:
                     self.batch_sampler.batch_size = (self._elastic._sync_local_bsz()) * num_replicas
+                    # self.batch_sampler.batch_size = (self._elastic._sync_local_bsz())
                     self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
                     #self.batch_sampler.batch_size = self.batch_sampler.batch_size.np() if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
                     bs_changed = True
@@ -565,19 +568,19 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                         # LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
                         pollux_agent.bs_sync_starttime = time.time()
                         bs_changed = False
+                        print(f"yielded batch shape - {batch['pixel_values'].shape}")
                     # Increment by the number of data samples processed
-                    self._elastic.current_index += \
-                        num_replicas * self.batch_sampler.batch_size
-                    # if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
-                    #     #gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
-                    #     #update_grad_params(gns.sqr_avg(), gns.var_avg())
-                    #     self.batch_sampler.batch_size = self._elastic._sync_local_bsz() * num_replicas
-                    #     self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
-                    #     LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
-                    #     LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
-                    #     LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
-                    #     bs_changed = True
-                    #     break    
+                    self._elastic.current_index += self.batch_sampler.batch_size
+                    if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
+                        #gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+                        #update_grad_params(gns.sqr_avg(), gns.var_avg())
+                        self.batch_sampler.batch_size = self._elastic._sync_local_bsz() * num_replicas
+                        self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
+                        LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
+                        LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
+                        LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
+                        bs_changed = True
+                        break    
                     # TODO: below code should be uncommented and progress 
                     # should be based on PGNS from JAX
                     
