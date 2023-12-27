@@ -18,7 +18,6 @@ handler = logging.FileHandler('/home/ubuntu/alpa-adaptdl/examples/ViT/sevit.log'
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
-LOGGER.info('testing vit logger')
    
 class GoodputFunction(object):
     def __init__(self, 

@@ -293,7 +293,7 @@ class AdaptiveDataLoaderHelper(object):
             )
             self._state.current_local_bsz = atomic_bsz
             self._state.accumulation_steps = accum_steps
-        elif self._state.current_local_bsz in [4, 8, 16]:
+        elif self._state.current_local_bsz in [1, 2, 4, 8]:
             self._state.current_local_bsz *= 2
         else:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(

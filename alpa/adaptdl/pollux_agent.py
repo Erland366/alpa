@@ -41,7 +41,7 @@ class PolluxAgent:
         
     
     def report_iteration(self, state, t_iter, executable_time_cost=None):
-        # assert self.total_batch_size != None, "Batch size should be set in the training code using pollux_agent.total_batch_size"
+        assert self.total_batch_size != None, "Batch size should be set in the training code using pollux_agent.total_batch_size"
         self.state = state
         self.t_iters.append(t_iter)
         self.bs_t_iter[self.total_batch_size].append(t_iter)
@@ -66,7 +66,7 @@ class PolluxAgent:
             
             
     def _fit_batchsize_dynp(self):
-        assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to fit the regressor."
+        # assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to fit the regressor."
         
         x_bs = np.array(list(self.bs_dp.keys())).reshape(-1, 1)
         y_dp = np.array(list(self.bs_dp.values())).reshape(-1, 1)
@@ -74,13 +74,13 @@ class PolluxAgent:
         self.bs_dp_regressor.fit(x_bs, y_dp)
         
     def predict_dynp_cost(self, batch_sizes): # TODO: handle typing
-        assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to make predictions."
+        # assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to make predictions."
         assert batch_sizes.ndim == 2 and batch_sizes.shape[1] == 1, "Input batch sizes np.ndarray should be of shape (N, 1)."
         self._fit_batchsize_dynp()
         return self.bs_dp_regressor.predict(batch_sizes)
     
     def _fit_batchsize_exectime(self):
-        assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to fit the regressor."
+        # assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to fit the regressor."
         
         x_bs = np.array(list(self.bs_t_exec_timecosts.keys())).reshape(-1, 1)
         y_dp = np.array(list([np.median(np.array(l)) for l in self.bs_t_exec_timecosts.values()])).reshape(-1, 1)
@@ -88,7 +88,7 @@ class PolluxAgent:
         self.bs_exectime_regressor.fit(x_bs, y_dp)
         
     def predict_exectime(self, batch_sizes): # TODO: handle typing
-        assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to make predictions."
+        # assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to make predictions."
         assert batch_sizes.ndim == 2 and batch_sizes.shape[1] == 1, "Input batch sizes np.ndarray should be of shape (N, 1)."
         self._fit_batchsize_exectime()
         return self.bs_exectime_regressor.predict(batch_sizes)

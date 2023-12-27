@@ -248,6 +248,33 @@ def create_learning_rate_fn(
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
 
+def get_current_batch_size():
+    return pollux_agent.total_batch_size
+
+def create_dynamic_lr_fn(
+    train_ds_size: int, initial_train_batch_size: int, num_train_epochs: int, num_warmup_steps: int,
+    learning_rate: float, get_current_batch_size: Callable[[], int]
+) -> Callable[[int], jnp.array]:
+    """Returns a learning rate function that adjusts based on the current batch size."""
+    initial_steps_per_epoch = lambda batch_size: train_ds_size // batch_size
+    num_train_steps = lambda batch_size: initial_steps_per_epoch(batch_size) * num_train_epochs
+
+    def schedule_fn(step: int) -> float:
+        current_batch_size = get_current_batch_size()
+        print(f"Current BS for LR scheduler - {current_batch_size}")
+        steps_per_epoch = initial_steps_per_epoch(current_batch_size)
+        total_steps = num_train_steps(current_batch_size)
+
+        def warmup_phase(_):
+            return learning_rate * step / num_warmup_steps
+
+        def decay_phase(_):
+            return learning_rate * (1 - (step - num_warmup_steps) / (total_steps - num_warmup_steps))
+
+        return jax.lax.cond(step < num_warmup_steps, warmup_phase, decay_phase, None)
+
+    return schedule_fn
+
 
 def main():
     
@@ -455,12 +482,13 @@ def main():
     rng, dropout_rng = jax.random.split(rng)
 
     # Create learning rate schedule
-    linear_decay_lr_schedule_fn = create_learning_rate_fn(
+    linear_decay_lr_schedule_fn = create_dynamic_lr_fn(
         len(train_dataset),
         train_batch_size,
         training_args.num_train_epochs,
         training_args.warmup_steps,
         training_args.learning_rate,
+        get_current_batch_size=get_current_batch_size
     )
 
     # create adam optimizer
