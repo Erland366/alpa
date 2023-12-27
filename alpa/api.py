@@ -141,8 +141,10 @@ class ParallelizedFunc:
         executable.sync() # synchronization for correct time measurement (TODO: remove after experimenting)
         t_iter = time.time() - iter_start
         # TODO: handle isinstance() with typing instead
+        #pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)
         pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, 
                                       t_iter, executable.get_execution_time_costs()[-1])
+        
         return tree_unflatten(out_tree(), out)
 
     def get_executable(self, *args):

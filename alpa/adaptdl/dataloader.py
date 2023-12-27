@@ -7,12 +7,22 @@ import numpy as np
 import pickle
 import random
 import torch
+import time
 from torch.utils.data import DataLoader, Sampler
+from alpa.adaptdl.metrics import set_batch_size, get_goodput_fn, get_progress
+#from alpa.adaptdl.gradient_noise_scale import gns
+from alpa.adaptdl.metrics import update_grad_params
+from alpa.adaptdl.epoch import current_epoch
+from alpa.adaptdl.pollux_agent import pollux_agent
 
 import alpa
 import alpa.adaptdl
 import alpa.adaptdl.checkpoint
 import alpa.adaptdl.env
+
+import jax
+import jax.numpy as jnp
+
 from alpa.adaptdl.epoch import current_epoch
 from alpa.adaptdl.pollux_agent import pollux_agent
 
@@ -40,7 +50,9 @@ class ElasticSampler(Sampler):
     def __init__(self, dataset, shuffle=True):
         self.dataset = dataset
         self.shuffle = shuffle
-        self.num_replicas = alpa.adaptdl.env.num_replicas() # should be 1 for Alpa because Alpa handles batch distribution by itself
+        #self.num_replicas = alpa.adaptdl.env.num_replicas() # should be 1 for Alpa because Alpa handles batch distribution by itself
+        # self.num_replicas = alpa.get_global_num_devices()
+        self.num_replicas = 1
         self.rank = 0 # alpa.adaptdl.env.replica_rank() TODO: currently hardcoded
         self.epoch = 0
         self.index = 0
@@ -133,8 +145,10 @@ class AdaptiveDataLoaderHelper(object):
         self.batch_size = batch_size
         self.future_exit = None
         self._gradient_accumulation = False
-        self._speedup_threshold = 1.05
+        self._speedup_threshold = 1.0
         self._accum_count = 0
+        self._num_replicas = alpa.get_global_num_devices()
+        self._num_nodes = 1
 
     @property
     def current_index(self):
@@ -220,8 +234,8 @@ class AdaptiveDataLoaderHelper(object):
         """
         if AdaptiveDataLoaderHelper._training is None:
             AdaptiveDataLoaderHelper._training = self
-        # set_batch_size(self.batch_size, self.max_batch_size,
-                    #    self.local_bsz_bounds, self._gradient_accumulation)
+        set_batch_size(self.batch_size, self.max_batch_size,
+                       self.local_bsz_bounds, self._gradient_accumulation)
 
     def autoscale_batch_size(self, max_batch_size, local_bsz_bounds=None,
                              gradient_accumulation=False):
@@ -242,9 +256,9 @@ class AdaptiveDataLoaderHelper(object):
             raise ValueError("invalid max_batch_size")
         if local_bsz_bounds is not None and (
                 local_bsz_bounds[0] is not None and
-                local_bsz_bounds[0] > self.batch_size or
+                local_bsz_bounds[0] > jnp.round(self.batch_size / self._num_replicas)  or
                 local_bsz_bounds[1] is not None and
-                local_bsz_bounds[1] < self.batch_size):
+                local_bsz_bounds[1] < jnp.round(self.batch_size / self._num_replicas)):
             raise ValueError("invalid local_bsz_bounds")
         self._max_batch_size = max_batch_size
         self._local_bsz_bounds = local_bsz_bounds
@@ -256,60 +270,52 @@ class AdaptiveDataLoaderHelper(object):
         Updates batch size if the newly suggested one is better by a significant margin.
         Temporarly for Alpa, this just periodically increases current batch size by increments of 2.
         """
-        if not self._state.current_local_bsz:
-            # self._state.current_local_bsz = 1
-            self._state.current_local_bsz = math.ceil(
-                self.batch_size / alpa.get_global_num_devices())
+        try:
+            from alpa.adaptdl.gradient_noise_scale import gns
+        except Exception as e:
+            print(f'Cannot import gns: {e}')
+        
+        goodput_fn = get_goodput_fn()
+
+        if goodput_fn is not None:
+            gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+            update_grad_params(gns.sqr_avg(), gns.var_avg())
+
+        if self.max_batch_size is None or goodput_fn is None:
+            self._state.current_local_bsz = np.ceil(self.batch_size / self._num_replicas).astype(np.int32)
             self._state.accumulation_steps = 0
-        # elif self.max_batch_size is not None and \
-        #     (self._state.current_local_bsz + 2) * alpa.get_global_num_devices() <= self.max_batch_size:
-        #         self._state.current_local_bsz += 2
-        # BELOW IS TEMPORARILY FOR TESTING BATCH SIZES OF POWER 2
-        elif self.max_batch_size is not None and \
-            (self._state.current_local_bsz * 2) * alpa.get_global_num_devices() <= self.max_batch_size:
-                self._state.current_local_bsz *= 2
-        new_total_bsz = self._state.current_local_bsz * alpa.get_global_num_devices()
-        if len(pollux_agent.bs_t_exec_timecosts) >= 2:
-            print(f"Seen batch sizes: {pollux_agent.bs_t_exec_timecosts.keys()}")
-            print(f"Predicting throughput for [1, 2, 4, 8, 16, 32]:")
-            print(f"Predicted throughput: {pollux_agent.predict_throughput([1, 2, 4, 8, 16, 32])}")
-        pollux_agent.total_batch_size = new_total_bsz
-        return new_total_bsz
-        # goodput_fn = get_goodput_fn()
-        # if self.max_batch_size is None or goodput_fn is None:
-        #     # No autoscale batch size, just divide batch size evenly.
-        #     self._state.current_local_bsz = math.ceil(
-        #         self.batch_size / adaptdl.env.num_replicas())
-        #     self._state.accumulation_steps = 0
-        # elif not self._state.current_local_bsz:
-        #     # if init, use the batch size suggested
-        #     _, atomic_bsz, accum_steps = goodput_fn.optimize(
-        #         adaptdl.env.num_nodes(), adaptdl.env.num_replicas(),
-        #         max_batch_size=self._max_batch_size,
-        #         atomic_bsz_range=self._local_bsz_bounds,
-        #         accumulation=self._gradient_accumulation)
-        #     self._state.current_local_bsz = atomic_bsz
-        #     self._state.accumulation_steps = accum_steps
-        # else:
-        #     # if not first time, we check against the relative speedup
-        #     suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
-        #         adaptdl.env.num_nodes(), adaptdl.env.num_replicas(),
-        #         max_batch_size=self._max_batch_size,
-        #         atomic_bsz_range=self._local_bsz_bounds,
-        #         accumulation=self._gradient_accumulation)
-        #     # get current goodput
-        #     current_goodput = goodput_fn(
-        #         adaptdl.env.num_nodes(), adaptdl.env.num_replicas(),
-        #         self.current_local_bsz, self.accumulation_steps)
-        #     # use only if speedup is significant
-        #     speedup = suggest_goodput / max(current_goodput, 1e-8)
-        #     if speedup > self._speedup_threshold:
-        #         self._state.current_local_bsz = atomic_bsz
-        #         self._state.accumulation_steps = accum_steps
-        # self._state.current_local_bsz, self._state.accumulation_steps = \
-        #     adaptdl.collective.broadcast((self._state.current_local_bsz,
-        #                                   self._state.accumulation_steps))
-        # return self.current_local_bsz
+        elif not self._state.current_local_bsz:
+            suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
+                self._num_nodes, self._num_replicas,
+                max_batch_size=self._max_batch_size,
+                atomic_bsz_range=self._local_bsz_bounds,
+                accumulation=self._gradient_accumulation
+            )
+            self._state.current_local_bsz = atomic_bsz
+            self._state.accumulation_steps = accum_steps
+        elif self._state.current_local_bsz in [4, 8, 16]:
+            self._state.current_local_bsz *= 2
+        else:
+            suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
+                self._num_nodes, self._num_replicas,
+                max_batch_size=self._max_batch_size,
+                atomic_bsz_range=self._local_bsz_bounds,
+                accumulation=self._gradient_accumulation
+            )
+            current_goodput= goodput_fn(
+                self._num_nodes, self._num_replicas,
+                self.current_local_bsz,
+                self.accumulation_steps
+            )
+            #print(jnp.maximum(current_goodput, 1e-8))
+            speedup = suggest_goodput / jnp.maximum(current_goodput, 1e-8)
+            if speedup > self._speedup_threshold:
+                self._state.current_local_bsz = atomic_bsz
+                self._state.accumulation_steps = accum_steps
+        pollux_agent.total_batch_size = int(jax.device_get(self._state.current_local_bsz).item())* alpa.get_global_num_devices() if isinstance(self._state.current_local_bsz, jnp.DeviceArray) else self._state.current_local_bsz * alpa.get_global_num_devices()
+        #pollux_agent.total_batch_size = self._state.current_local_bsz * alpa.get_global_num_devices()
+        
+        return self.current_local_bsz
 
     @property
     def training(self):
@@ -365,7 +371,9 @@ class AdaptiveDataLoaderHelper(object):
     @property
     def current_batch_size(self):
         return (self.current_local_bsz * (self.accumulation_steps + 1) *
-                alpa.adaptdl.env.num_replicas()) # TODO: ensure that num of replicas is retrieved from Ray, hardcode for now?
+                alpa.get_global_num_devices())
+        #return (self.current_local_bsz * (self.accumulation_steps + 1) *
+                #alpa.adaptdl.env.num_replicas()) # TODO: ensure that num of replicas is retrieved from Ray, hardcode for now?
 
     def skipdone(self):
         """
@@ -507,6 +515,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
         # Custom sampler is incompatible with shuffle=True, so we always set
         # shuffle=False in __init__ and let our own sampler do the shuffling.
         kwargs["sampler"] = ElasticSampler(dataset, shuffle=shuffle)
+        print("DATALOADER INITIALIZATION")
         kwargs["worker_init_fn"] = _worker_init_wrapper(
             kwargs.get("worker_init_fn"), kwargs.get("num_workers"))
         super().__init__(dataset, batch_size, shuffle=False, **kwargs)
@@ -526,8 +535,14 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
         case, the current iteration state will be saved and restored after the
         restart, and continue where it left off.
         """
+        try:
+            from alpa.adaptdl.gradient_noise_scale import gns 
+        except Exception as e:
+            print(f'cannot import gns: {e}')
+        
         epoch = current_epoch()
-        num_replicas = alpa.adaptdl.env.num_replicas()
+        #num_replicas = alpa.adaptdl.env.num_replicas()
+        num_replicas = alpa.get_global_num_devices()
         with self._elastic.context():
             if self._elastic.skipdone():
                 return
@@ -537,7 +552,10 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
                 if not bs_changed:
-                    self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
+                    self.batch_sampler.batch_size = (self._elastic._sync_local_bsz()) * num_replicas
+                    # self.batch_sampler.batch_size = (self._elastic._sync_local_bsz())
+                    self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
+                    #self.batch_sampler.batch_size = self.batch_sampler.batch_size.np() if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
                     bs_changed = True
                     LOG.info(f"Current local batch size - {self.current_local_bsz}")
                     LOG.info(f"Current total batch size - {self.batch_sampler.batch_size}")
@@ -546,30 +564,26 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     # with self._elastic.profile(self.training and idx >= 1):
                     # TODO: above profiler should be implemented and below code indented
                     yield batch
+                    if self._elastic.current_index == 0:
+                        gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+                        update_grad_params(gns.sqr_avg(), gns.var_avg())
                     if bs_changed:
                         # LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
                         pollux_agent.bs_sync_starttime = time.time()
                         bs_changed = False
+                        print(f"yielded batch shape - {batch['pixel_values'].shape}")
                     # Increment by the number of data samples processed
-                    self._elastic.current_index += \
-                        num_replicas * self.batch_sampler.batch_size
+                    self._elastic.current_index += self.batch_sampler.batch_size
                     if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
-                    # BELOW IS TEMPORARY
-                    # if (pollux_agent.iter + 1) % 500 == 0:
-                        self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
+                        #gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+                        #update_grad_params(gns.sqr_avg(), gns.var_avg())
+                        self.batch_sampler.batch_size = self._elastic._sync_local_bsz() * num_replicas
+                        self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
                         LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
                         LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
                         LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
                         bs_changed = True
-                        break
-                    # if idx == 20: # #TODO: invoking batch size change between iteration - works
-                    #     self.batch_sampler.batch_size = self._elastic._sync_local_bsz()
-                    #     LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
-                    #     LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
-                    #     LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
-                    #     bs_changed = True
-                    #     break
-                        
+                        break    
                     # TODO: below code should be uncommented and progress 
                     # should be based on PGNS from JAX
                     

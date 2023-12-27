@@ -45,15 +45,26 @@ class CNN(nn.Module):
   def __call__(self, x):
     x = nn.Conv(features=32, kernel_size=(3, 3))(x)
     x = nn.relu(x)
-    x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+    #x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
     x = nn.Conv(features=64, kernel_size=(3, 3))(x)
     x = nn.relu(x)
-    x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+    x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+    ##x = nn.Dropout(0.25)(x, deterministic=False)
+    #x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
     x = x.reshape((x.shape[0], -1))  # flatten
-    x = nn.Dense(features=256)(x)
+    
+    ###################
+    x = nn.Dense(128)(x)
     x = nn.relu(x)
-    x = nn.Dense(features=10)(x)
-    return x
+    ##x = nn.Dropout(0.5)(x, deterministic=False)
+    x = nn.Dense(10)(x)
+    output = nn.log_softmax(x)
+    
+    #x = nn.Dense(features=256)(x)
+    #x = nn.relu(x)
+    #x = nn.Dense(features=10)(x)
+    #return x
+    return output
 
 
 def train_step(state, images, labels):
