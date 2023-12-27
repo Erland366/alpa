@@ -289,7 +289,8 @@ class AdaptiveDataLoaderHelper(object):
             )
             self._state.current_local_bsz = atomic_bsz
             self._state.accumulation_steps = accum_steps
-            
+        elif self._state.current_local_bsz in [4, 8, 16]:
+            self._state.current_local_bsz *= 2
         else:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
                 self._num_nodes, self._num_replicas,
@@ -567,16 +568,16 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     # Increment by the number of data samples processed
                     self._elastic.current_index += \
                         num_replicas * self.batch_sampler.batch_size
-                    if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
-                        #gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
-                        #update_grad_params(gns.sqr_avg(), gns.var_avg())
-                        self.batch_sampler.batch_size = self._elastic._sync_local_bsz() * num_replicas
-                        self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
-                        LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
-                        LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
-                        LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
-                        bs_changed = True
-                        break    
+                    # if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
+                    #     #gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+                    #     #update_grad_params(gns.sqr_avg(), gns.var_avg())
+                    #     self.batch_sampler.batch_size = self._elastic._sync_local_bsz() * num_replicas
+                    #     self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
+                    #     LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")
+                    #     LOG.info(f"BETWEEN ITER Current total batch size - {self.batch_sampler.batch_size}")
+                    #     LOG.info(f"BETWEEN ITER Current epoch - {current_epoch()}")
+                    #     bs_changed = True
+                    #     break    
                     # TODO: below code should be uncommented and progress 
                     # should be based on PGNS from JAX
                     

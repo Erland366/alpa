@@ -46,6 +46,7 @@ class PolluxAgent:
         self.bs_t_iter[self.total_batch_size].append(t_iter)
         if executable_time_cost is not None:
             self.bs_t_exec_timecosts[self.total_batch_size].append(executable_time_cost)
+            # self.bs_t_exec_timecosts[self.total_batch_size].append(t_iter)
             self.bs_t_diff[self.total_batch_size].append(t_iter - executable_time_cost)
         self.iter += 1
         self.throughputs.append(self.total_batch_size / t_iter if self.total_batch_size is not None else 1 / t_iter)
@@ -59,8 +60,8 @@ class PolluxAgent:
                 print(f"Median current BS {self.total_batch_size} iteration time - {np.median(np.array(self.bs_t_iter[self.total_batch_size]))} \
                     Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
                     Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
-        if self.iter % 500 == 0:
-            self._save_objects(f'/home/haifatl/Documents/alpa/alpa-adaptdl_8/alpa-adaptdl/alpa/adaptdl/pickle_objects/4gp/objects_iteration{self.iter}.pkl')
+        # if self.iter % 500 == 0:
+            # self._save_objects(f'/home/haifatl/Documents/alpa/alpa-adaptdl_8/alpa-adaptdl/alpa/adaptdl/pickle_objects/4gp/objects_iteration{self.iter}.pkl')
             
             
     def _fit_batchsize_dynp(self):
@@ -95,6 +96,7 @@ class PolluxAgent:
         if self.training_dp_cost is not None:
             return np.array(batch_sizes).reshape(-1, 1) / self.predict_dynp_cost(np.array(batch_sizes).reshape(-1, 1))
         else:
+            print(f"Collected batch sizes before predict - {self.bs_t_exec_timecosts.keys()}")
             return np.array(batch_sizes).reshape(-1, 1) / self.predict_exectime(np.array(batch_sizes).reshape(-1, 1))
         
     def _save_objects(self, filename):

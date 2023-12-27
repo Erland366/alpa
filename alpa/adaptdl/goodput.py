@@ -14,7 +14,7 @@ GradParams = collections.namedtuple("GradParams", ["sqr", "var"])
 
 LOGGER = logging.getLogger("vit logger")
 LOGGER.setLevel(logging.INFO)
-handler = logging.FileHandler('/home/haifatl/Documents/alpa/alpa-adaptdl4/alpa-adaptdl/examples/ViT/sevit.log')
+handler = logging.FileHandler('/home/jovyan/alpa-adaptdl/examples/ViT/sevit.log')
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 LOGGER.addHandler(handler)

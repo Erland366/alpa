@@ -416,7 +416,7 @@ def main():
     
     train_loader.autoscale_batch_size(max_batch_size = 60 * alpa.get_global_num_devices(), 
                                       #local_bsz_bounds=(16, 96), gradient_accumulation=False)
-                                        local_bsz_bounds=(32, 64), gradient_accumulation=False)
+                                        local_bsz_bounds=(1, 64), gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
