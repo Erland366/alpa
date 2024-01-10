@@ -515,7 +515,6 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
         # Custom sampler is incompatible with shuffle=True, so we always set
         # shuffle=False in __init__ and let our own sampler do the shuffling.
         kwargs["sampler"] = ElasticSampler(dataset, shuffle=shuffle)
-        print("DATALOADER INITIALIZATION")
         kwargs["worker_init_fn"] = _worker_init_wrapper(
             kwargs.get("worker_init_fn"), kwargs.get("num_workers"))
         super().__init__(dataset, batch_size, shuffle=False, **kwargs)
@@ -571,7 +570,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                         # LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
                         pollux_agent.bs_sync_starttime = time.time()
                         bs_changed = False
-                        print(f"yielded batch shape - {batch['pixel_values'].shape}")
+                        # print(f"yielded batch shape - {batch['pixel_values'].shape}")
                     # Increment by the number of data samples processed
                     self._elastic.current_index += self.batch_sampler.batch_size
                     if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
