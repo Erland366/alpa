@@ -60,10 +60,11 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn
 #from alpa.adaptdl.gradient_noise_scale import gns
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
+from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
@@ -118,6 +119,9 @@ class TrainingArguments:
         default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
+    pretrain: bool = field(
+        default=False, metadata={"help": "Whether or not to pretrain."}
+    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -248,33 +252,6 @@ def create_learning_rate_fn(
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
 
-def get_current_batch_size():
-    return pollux_agent.total_batch_size
-
-def create_dynamic_lr_fn(
-    train_ds_size: int, initial_train_batch_size: int, num_train_epochs: int, num_warmup_steps: int,
-    learning_rate: float, get_current_batch_size: Callable[[], int]
-) -> Callable[[int], jnp.array]:
-    """Returns a learning rate function that adjusts based on the current batch size."""
-    initial_steps_per_epoch = lambda batch_size: train_ds_size // batch_size
-    num_train_steps = lambda batch_size: initial_steps_per_epoch(batch_size) * num_train_epochs
-
-    def schedule_fn(step: int) -> float:
-        current_batch_size = get_current_batch_size()
-        print(f"Current BS for LR scheduler - {current_batch_size}")
-        steps_per_epoch = initial_steps_per_epoch(current_batch_size)
-        total_steps = num_train_steps(current_batch_size)
-
-        def warmup_phase(_):
-            return learning_rate * step / num_warmup_steps
-
-        def decay_phase(_):
-            return learning_rate * (1 - (step - num_warmup_steps) / (total_steps - num_warmup_steps))
-
-        return jax.lax.cond(step < num_warmup_steps, warmup_phase, decay_phase, None)
-
-    return schedule_fn
-
 
 def main():
     
@@ -389,7 +366,7 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if model_args.model_name_or_path:
+    if model_args.model_name_or_path and not training_args.pretrain:
         model = FlaxAutoModelForImageClassification.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -398,6 +375,7 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
     else:
+        print(f"Pretraining mode")
         model = FlaxAutoModelForImageClassification.from_config(
             config,
             seed=training_args.seed,
@@ -482,18 +460,24 @@ def main():
     rng, dropout_rng = jax.random.split(rng)
 
     # Create learning rate schedule
-    linear_decay_lr_schedule_fn = create_dynamic_lr_fn(
+    linear_decay_lr_schedule_fn = create_learning_rate_fn(
         len(train_dataset),
         train_batch_size,
         training_args.num_train_epochs,
         training_args.warmup_steps,
-        training_args.learning_rate,
-        get_current_batch_size=get_current_batch_size
+        training_args.learning_rate
     )
+    
+    scaling_rule = LinearScale()
+    # scaling_rule = SqrtScale()
+    
+    # TODO: initial batch size should probably be stored separately to avoid newer batch size being set after a checkpoint-restart
+    scaled_linear_decay_lr_schedule_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
+                                                             scaling_rule=scaling_rule)
 
     # create adam optimizer
     adamw = optax.adamw(
-        learning_rate=linear_decay_lr_schedule_fn,
+        learning_rate=scaled_linear_decay_lr_schedule_fn,
         b1=training_args.adam_beta1,
         b2=training_args.adam_beta2,
         eps=training_args.adam_epsilon,
@@ -539,7 +523,7 @@ def main():
                                             accum_scale=2)
         
         metrics = {"loss": loss, 
-                   "learning_rate": linear_decay_lr_schedule_fn(state.step), 
+                   "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
                    "pgns_grads_norms": grads_normsqr, "local_sqr_val": local_sqr_val 
                    }
 
@@ -611,6 +595,11 @@ def main():
                 #print(f'time for pgns computation: {time.time() - timer}')
             
             # print(f"Last batch shape - {batch['pixel_values'].shape}")
+            
+            # Testing if LR is scaling correctly
+            # if step % 15 == 0:
+                # print(f"Learning rate at step #{step}: {train_metric['learning_rate']}")
+                
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
