@@ -277,10 +277,6 @@ class AdaptiveDataLoaderHelper(object):
         
         goodput_fn = get_goodput_fn()
 
-        if goodput_fn is not None:
-            gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
-            update_grad_params(gns.sqr_avg(), gns.var_avg())
-
         if self.max_batch_size is None or goodput_fn is None:
             self._state.current_local_bsz = np.ceil(self.batch_size / self._num_replicas).astype(np.int32)
             self._state.accumulation_steps = 0
@@ -564,9 +560,9 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     # with self._elastic.profile(self.training and idx >= 1):
                     # TODO: above profiler should be implemented and below code indented
                     yield batch
-                    if self._elastic.current_index == 0:
-                        gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
-                        update_grad_params(gns.sqr_avg(), gns.var_avg())
+                    #if self._elastic.current_index == 0:
+                    #    gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+                    #    update_grad_params(gns.sqr_avg(), gns.var_avg())
                     if bs_changed:
                         # LOG.info(f"Yielded batch shape - {batch['pixel_values'].shape}")
                         pollux_agent.bs_sync_starttime = time.time()
@@ -577,6 +573,8 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
                         #gns.compute_pgns_p(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
                         #update_grad_params(gns.sqr_avg(), gns.var_avg())
+                        gns.compute_pgns(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
+                        update_grad_params(gns.pgns["pgns_grads_norms"], gns.pgns["local_sqr_val"])
                         self.batch_sampler.batch_size = self._elastic._sync_local_bsz() * num_replicas
                         self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
                         LOG.info(f"BETWEEN ITER Current local batch size - {self.current_local_bsz}")

@@ -71,7 +71,7 @@ class GradientNoiseScale():
         self._state.pop(param_name + "_biased", None)
         self._state.pop(param_name + "_unbias", None)
     
-    def _update_avg(self, param_name, value, factor):
+    def _update_avg_2(self, param_name, value, factor):
         biased = self._state.get(param_name + "_biased", 0.0)
         unbias = self._state.get(param_name + "_unbias", 0.0)
         biased = factor * biased + (1.0 - factor) * value
@@ -80,7 +80,9 @@ class GradientNoiseScale():
         self._state[param_name + "_unbias"] = unbias
         self._state[param_name] = biased / unbias
 
-    
+    def _update_avg(self, param_name, value):
+        self._state[param_name] = value
+
     def compute_pgns_p(self, grads_normsqr, local_sqr_):  
 
         #self._local_sqr = local_sqr_._value
@@ -107,6 +109,12 @@ class GradientNoiseScale():
         self._update_avg('sqr_avg', grad_sqr, theta)
         self._update_avg('var_avg', grad_var, theta)
         self.set_progress(self.get_progress() + self.gain(scale))
+        return self._state
+    
+    def compute_pgns(self, grad_sqr, grad_var):
+        self._update_avg('sqr_avg', grad_sqr)
+        self._update_avg('var_avg', grad_var)
+        #return self.pgns['local_sqr_val'] / self.pgns['pgns_grads_norms']
         return self._state
     
 gns = GradientNoiseScale()

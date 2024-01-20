@@ -1,6 +1,8 @@
 from alpa.adaptdl.pollux_agent import pollux_agent
+from alpa.adaptdl.scaling_rules import ScalingRuleBase
 import alpa
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
+from typing import Callable, Optional
 
 def update_state_on_bs_change(state):
     if pollux_agent.last_state_retrieved_batch_size == pollux_agent.total_batch_size:
@@ -30,3 +32,19 @@ def update_state_on_bs_change(state):
     pollux_agent.last_state_retrieved_batch_size = pollux_agent.total_batch_size
     
     return state
+
+
+def scale_lr(current_batch_size: int, initial_batch_size: int, base_lr: float) -> float:
+    """Plug-in interface for linear learning rate scaling based on batch size."""
+    return base_lr * (current_batch_size / initial_batch_size)
+
+
+def create_scaled_lr_fn(original_lr_fn, initial_batch_size: int, scaling_rule: ScalingRuleBase):
+    """Returns a new learning rate function based on the current batch size."""
+    def scaled_lr_fn(step: int) -> float:
+        current_batch_size = pollux_agent.total_batch_size
+        base_lr = original_lr_fn(step)
+        scale = current_batch_size / initial_batch_size
+        return scaling_rule.scale_lr(scale) * base_lr
+    
+    return scaled_lr_fn

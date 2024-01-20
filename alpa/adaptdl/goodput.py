@@ -14,10 +14,11 @@ GradParams = collections.namedtuple("GradParams", ["sqr", "var"])
 
 LOGGER = logging.getLogger("vit logger")
 LOGGER.setLevel(logging.INFO)
-handler = logging.FileHandler('/home/ubuntu/alpa-adaptdl/examples/ViT/sevit.log')
+handler = logging.FileHandler('/home/haifatl/Documents/alpa/alpa-adaptdl55/alpa-adaptdl/examples/ViT/sevit_method2.log')
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
+LOGGER.info('testing vit logger')
    
 class GoodputFunction(object):
     def __init__(self, 
@@ -38,14 +39,17 @@ class GoodputFunction(object):
         selogs = self.efficiency(batch_size)
         throughput_logs = jnp.ravel(self.throughtput(batch_size))
         try:
-            LOGGER.info(f"atomic_bsz {bsz_logs}: SE = {selogs}, Throughput: {throughput_logs}")
+            LOGGER.info(f"atomic_bsz {bsz_logs}: SE = {selogs}, Throughput: {throughput_logs}, Goodput: {selogs * throughput_logs}")
         except Exception as e:
             print(f'cannot write to selogs.log: {e}')
-        return self.efficiency(batch_size) * jnp.ravel(self.throughtput(batch_size))
+        #return self.efficiency(batch_size) * jnp.ravel(self.throughtput(batch_size))
+        return selogs * throughput_logs
     
     def efficiency_2(self, batch_size):
         grad_sqr = self._grad_params.sqr
         grad_var = self._grad_params.var
+        LOGGER.info(f'noise: {grad_var}')
+        LOGGER.info(f'scale: {grad_sqr}')
         scale = batch_size / self._init_batch_size
         denom = grad_var / scale + grad_sqr
         gain = jnp.where(denom > 0, (grad_var + grad_sqr) / denom, 1.0)
@@ -55,6 +59,9 @@ class GoodputFunction(object):
         grad_sqr = self._grad_params.sqr
         grad_var = self._grad_params.var
         pgns = grad_var / grad_sqr
+        LOGGER.info(f'noise: {grad_var}')
+        LOGGER.info(f'scale: {grad_sqr}')
+        LOGGER.info(f'pgns: {pgns}')
         se = (pgns + self._init_batch_size) / (pgns + batch_size)
         return se
     
