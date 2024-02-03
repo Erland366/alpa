@@ -11,11 +11,12 @@ _GRAD_PARAM_DICT = None
 def update_grad_params(grad_norm_sqr, grad_variance):
     global _GRAD_PARAM_DICT
     _GRAD_PARAM_DICT = jnp.asarray([grad_norm_sqr, grad_variance])
-    print(f'_GRAD_PARAM_DICT: {_GRAD_PARAM_DICT}')
+    #print(f'_GRAD_PARAM_DICT: {_GRAD_PARAM_DICT}')
     #grad_params = sum(_GRAD_PARAM_DICT.values())
     grad_params = _GRAD_PARAM_DICT
     print(f'grad_params: {grad_params}')
     _metric_state().grad_params = (grad_params[0], grad_params[1])
+    print(_metric_state().grad_params)
 
 
 def set_batch_size(init_batch_size, 

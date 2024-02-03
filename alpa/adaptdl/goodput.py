@@ -4,17 +4,18 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import logging
+import datetime
 
 
 
 from alpa.adaptdl.pollux_agent import pollux_agent
 
-GradParams = collections.namedtuple("GradParams", ["sqr", "var"])
+GradParams = collections.namedtuple("GradParams", ["scale", "noise"])
 
 
 LOGGER = logging.getLogger("vit logger")
 LOGGER.setLevel(logging.INFO)
-handler = logging.FileHandler('/home/haifatl/Documents/alpa/alpa-adaptdl55/alpa-adaptdl/examples/ViT/sevit_method2.log')
+handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-7/alpa-adaptdl/examples/ViT/logs/ViT_goodput_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
@@ -46,24 +47,28 @@ class GoodputFunction(object):
         return selogs * throughput_logs
     
     def efficiency_2(self, batch_size):
-        grad_sqr = self._grad_params.sqr
-        grad_var = self._grad_params.var
-        LOGGER.info(f'noise: {grad_var}')
-        LOGGER.info(f'scale: {grad_sqr}')
-        scale = batch_size / self._init_batch_size
-        denom = grad_var / scale + grad_sqr
-        gain = jnp.where(denom > 0, (grad_var + grad_sqr) / denom, 1.0)
-        return gain / scale
-    
-    def efficiency(self, batch_size):
-        grad_sqr = self._grad_params.sqr
-        grad_var = self._grad_params.var
-        pgns = grad_var / grad_sqr
-        LOGGER.info(f'noise: {grad_var}')
-        LOGGER.info(f'scale: {grad_sqr}')
+        grad_scale = self._grad_params.scale
+        grad_noise = self._grad_params.noise
+        pgns = grad_scale / grad_noise
+        LOGGER.info(f'noise: {grad_noise}')
+        LOGGER.info(f'scale: {grad_scale}')
         LOGGER.info(f'pgns: {pgns}')
         se = (pgns + self._init_batch_size) / (pgns + batch_size)
         return se
+    
+    def efficiency(self, batch_size):
+        grad_sqr = jnp.maximum(self._grad_params.scale, 0)
+        grad_var = jnp.maximum(self._grad_params.noise, 1e-6)
+
+        scale = batch_size / self._init_batch_size
+        denom = grad_var / scale + grad_sqr
+        gain = np.where(denom > 0, (grad_var + grad_sqr) / denom, 1.0)
+        LOGGER.info(f'Efficiency & GNS Computation')
+        LOGGER.info(f'grad_sqr: {grad_sqr}')
+        LOGGER.info(f'grad_var: {grad_var}')
+        LOGGER.info(f'scale: {scale}')
+        LOGGER.info(f'gain (GNS): {gain}')
+        return gain / scale
     
     def throughtput(self, batchsizes):
         throughtput = pollux_agent.predict_throughput(batch_sizes=batchsizes)
@@ -94,17 +99,18 @@ class GoodputFunction(object):
             
         atomic_bsz = jnp.maximum(min_atomic_bsz, atomic_bsz)
         atomic_bsz = jnp.minimum(max_atomic_bsz, atomic_bsz)
-        print(f'atomic_bsz: {atomic_bsz}')
+        #print(f'atomic_bsz: {atomic_bsz}')
         goodput = self.evaluate(num_nodes=num_nodes, 
                                     num_replicas=num_replicas, 
                                     atomic_bsz=atomic_bsz, 
                                     accum_steps=accum_steps)
-        print(f'goodput: {goodput}')
+        #print(f'goodput: {goodput}')
         indices = jnp.argmax(goodput, axis=0)
-        print(f'indices: {indices}')
+        LOGGER.info(f'indices: {indices}')
         goodput_elem = goodput[indices]
-        print(f'best goodput: {goodput_elem}')
+        LOGGER.info(f'best goodput: {goodput_elem}')
         atomic_bsz = atomic_bsz[indices]
+        LOGGER.info(f'best atomic_bsz: {atomic_bsz}')
         accum_steps = accum_steps[indices]
 
         return goodput_elem, atomic_bsz, accum_steps

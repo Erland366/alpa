@@ -41,6 +41,40 @@ def compute_gradsnorms(gradients, preconditioners):
     grads_normsqr = normsqr_groups(gradients, preconditioners)
     return local_sqr_val, grads_normsqr
 
+def average_groups_2(grads1, grads2):
+    ret = []
+    for group1, group2 in zip(grads1, grads2):
+        ret.append([])
+        for g1, g2 in zip(group1, group2):
+            if g1 is None:
+                ret[-1].append(g2)
+            elif g2 is None:
+                ret[-1].append(g1)
+            else:
+                ret[-1].append((g1 + g2) / 2)
+    return ret
+
+def update_avg(value, factor, biased, unbias):
+    biased = factor * biased + (1.0 - factor) * value
+    unbias = factor * unbias + (1.0 - factor)
+
+    value = biased / unbias
+    
+    return biased, unbias, value
+
+#def compute_pgns_values_2(store_grads, preconditioner, count=2, scale=1, smoothing=0.9):
+#    grads_normsqr = normsqr_groups(store_grads[1], preconditioner)
+#    local_sqr = (normsqr_groups(store_grads[0], preconditioner)
+#                             + grads_normsqr) / 2
+#    avg_grads = average_groups(store_grads[1], store_grads[0])
+#    total_sqr = normsqr_groups(avg_grads, preconditioner)
+#    grad_sqr = (count * total_sqr - local_sqr) / (count - 1)
+#    grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+#    theta = smoothing ** scale
+#    grad_sqr = update_avg(grad_sqr, theta)
+#    grad_var = update_avg(grad_var, theta)
+#    return grad_sqr, grad_var
+
 def running_gradient(running_grd, running_grd_sqr, grads_flat, itr, beta=0.9):
     """
     This function comptes the noise and scale for gradient noise scale
@@ -87,7 +121,7 @@ def compute_grad_flat_mean(grd):
 # Different Method
 def flatten_gradients(grads):
     flat_gradients, _ = tree_flatten(jax.tree_map(lambda x: x.ravel(), grads))
-    return jnp.concatenate(flat_gradients)
+    return jnp.reshape(jnp.concatenate(flat_gradients), (-1,1))
 
 def running_gradient_2(running_grd, grad, itr, beta=0.9):
     return (beta * running_grd + (1 - beta)*grad) / (1 - beta**(itr + 1))
@@ -98,6 +132,30 @@ def init_running_gradients(grads):
     running_grd = jnp.zeros_like(flat_grds)
     running_grd_sqr = jnp.zeros_like(flat_grds)
     return running_grd, running_grd_sqr
+
+
+def run_grads(shape, store_grads, n_batch, running_noise, running_scale, beta, iteration):
+    assert len(store_grads) == n_batch
+    stored_grads = jnp.concatenate(store_grads, axis=1) 
+    acc_grads = jnp.mean(stored_grads, axis=1)
+    #g_small = jnp.mean(jnp.sum(stored_grads**2, axis=0))
+    g_small = jnp.sum((stored_grads[:,-1] ** 2)) # mean or sum ?
+    #g_big = jnp.sum(acc_grads ** 2)
+    g_big = jnp.sum(acc_grads ** 2)    # mean or sum ?
+    #b_small, b_big = batch.shape[0], batch.shape[0] * n_batch
+    b_small, b_big = shape, shape * n_batch
+    noise = (b_big * g_big - b_small * g_small) / (b_big - b_small)
+    scale = (g_small - g_big) / ((1 / b_small) - (1 / b_big))
+        
+    lin_comb_scale = beta * running_scale + (1 - beta) * scale
+    lin_comb_noise = beta * running_noise + (1 - beta) * noise
+
+    running_scale, scale = lin_comb_scale, lin_comb_scale / (1-beta**(iteration+1))
+    running_noise, noise = lin_comb_noise, lin_comb_noise / (1-beta**(iteration+1))
+
+    noise_scale = (scale / noise)
+        
+    return noise, scale, noise_scale, running_noise, running_scale
     
 
 

@@ -2,10 +2,13 @@ import time
 import numpy as np
 from numpy.typing import NDArray
 from typing import TypeVar
-from sklearn.linear_model import LinearRegression
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import WhiteKernel, ConstantKernel, RBF, DotProduct
 from collections import defaultdict
 import pickle
 import os
+
+linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
 class PolluxAgent:
     def __init__(self, state=None):
@@ -21,8 +24,8 @@ class PolluxAgent:
         self.alloc_vector = None # allocation vector in AdaptDL
         self.training_dp_cost = None
         self.bs_dp = {}
-        self.bs_dp_regressor = LinearRegression()
-        self.bs_exectime_regressor = LinearRegression()
+        self.bs_dp_regressor = GaussianProcessRegressor(kernel=linear_rbf_kernel)
+        self.bs_exectime_regressor = GaussianProcessRegressor(kernel=linear_rbf_kernel)
         self.bs_t_iter = defaultdict(list)
         self.bs_t_exec_timecosts = defaultdict(list)
         self.bs_t_diff = defaultdict(list)
@@ -62,7 +65,7 @@ class PolluxAgent:
                     Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
                     Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
         if self.iter % 500 == 0:
-            self._save_objects(f'pickle_objects/4gp/objects_iteration{self.iter}.pkl')
+            self._save_objects(f'pickle_objects/1gp_laptop/objects_iteration{self.iter}.pkl')
             
             
     def _fit_batchsize_dynp(self):
@@ -94,10 +97,11 @@ class PolluxAgent:
         return self.bs_exectime_regressor.predict(batch_sizes)
     
     def predict_throughput(self, batch_sizes):
+        # TODO: clean up unnecessary reshapes
         if self.training_dp_cost is not None:
-            return np.array(batch_sizes).reshape(-1, 1) / self.predict_dynp_cost(np.array(batch_sizes).reshape(-1, 1))
+            return np.array(batch_sizes).reshape(-1, 1) / self.predict_dynp_cost(np.array(batch_sizes).reshape(-1, 1)).reshape(-1, 1)
         else:
-            return np.array(batch_sizes).reshape(-1, 1) / self.predict_exectime(np.array(batch_sizes).reshape(-1, 1))
+            return np.array(batch_sizes).reshape(-1, 1) / self.predict_exectime(np.array(batch_sizes).reshape(-1, 1)).reshape(-1, 1)
         
     def _save_objects(self, filename):
         os.makedirs(os.path.dirname(filename), exist_ok=True)

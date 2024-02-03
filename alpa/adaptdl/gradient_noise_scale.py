@@ -32,6 +32,17 @@ class GradientNoiseScale():
         self.accum_count = None
         self.init_batch_size = init_batch_size
         self.smoothing = smoothing
+        self.store_grads = []
+        #self.precondionners = []
+        self.running_noise = 0.0
+        self.running_scale = 0.0
+        self.noise = None
+        self.scale = None
+        self.noise_scale = None
+        self.biased_sqr = 0.0 
+        self.unbias_sqr = 0.0 
+        self.biased_var = 0.0 
+        self.unbias_var = 0.0
         
 
     @property
@@ -62,10 +73,10 @@ class GradientNoiseScale():
         pinv = jax.tree_util.tree_map(ones_like, grads._value)
         return pinv
    
-    def update_state(self, state, local_sqr_val, pgns_grads_norms):
+    def update_state(self, state):
         self.state                      = state
-        self.pgns['local_sqr_val']      = local_sqr_val._value
-        self.pgns['pgns_grads_norms']   = pgns_grads_norms._value
+        #self.pgns['local_sqr_val']      = local_sqr_val._value
+        #self.pgns['pgns_grads_norms']   = pgns_grads_norms._value
 
     def _reset_avg(self, param_name):
         self._state.pop(param_name + "_biased", None)
