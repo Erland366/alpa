@@ -75,6 +75,11 @@ class Orchestrator:
         self.all_host_info = all_host_info
         self.all_host_ips = all_host_ips
         self.all_host_num_devices = np.array(all_host_num_devices)
+        self.all_node_ids = list(node['NodeID'] for node in all_host_info)
+        
+        logger.info(f"all_host_info: {self.all_host_info}")
+        logger.info(f"all_host_ips: {self.all_host_ips}")
+        logger.info(f"all_node_ids: {self.all_node_ids}")
         
         # Assuming that all nodes have equal number of GPUs, as is required by both Alpa and AdaptDL.
         # I.e., designed for clusters with each node having the # of GPUs in the powers of 2.
@@ -117,7 +122,7 @@ class Orchestrator:
             if num_free_gpus >= init_num_gpus:
                 allocated_node = i
         
-        if allocated_node is None:
+        if allocated_node is None: # TODO: also check if such a placement group is available
             self.jobs_queue.append(job_id)
             self.jobs[job_id].status = JobState.queued
             logger.info("queued")
@@ -192,12 +197,15 @@ class Orchestrator:
                     "cluster either has enough resources or use an "
                     "autoscaling cluster. If you are running on a cluster, "
                     "make sure you specify an address in `ray.init()`, for example,"
-                    ' `ray.init("auto")`. You can also increase the timeout by '
-                    "setting the ALPA_PLACEMENT_GROUP_TIMEOUT_S environment "
-                    "variable. Current resources available: "
+                    ' `ray.init("auto")`. Current resources available: '
                     f"{ray.available_resources()}, resources requested by "
                     f"the placement group: {placement_group.bundle_specs}")
             self.jobs[job_id].pg_name = name
+            pg_table = ray.util.placement_group_table(placement_group)
+            logger.info(f"PG table: {pg_table}")
+            node_ids = [v for k, v in pg_table['bundles_to_node_id'].items()]
+            logger.info(f"node IDs of bundles: {node_ids}")
+            logger.info(f"indeces of node IDs in the allocation matrix: {[self.all_node_ids.index(node_id) for node_id in node_ids]}")
             return placement_group
         else:
             return current_placement_group

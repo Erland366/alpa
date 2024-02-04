@@ -68,4 +68,4 @@ async def get_all_jobs():
 
 
 if __name__=="__main__":
-    uvicorn.run("main:app", host=HOST, port=PORT, reload=True, log_level="debug") # TODO: set reload to False
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="debug") # TODO: set reload to False
