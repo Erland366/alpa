@@ -32,7 +32,12 @@ class PolluxAgent:
         
         self.bs_sync_starttime = None
         self.bs_sync_interval = 30 # seconds
-        print("PolluxAgent initialized.")
+        
+        self.scheduler_enabled = False
+        self.scheduler_address = None
+        self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
+        self.job_id = None
+        # print("PolluxAgent initialized.")
         
     @property
     def total_batch_size(self):

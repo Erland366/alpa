@@ -60,6 +60,7 @@ from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
 
+# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 alpa.init(cluster="ray")
 logger = logging.getLogger(__name__)
 

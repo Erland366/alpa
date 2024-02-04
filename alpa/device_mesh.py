@@ -64,6 +64,7 @@ if global_config.backend == "gpu" and global_config.has_cuda:
     from alpa.collective import worker_nccl_util
 
 from alpa.adaptdl.pollux_agent import pollux_agent
+from alpa.adaptdl.sched_requests import register_placement_group
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -2198,6 +2199,9 @@ class DeviceCluster:
         self.namespace = namespace
         if namespace:
             pg_name = namespace + "_pg"
+            if pollux_agent.scheduler_enabled: 
+                pg_name += "_" + pollux_agent.job_id
+                register_placement_group(num_hosts, self.host_num_devices, pg_name)
             try:
                 pg = ray.util.get_placement_group(pg_name)
             except ValueError:
@@ -2333,7 +2337,7 @@ def init_global_cluster(cluster: str,
                      ignore_reinit_error=True,
                      namespace=namespace)
         update_jax_platform("cpu")
-        global_cluster = DeviceCluster(num_nodes, num_devices_per_node)
+        global_cluster = DeviceCluster(num_nodes, num_devices_per_node, namespace)
         global_virtual_physical_mesh = (
             global_cluster.get_virtual_physical_mesh())
 

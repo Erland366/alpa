@@ -20,6 +20,7 @@ from alpa.version import check_alpa_jaxlib_version
 from alpa.adaptdl.pollux_agent import pollux_agent
 from flax.training import train_state
 import time
+from alpa.adaptdl.sched_requests import register_job
 
 traceback_util.register_exclusion(__file__)
 
@@ -30,7 +31,8 @@ def init(cluster: str = "ray",
          cluster_address: Optional[str] = None,
          num_nodes: Optional[int] = None,
          num_devices_per_node: Optional[int] = None,
-         namespace: Optional[str] = "alpa_default_space"):
+         namespace: Optional[str] = "alpa_default_space",
+         scheduler_address: Optional[str] = None):
     """Initialize the global environment.
 
     `devices_per_node, num_nodes` are used to specify the number of devices.
@@ -54,6 +56,11 @@ def init(cluster: str = "ray",
       num_nodes: The number of nodes.
       num_devices_per_node: The number of devices per node.
     """
+    if scheduler_address is not None:
+        pollux_agent.scheduler_enabled = True
+        pollux_agent.scheduler_address = scheduler_address
+        namespace = pollux_agent.namespace
+        register_job()
     global is_initialized
 
     if is_initialized:
