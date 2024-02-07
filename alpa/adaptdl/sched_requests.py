@@ -38,6 +38,6 @@ def release_resources():
     request_data = {
         "job_id": pollux_agent.job_id
     }
-    r = requests.post(url=url, data=request_data)
+    r = requests.post(url=url, params=request_data)
     logger.info(f"Sent request to release the resources of job {pollux_agent.job_id}")
     

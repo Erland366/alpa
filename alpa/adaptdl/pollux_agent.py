@@ -39,8 +39,11 @@ class PolluxAgent:
         self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
         self.job_id = None
         # print("PolluxAgent initialized.")
-        # from alpa.adaptdl.sched_requests import release_resources
-        # atexit.register(release_resources)
+        atexit.register(self.release_resources)
+
+    def release_resources(self):
+        from alpa.adaptdl.sched_requests import release_resources
+        release_resources()
         
     @property
     def total_batch_size(self):
