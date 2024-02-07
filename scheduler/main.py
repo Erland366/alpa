@@ -60,6 +60,19 @@ async def get_all_jobs():
     jobs = orchestrator.get_all_jobs()
     return {"jobs": jobs}
 
+@app.get("/get-all-info")
+async def get_all_jobs():
+    info = orchestrator.get_all_info()
+    return info
+
+@app.post("/release-resources")
+async def release_resources(job_id: str):
+    try:
+        orchestrator.release_resources(job_id)
+        return {"message": f"successfully released resources of job {job_id}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
 
 # @app.post("/replace-all-jobs")
 # async def replace_all_jobs(jobs: Dict[str, PolluxJob]):

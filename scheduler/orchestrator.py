@@ -11,7 +11,6 @@ from ray.util.placement_group import get_current_placement_group,\
 import time
 from util import try_import_ray_worker, is_ray_node_resource
 import uuid
-from alpa.global_env import global_config
 
 RAY_CLUSTER_ADDRESS = "127.0.0.1:6379"
 RAY_CLUSTER_NAMESPACE = "Alpa-AdaptDL-Ray-NameSpace"
@@ -60,7 +59,7 @@ class Orchestrator:
         for node in ray.nodes():
             for key in node["Resources"]:
                 if (is_ray_node_resource(key) and
-                        global_config.ray_accelerator_name
+                        "GPU"
                         in node["Resources"]):
                     all_host_info.append(node)
                     all_host_ips.append(key.split("node:")[-1])
@@ -68,7 +67,7 @@ class Orchestrator:
         # Gather device info
         all_host_num_devices = []
         for host_info in all_host_info:
-            number = host_info["Resources"][global_config.ray_accelerator_name]
+            number = host_info["Resources"]["GPU"]
             assert number.is_integer()
             all_host_num_devices.append(int(number))
         
@@ -77,9 +76,9 @@ class Orchestrator:
         self.all_host_num_devices = np.array(all_host_num_devices)
         self.all_node_ids = list(node['NodeID'] for node in all_host_info)
         
-        logger.info(f"all_host_info: {self.all_host_info}")
-        logger.info(f"all_host_ips: {self.all_host_ips}")
-        logger.info(f"all_node_ids: {self.all_node_ids}")
+        # logger.info(f"all_host_info: {self.all_host_info}")
+        # logger.info(f"all_host_ips: {self.all_host_ips}")
+        # logger.info(f"all_node_ids: {self.all_node_ids}")
         
         # Assuming that all nodes have equal number of GPUs, as is required by both Alpa and AdaptDL.
         # I.e., designed for clusters with each node having the # of GPUs in the powers of 2.
@@ -95,6 +94,23 @@ class Orchestrator:
     
     def get_all_jobs(self):
         return self.jobs
+    
+    def get_all_info(self):
+        info = {"ip_address": self.ip_address,
+                "jobs": self.jobs,
+                "ray_cluster_address": self.ray_cluster_address,
+                "ray_cluster_namespace": self.ray_cluster_namespace,
+                "allocation_matrix": {k: v.tolist() for k, v in self.allocation_matrix.items()},
+                "all_host_num_devices": self.all_host_num_devices,
+                "gpus_per_node": self.gpus_per_node,
+                "jobs_queue": self.jobs_queue,
+                "all_host_info": self.all_host_info,
+                "all_host_ips": self.all_host_ips,
+                "all_host_num_devices": self.all_host_num_devices.tolist(),
+                "all_node_ids": self.all_node_ids}
+        logger.info(f"Created dictionary info!")
+        logger.info(f"Dictionary: {info}")
+        return info
     
     
     def replace_all_jobs(self, jobs: Dict[str, PolluxJob]):
@@ -204,11 +220,33 @@ class Orchestrator:
             pg_table = ray.util.placement_group_table(placement_group)
             logger.info(f"PG table: {pg_table}")
             node_ids = [v for k, v in pg_table['bundles_to_node_id'].items()]
-            logger.info(f"node IDs of bundles: {node_ids}")
-            logger.info(f"indeces of node IDs in the allocation matrix: {[self.all_node_ids.index(node_id) for node_id in node_ids]}")
+            node_indeces = [self.all_node_ids.index(node_id) for node_id in node_ids]
+            gpus_on_nodes = [int(v['GPU']) for k, v in pg_table['bundles'].items()]
+            # logger.info(f"node IDs of bundles: {node_ids}")
+            # logger.info(f"indeces of node IDs in the allocation matrix: {[self.all_node_ids.index(node_id) for node_id in node_ids]}")
+            # logger.info(f"gpus_on_nodes: {gpus_on_nodes}")
+            # logger.info(f"allocation matrix before: {self.allocation_matrix}")
+            
+            self.allocation_matrix[job_id] = np.zeros(self.all_host_num_devices.shape, dtype=int)
+            for node_index, num_gpus in zip(node_indeces, gpus_on_nodes):
+                self.allocation_matrix[job_id][node_index] = num_gpus
+            
+            # logger.info(f"allocation matrix after: {self.allocation_matrix}")
+            self.jobs[job_id].status = JobState.allocated
+            
             return placement_group
         else:
             return current_placement_group
+        
+    
+    def release_resources(self, job_id: str):
+         if job_id not in self.allocation_matrix.keys():
+             raise SchedulerError("This job does not have any allocated resources!")
+         placement_group = ray.util.get_placement_group(self.jobs[job_id].pg_name)
+         ray.util.remove_placement_group(placement_group)
+         self.jobs[job_id].status = JobState.ended
+         del self.allocation_matrix[job_id]
+         logger.info(f"Resources of job {job_id} released!")
         
         
 orchestrator = Orchestrator()

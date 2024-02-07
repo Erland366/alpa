@@ -7,6 +7,7 @@ from sklearn.gaussian_process.kernels import WhiteKernel, ConstantKernel, RBF, D
 from collections import defaultdict
 import pickle
 import os
+import atexit
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -38,6 +39,8 @@ class PolluxAgent:
         self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
         self.job_id = None
         # print("PolluxAgent initialized.")
+        # from alpa.adaptdl.sched_requests import release_resources
+        # atexit.register(release_resources)
         
     @property
     def total_batch_size(self):
