@@ -62,18 +62,18 @@ class PolluxAgent:
             self.bs_t_diff[self.total_batch_size].append(t_iter - executable_time_cost)
         self.iter += 1
         self.throughputs.append(self.total_batch_size / t_iter if self.total_batch_size is not None else 1 / t_iter)
-        if self.iter % 20 == 0 and self.total_batch_size is not None: # printing for debugging purposes # TODO remove this
-            print(f"Iteration #{self.iter}. Time taken - {t_iter} seconds. Throughput - {self.throughputs[-1]} samples/sec. \
-                Median/mean throughput - {np.median(np.array(self.throughputs))} / {np.mean(np.array(self.throughputs))}.\n \
-                    Training DP cost - {self.training_dp_cost} \
-                        Median/mean iteration time - {np.median(np.array(self.t_iters))} / {np.mean(np.array(self.t_iters))} \
-                            Compilation time - {self.t_compilation}")
-            if executable_time_cost is not None:
-                print(f"Median current BS {self.total_batch_size} iteration time - {np.median(np.array(self.bs_t_iter[self.total_batch_size]))} \
-                    Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
-                    Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
+        # if self.iter % 20 == 0 and self.total_batch_size is not None: # printing for debugging purposes # TODO remove this
+        #     print(f"Iteration #{self.iter}. Time taken - {t_iter} seconds. Throughput - {self.throughputs[-1]} samples/sec. \
+        #         Median/mean throughput - {np.median(np.array(self.throughputs))} / {np.mean(np.array(self.throughputs))}.\n \
+        #             Training DP cost - {self.training_dp_cost} \
+        #                 Median/mean iteration time - {np.median(np.array(self.t_iters))} / {np.mean(np.array(self.t_iters))} \
+        #                     Compilation time - {self.t_compilation}")
+        #     if executable_time_cost is not None:
+        #         print(f"Median current BS {self.total_batch_size} iteration time - {np.median(np.array(self.bs_t_iter[self.total_batch_size]))} \
+        #             Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
+        #             Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
         if self.iter % 500 == 0:
-            self._save_objects(f'pickle_objects/1gp_laptop/objects_iteration{self.iter}.pkl')
+            self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
             
             
     def _fit_batchsize_dynp(self):

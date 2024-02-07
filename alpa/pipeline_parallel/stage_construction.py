@@ -632,17 +632,12 @@ def cluster_layers_and_slice_mesh(
             stage_option.submesh_logical_shape_space, batch_size)
         num_autosharding_configs = len(autosharding_configs[0])
 
-        compute_cost_start = time.time()
-
         # Use DP to find the optimal solution.
         compute_cost, max_n_succ_stages = get_compute_cost(
             virtual_mesh, submesh_choices, autosharding_configs, layers,
             accumulator_mapping, acc_grad_invars, acc_grad_outvars,
             jax_apply_layers, apply_grad_global_info, num_micro_batches,
             default_as_option, stage_option, inference_mode)
-        
-        compute_cost_time = time.time() - compute_cost_start
-        print(f"Compute cost time - {compute_cost_time}") # TODO: remove this
         
         if inference_mode:
             _, solution = inference_dp(num_layers, virtual_mesh.num_devices,
