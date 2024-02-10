@@ -450,8 +450,8 @@ def main():
         collate_fn=collate_fn,
     )
     
-    train_loader.autoscale_batch_size(max_batch_size = 160 * alpa.get_global_num_devices(), 
-                                        local_bsz_bounds=(4, 80), gradient_accumulation=False)
+    train_loader.autoscale_batch_size(max_batch_size = 80 * alpa.get_global_num_devices(), 
+                                        local_bsz_bounds=(2, 80), gradient_accumulation=False)
 
     #eval_loader = torch.utils.data.DataLoader(
     #    eval_dataset,
@@ -502,8 +502,8 @@ def main():
         training_args.learning_rate,
     )
 
-    scaling_rule = LinearScale()
-    # scaling_rule = SqrtScale()
+    #scaling_rule = LinearScale()
+    scaling_rule = SqrtScale()
     
     # TODO: initial batch size should probably be stored separately to avoid newer batch size being set after a checkpoint-restart
     scaled_linear_decay_lr_schedule_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
@@ -569,7 +569,7 @@ def main():
 
         return new_state, metrics, gradients, preconditioners
     
-    def compute_pgns_values(store_grads, preconditioner, biased_sqr, unbias_sqr, biased_var, unbias_var, count=2, scale=1, smoothing=0.9):
+    def compute_pgns_values(store_grads, preconditioner, biased_sqr, unbias_sqr, biased_var, unbias_var, count=2, scale=2, smoothing=0.9):
         
         def average_groups(grads1, grads2):
             ret = []
@@ -647,6 +647,8 @@ def main():
         losses = []
         epoch_losses = []
         gns.store_grads = []
+        eval_losses = []
+        eval_acc = []
 
         steps_per_epoch = len(train_dataset) // train_batch_size
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
@@ -687,7 +689,7 @@ def main():
                 update_grad_params(grad_sqr._value, grad_var._value)
             
             
-            train_metrics.append(train_metric)
+            #train_metrics.append(train_metric)
         
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
@@ -706,7 +708,8 @@ def main():
         train_time += time.time() - train_start
         last_time = time.time()
 
-        losses.append(jnp.mean(jnp.array(epoch_losses)))
+        logger.info(f"train_loss: {train_metric['loss']}")
+        
 
         train_step_progress_bar.close()
         epochs.write(
@@ -714,7 +717,7 @@ def main():
             f" {train_metric['learning_rate']}), "
             f"Throughput: {images_per_second:.2f} images/s, "   
         )
-        losses.append(jnp.mean(jnp.array(epoch_losses)))
+        
     
 
         # # ======================== Evaluating ==============================
@@ -738,6 +741,9 @@ def main():
         eval_metrics = alpa.util.get_metrics(eval_metrics)
         eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
+        logger.info(f"eval_loss: {eval_metrics['loss'].item()}")
+        logger.info(f"eval_acc: {eval_metrics['accuracy'].item()}")
+
         # Print metrics and update progress bar
         eval_step_progress_bar.close()
         desc = (
@@ -760,7 +766,7 @@ def main():
         #     if training_args.push_to_hub:
         #         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
-    logger.info(f'losses: {losses}')
+    logger.info(f'training losses: {losses}, eval_losses: {eval_losses}, eval_acc: {eval_acc}')
 
 
 if __name__ == "__main__":
