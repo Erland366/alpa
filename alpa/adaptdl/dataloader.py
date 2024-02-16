@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
 #handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-7/alpa-adaptdl/examples/huggingface/transformers/examples/flax/BERT/logs/Bert_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-7/alpa-adaptdl/examples/ViT/logs/ViT_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/ViT/logs/ViT_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
@@ -296,7 +296,7 @@ class AdaptiveDataLoaderHelper(object):
             )
             self._state.current_local_bsz = atomic_bsz
             self._state.accumulation_steps = accum_steps
-        elif self._state.current_local_bsz in [1, 2, 4, 8] and epoch < 4:
+        elif self._state.current_local_bsz in [16, 32, 64, 128] and epoch < 4:
         #elif self._state.current_local_bsz in [1, 4, 6, 8] and epoch < 3:
             self._state.current_local_bsz *= 2
         else:

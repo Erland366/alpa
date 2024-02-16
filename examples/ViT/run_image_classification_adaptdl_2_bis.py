@@ -83,7 +83,7 @@ def count_params(model):
 alpa.init(cluster="ray")
 logger = logging.getLogger(__name__)
 
-handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-7/alpa-adaptdl/examples/ViT/logs/gradsqr_gradvar_vit_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/ViT/logs/gradsqr_gradvar_vit_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -766,7 +766,7 @@ def main():
         #     if training_args.push_to_hub:
         #         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
-    logger.info(f'training losses: {losses}, eval_losses: {eval_losses}, eval_acc: {eval_acc}')
+    
 
 
 if __name__ == "__main__":
