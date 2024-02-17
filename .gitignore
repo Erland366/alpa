@@ -75,4 +75,5 @@ examples/ViT/imagenette2
 examples/ViT/vit-base-patch16-imagenette/
 *.tgz
 *.ipynb_checkpoints
-examples/ViT/alpa_debug_info*
+alpa_debug_info*
+pickle_objects*
