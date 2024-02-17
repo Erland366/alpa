@@ -11,6 +11,7 @@ from ray.util.placement_group import get_current_placement_group,\
 import time
 from util import try_import_ray_worker, is_ray_node_resource
 import uuid
+import asyncio
 
 RAY_CLUSTER_ADDRESS = "127.0.0.1:6379"
 RAY_CLUSTER_NAMESPACE = "Alpa-AdaptDL-Ray-NameSpace"
@@ -148,7 +149,7 @@ class Orchestrator:
             self.allocation_matrix[job_id] = allocation_vector
             self.jobs[job_id].status = JobState.allocated
     
-    def create_placement_group(self, num_hosts,
+    async def create_placement_group(self, num_hosts,
                             host_num_devices,
                             name,
                             job_id,
@@ -233,6 +234,10 @@ class Orchestrator:
             
             # logger.info(f"allocation matrix after: {self.allocation_matrix}")
             self.jobs[job_id].status = JobState.allocated
+
+            from main import send_message_to_clients
+            
+            await send_message_to_clients("Test message from orchestrator to clients")
             
             return placement_group
         else:

@@ -61,6 +61,8 @@ def init(cluster: str = "ray",
         pollux_agent.scheduler_address = scheduler_address
         namespace = pollux_agent.namespace
         register_job()
+        pollux_agent.init_sched_utils()
+        
     global is_initialized
 
     if is_initialized:

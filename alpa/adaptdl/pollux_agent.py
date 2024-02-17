@@ -8,6 +8,8 @@ from collections import defaultdict
 import pickle
 import os
 import atexit
+import threading
+import asyncio
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -39,11 +41,14 @@ class PolluxAgent:
         self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
         self.job_id = None
         # print("PolluxAgent initialized.")
-        atexit.register(self.release_resources)
 
-    def release_resources(self):
+    def init_sched_utils(self):
         from alpa.adaptdl.sched_requests import release_resources
-        release_resources()
+        atexit.register(release_resources)
+
+        from alpa.adaptdl.websocket_client import start_websocket_client
+        thread = threading.Thread(target=start_websocket_client, daemon=True)
+        thread.start()
         
     @property
     def total_batch_size(self):

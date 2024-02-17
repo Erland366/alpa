@@ -41,7 +41,7 @@ async def initial_request_placement_group(job_id: str):
 @app.post("/create-placement-group")
 async def create_placement_group(placementgrouprequest: PlacementGroupRequest):
     try:
-        pg = orchestrator.create_placement_group(placementgrouprequest.num_hosts, placementgrouprequest.host_num_devices, placementgrouprequest.name,
+        pg = await orchestrator.create_placement_group(placementgrouprequest.num_hosts, placementgrouprequest.host_num_devices, placementgrouprequest.name,
                                                  placementgrouprequest.job_id)
         print(f"Placement group: {ray.util.get_placement_group(placementgrouprequest.name)}")
         return {"message": f"placement group with namespace {placementgrouprequest.name} created!"}
@@ -73,12 +73,28 @@ async def release_resources(job_id: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
 
+connected_clients = []
 
-# @app.post("/replace-all-jobs")
-# async def replace_all_jobs(jobs: Dict[str, PolluxJob]):
-#     orchestrator.replace_all_jobs(jobs)
-#     return {"message": "successfully replaced all the existing jobs"}
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+    try:
+        while True:
+            # Keep the connection open, listen for incoming messages
+            # You can also send messages to the client as needed
+            data = await websocket.receive_text()
+            print(f"Message from client: {data}")
+    except Exception as e:
+        # Handle disconnection
+        connected_clients.remove(websocket)
+        print(f"Client disconnected: {e}")
+
+
+async def send_message_to_clients(message):
+    for client in connected_clients:
+        await client.send_json(message)
 
 
 if __name__=="__main__":
-    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="debug") # TODO: set reload to False
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="info")
