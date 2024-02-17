@@ -1,6 +1,7 @@
 import ray
 import socket
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File
+from fastapi.param_functions import Query
 from typing import Union, Optional, List, Tuple, Set, Dict
 from enum import Enum
 import uvicorn
@@ -9,9 +10,14 @@ from orchestrator import orchestrator
 from pollux_job import PolluxJob
 from pydantic import BaseModel
 import pickle
+import logging
 
 HOST = "127.0.0.1"
 PORT = 8000
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
     
 @asynccontextmanager
@@ -73,27 +79,33 @@ async def release_resources(job_id: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
 
-connected_clients = []
+@app.post("/update-state")
+async def update_state(job_id: str = Query(...), state_bytes: UploadFile = File(...)):
+    try:
+        state_contents = await state_bytes.read()
+        state_unpickled = pickle.loads(state_contents)
+        orchestrator.update_state(job_id, state_unpickled)
+        return {"message": f"successfully updated state of job {job_id}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
+connected_clients: Dict[str, WebSocket] = {}
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, job_id: str):
     await websocket.accept()
-    connected_clients.append(websocket)
+    connected_clients[job_id] = websocket
     try:
         while True:
-            # Keep the connection open, listen for incoming messages
-            # You can also send messages to the client as needed
             data = await websocket.receive_text()
             print(f"Message from client: {data}")
     except Exception as e:
-        # Handle disconnection
-        connected_clients.remove(websocket)
+        del connected_clients[job_id]
         print(f"Client disconnected: {e}")
 
 
-async def send_message_to_clients(message):
-    for client in connected_clients:
-        await client.send_json(message)
+async def send_message_to_client(job_id: str, message):
+    await connected_clients[job_id].send_json(message)
 
 
 if __name__=="__main__":

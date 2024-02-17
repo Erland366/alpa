@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from typing import Union, Optional, List, Tuple, Set, Dict
 from enum import Enum
 from datetime import datetime
+from alpa.adaptdl.pollux_agent import PolluxAgent
 
 
 class JobState(str, Enum):
@@ -20,6 +21,7 @@ class PolluxJob:
     creation_time: datetime
     status: JobState
     pg_name: str
+    pollux_agent: PolluxAgent
     
     def __init__(self, id: str):
         self.id = id

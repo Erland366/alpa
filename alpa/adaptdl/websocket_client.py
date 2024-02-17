@@ -6,12 +6,13 @@ import logging
 import threading
 import asyncio
 import websockets
+from datetime import datetime
 
 def start_websocket_client():
     asyncio.run(websocket_client())
 
 async def websocket_client():
-    uri = "ws://localhost:8000/ws"  # TODO: hardcoded
+    uri = f"ws://localhost:8000/ws?job_id={pollux_agent.job_id}"  # TODO: hardcoded
     print(f"Running websocket client")
     async with websockets.connect(uri) as websocket:
         while True:
@@ -20,6 +21,6 @@ async def websocket_client():
             asyncio.get_event_loop().call_soon_threadsafe(handle_message, message)
 
 def handle_message(message):
-    print(f"Handling message synchronously: {message}")
+    print(f"Handling message synchronously: {message} at time {datetime.now().strftime('%H:%M:%S')}")
     # if message == "command_xyz":
         # perform_action()

@@ -3,6 +3,7 @@ from alpa.adaptdl.pollux_agent import pollux_agent
 from typing import Union, Optional, List, Tuple, Set, Dict
 import requests
 import logging
+import pickle
 
 
 logging.basicConfig(level=logging.INFO)
@@ -40,4 +41,16 @@ def release_resources():
     }
     r = requests.post(url=url, params=request_data)
     logger.info(f"Sent request to release the resources of job {pollux_agent.job_id}")
+
+
+def update_state(state_bytes):
+    request = "/update-state"
+    url = pollux_agent.scheduler_address + request
+    request_data = {
+        "job_id": pollux_agent.job_id
+    }
+    files = {
+        "state_bytes": state_bytes
+    }
+    r = requests.post(url=url, params=request_data, files=files)
     

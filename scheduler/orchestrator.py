@@ -109,8 +109,6 @@ class Orchestrator:
                 "all_host_ips": self.all_host_ips,
                 "all_host_num_devices": self.all_host_num_devices.tolist(),
                 "all_node_ids": self.all_node_ids}
-        logger.info(f"Created dictionary info!")
-        logger.info(f"Dictionary: {info}")
         return info
     
     
@@ -148,6 +146,7 @@ class Orchestrator:
             logger.info(f"allocation_vector - {allocation_vector}")
             self.allocation_matrix[job_id] = allocation_vector
             self.jobs[job_id].status = JobState.allocated
+
     
     async def create_placement_group(self, num_hosts,
                             host_num_devices,
@@ -235,13 +234,23 @@ class Orchestrator:
             # logger.info(f"allocation matrix after: {self.allocation_matrix}")
             self.jobs[job_id].status = JobState.allocated
 
-            from main import send_message_to_clients
+            from main import send_message_to_client
             
-            await send_message_to_clients("Test message from orchestrator to clients")
+            await send_message_to_client(job_id=job_id, message="Created placement group for you - websocket message")
+
+            # from util import periodically_send_messages
+
+            # asyncio.create_task(periodically_send_messages(job_id))
             
             return placement_group
         else:
             return current_placement_group
+
+
+    def update_state(self, job_id: str, pollux_agent):
+        if job_id not in self.jobs.keys():
+            raise SchedulerError("This job is not found in the scheduler's database")
+        self.jobs[job_id].pollux_agent = pollux_agent
         
     
     def release_resources(self, job_id: str):

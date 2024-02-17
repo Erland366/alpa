@@ -61,7 +61,7 @@ class PolluxAgent:
     
     def report_iteration(self, state, t_iter, executable_time_cost=None):
         assert self.total_batch_size != None, "Batch size should be set in the training code using pollux_agent.total_batch_size"
-        self.state = state
+        # self.state = state
         self.t_iters.append(t_iter)
         self.bs_t_iter[self.total_batch_size].append(t_iter)
         if executable_time_cost is not None:
@@ -80,6 +80,10 @@ class PolluxAgent:
         #         print(f"Median current BS {self.total_batch_size} iteration time - {np.median(np.array(self.bs_t_iter[self.total_batch_size]))} \
         #             Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
         #             Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
+        if self.iter % 20 == 0:
+            dumped = pickle.dumps(self)
+            from alpa.adaptdl.sched_requests import update_state
+            update_state(dumped)
         if self.iter % 500 == 0:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
             
