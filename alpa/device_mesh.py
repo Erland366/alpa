@@ -1048,7 +1048,10 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
 
     def get_host_worker_name(self, host_id):
         if self.namespace:
-            return f"mesh_{self.mesh_id}_host_{host_id}"
+            if pollux_agent.scheduler_address is None:
+                return f"mesh_{self.mesh_id}_host_{host_id}"
+            else:
+                return f"mesh_{self.mesh_id}_host_{host_id}_job_{pollux_agent.job_id}"
         else:
             return None
 
