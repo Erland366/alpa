@@ -117,7 +117,7 @@ class Orchestrator:
         self.jobs = jobs
         
         
-    def initial_request_placement_group(self, job_id: str):
+    async def initial_request_placement_group(self, job_id: str, name: str):
         if job_id in self.allocation_matrix.keys() or self.jobs[job_id].status is not JobState.registered:
             raise SchedulerError("This job is not supposed to request initial resources!")
         
@@ -140,12 +140,17 @@ class Orchestrator:
         if allocated_node is None: # TODO: also check if such a placement group is available
             self.jobs_queue.append(job_id)
             self.jobs[job_id].status = JobState.queued
-            logger.info("queued")
+            logger.info(f"queued job {job_id}")
+            return None # TODO: instead, implement a queueing mechanism, job should wait for a placement group
         else:
-            allocation_vector = np.array([init_num_gpus if i == allocated_node else 0 for i in range(self.all_host_num_devices.shape[0])])
-            logger.info(f"allocation_vector - {allocation_vector}")
-            self.allocation_matrix[job_id] = allocation_vector
-            self.jobs[job_id].status = JobState.allocated
+            # allocation_vector = np.array([init_num_gpus if i == allocated_node else 0 for i in range(self.all_host_num_devices.shape[0])])
+            # logger.info(f"allocation_vector - {allocation_vector}")
+            # self.allocation_matrix[job_id] = allocation_vector
+            num_hosts = 1
+            host_num_devices = [init_num_gpus] * num_hosts
+            # pg_name = RAY_CLUSTER_NAMESPACE + "_pg_" + job_id
+            # self.jobs[job_id].status = JobState.allocated
+            return await self.create_placement_group(num_hosts, host_num_devices, name, job_id)
 
     
     async def create_placement_group(self, num_hosts,
@@ -203,7 +208,7 @@ class Orchestrator:
                                                     strategy=strategy,
                                                     name=name or "")
             logger.info("Waiting for placement group to start.")
-            timeout = 100
+            timeout = 5 # TODO: need to handle queueing, just denying the job right now
             ready, _ = ray.wait([placement_group.ready()], timeout=timeout)
             if ready:
                 logger.info("Placement group has started.")

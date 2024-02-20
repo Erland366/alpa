@@ -37,9 +37,12 @@ class PlacementGroupRequest(BaseModel):
     
     
 @app.post("/initial-request-placement-group")
-async def initial_request_placement_group(job_id: str):
+async def initial_request_placement_group(job_id: str, name: str):
     try:
-        orchestrator.initial_request_placement_group(job_id)
+        pg = await orchestrator.initial_request_placement_group(job_id, name)
+        print(f"Placement group: {pg}")
+        # print(f"Objects in the pg object: {dir(pg)}")
+        return {"message": f"placement group with name {ray.util.placement_group_table(pg)['name']} created!"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
 
@@ -50,7 +53,7 @@ async def create_placement_group(placementgrouprequest: PlacementGroupRequest):
         pg = await orchestrator.create_placement_group(placementgrouprequest.num_hosts, placementgrouprequest.host_num_devices, placementgrouprequest.name,
                                                  placementgrouprequest.job_id)
         print(f"Placement group: {ray.util.get_placement_group(placementgrouprequest.name)}")
-        return {"message": f"placement group with namespace {placementgrouprequest.name} created!"}
+        return {"message": f"placement group with name {placementgrouprequest.name} created!"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
     

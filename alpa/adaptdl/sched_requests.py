@@ -18,6 +18,17 @@ def register_job() -> str:
     data = r.json()
     pollux_agent.job_id = data['job_id']
     logger.info(f"Registered job with orchestrator with job_id {pollux_agent.job_id}")
+
+
+def initial_request_placement_group(name: str):
+    request = "/initial-request-placement-group"
+    url = pollux_agent.scheduler_address + request
+    request_data = {
+        "job_id": pollux_agent.job_id,
+        "name": name
+    }
+    r = requests.post(url=url, params=request_data)
+    logger.info(f"Got placement group for job_id {pollux_agent.job_id}")
     
 
 def register_placement_group(num_hosts: int, host_num_devices: List[int], name: str):

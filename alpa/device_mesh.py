@@ -64,7 +64,7 @@ if global_config.backend == "gpu" and global_config.has_cuda:
     from alpa.collective import worker_nccl_util
 
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.sched_requests import register_placement_group
+from alpa.adaptdl.sched_requests import register_placement_group, initial_request_placement_group
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -2175,7 +2175,7 @@ class DeviceCluster:
             assert number.is_integer()
             all_host_num_devices.append(int(number))
         
-        pollux_agent.alloc_vector = all_host_num_devices
+        # pollux_agent.alloc_vector = all_host_num_devices
 
         # adjust the resource allocations
         # if `num_nodes` is set, use it.
@@ -2204,9 +2204,20 @@ class DeviceCluster:
             pg_name = namespace + "_pg"
             if pollux_agent.scheduler_enabled: 
                 pg_name += "_" + pollux_agent.job_id
-                register_placement_group(num_hosts, self.host_num_devices, pg_name)
+                if num_hosts and num_devices_per_node:
+                    register_placement_group(num_hosts, self.host_num_devices, pg_name)
+                else:
+                    initial_request_placement_group(pg_name)
+
+                # Below is just to request a placement group for all the devices from the scheduler, only for testing
+                # register_placement_group(num_hosts, self.host_num_devices, pg_name)
             try:
                 pg = ray.util.get_placement_group(pg_name)
+                # The below code sets self.host_num_devices to whatever the scheduler allocated
+                if pollux_agent.scheduler_enabled:
+                    pg_table = ray.util.placement_group_table(pg)
+                    self.host_num_devices = [int(v['GPU']) for k, v in pg_table['bundles'].items()]
+                    # print(f"host_num_devices: {self.host_num_devices}")
             except ValueError:
                 pg = None
         else:
@@ -2219,7 +2230,7 @@ class DeviceCluster:
                 num_hosts, self.host_num_devices, pg_name)
 
         # Update the Device Cluster info from placement group
-        if num_devices_per_node or num_nodes:
+        if num_devices_per_node or num_nodes or pollux_agent.scheduler_enabled:
             # map: host ip to host info
             host_ip2info = dict(zip(all_host_ips, all_host_info))
 
@@ -2238,6 +2249,8 @@ class DeviceCluster:
             self.host_ips = [
                 ips[bundle_idx] for bundle_idx in device_bundle_idx_list
             ]
+            # print(f"host_info: {self.host_info}")
+            # print(f"host_ips: {self.host_ips}")
         else:
             self.host_info = all_host_info
             self.host_ips = all_host_ips
