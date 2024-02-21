@@ -29,6 +29,17 @@ def initial_request_placement_group(name: str):
     }
     r = requests.post(url=url, params=request_data)
     logger.info(f"Got placement group for job_id {pollux_agent.job_id}")
+
+
+def reallocation_request_placement_group(name: str):
+    request = "/reallocation-request-placement-group"
+    url = pollux_agent.scheduler_address + request
+    request_data = {
+        "job_id": pollux_agent.job_id,
+        "name": name
+    }
+    r = requests.post(url=url, params=request_data)
+    logger.info(f"Got placement group for job_id {pollux_agent.job_id}")
     
 
 def register_placement_group(num_hosts: int, host_num_devices: List[int], name: str):

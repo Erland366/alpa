@@ -12,6 +12,7 @@ import time
 from util import try_import_ray_worker, is_ray_node_resource
 import uuid
 import asyncio
+from datetime import datetime
 
 RAY_CLUSTER_ADDRESS = "127.0.0.1:6379"
 RAY_CLUSTER_NAMESPACE = "Alpa-AdaptDL-Ray-NameSpace"
@@ -45,6 +46,7 @@ class Orchestrator:
         self._ray_init(address=self.ray_cluster_address, namespace=self.ray_cluster_namespace)
         self.allocation_matrix = {}
         self.jobs_queue = []
+        self.realloc_requests_once = True # temporary for tests
         
     
     def _ray_init(self, address: str, namespace: str):
@@ -246,6 +248,10 @@ class Orchestrator:
             # from util import periodically_send_messages
 
             # asyncio.create_task(periodically_send_messages(job_id))
+
+            if not self.realloc_requests_once:
+                asyncio.create_task(self.send_reallocation_notices())
+                self.realloc_requests_once = True
             
             return placement_group
         else:
@@ -273,6 +279,51 @@ class Orchestrator:
         except:
             # del self.allocation_matrix[job_id]
             raise SchedulerError("Placement group not found, job probably called alpa.shutdown().")
+
+
+    async def send_reallocation_notices(self): # input list of relevant jobs
+        await asyncio.sleep(30)
+        job_ids = [j for j in self.jobs.keys() if self.jobs[j].status == JobState.allocated]
+        for job_id in job_ids:
+            from main import send_message_to_client
+            logger.info(f"Sending reallocation notice at {datetime.now().strftime('%H:%M:%S')}")
+            await send_message_to_client(job_id, "reallocation")
+
+    
+    async def reallocation_request_placement_group(self, job_id: str, name: str):
+        if job_id in self.allocation_matrix.keys() or self.jobs[job_id].status is not JobState.reallocating:
+            raise SchedulerError("This job is not supposed to request resource reallocation!")
+        
+        # Get used and free resources' vectors
+        used_resources = np.zeros(self.all_host_num_devices.shape, dtype=int)
+        
+        for allocation_vector in list(self.allocation_matrix.values()):
+            used_resources += allocation_vector
+
+        free_resources = self.all_host_num_devices - used_resources
+        
+        init_num_gpus = min(2, self.gpus_per_node)
+        
+        allocated_node = None
+        
+        for i, num_free_gpus in enumerate(free_resources):
+            if num_free_gpus >= init_num_gpus:
+                allocated_node = i
+        
+        if allocated_node is None: # TODO: also check if such a placement group is available
+            self.jobs_queue.append(job_id)
+            self.jobs[job_id].status = JobState.queued
+            logger.info(f"queued job {job_id}")
+            return None # TODO: instead, implement a queueing mechanism, job should wait for a placement group
+        else:
+            # allocation_vector = np.array([init_num_gpus if i == allocated_node else 0 for i in range(self.all_host_num_devices.shape[0])])
+            # logger.info(f"allocation_vector - {allocation_vector}")
+            # self.allocation_matrix[job_id] = allocation_vector
+            num_hosts = 1
+            host_num_devices = [init_num_gpus] * num_hosts
+            # pg_name = RAY_CLUSTER_NAMESPACE + "_pg_" + job_id
+            # self.jobs[job_id].status = JobState.allocated
+            return await self.create_placement_group(num_hosts, host_num_devices, name, job_id)
 
         
         

@@ -46,6 +46,17 @@ async def initial_request_placement_group(job_id: str, name: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
 
+
+@app.post("/reallocation-request-placement-group")
+async def reallocation_request_placement_group(job_id: str, name: str):
+    try:
+        pg = await orchestrator.reallocation_request_placement_group(job_id, name)
+        print(f"Placement group: {pg}")
+        # print(f"Objects in the pg object: {dir(pg)}")
+        return {"message": f"placement group with name {ray.util.placement_group_table(pg)['name']} created!"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=e.message)
+
     
 @app.post("/create-placement-group")
 async def create_placement_group(placementgrouprequest: PlacementGroupRequest):
@@ -108,7 +119,7 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
 
 
 async def send_message_to_client(job_id: str, message):
-    await connected_clients[job_id].send_json(message)
+    await connected_clients[job_id].send_text(message)
 
 
 if __name__=="__main__":

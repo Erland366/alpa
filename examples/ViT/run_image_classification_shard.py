@@ -56,6 +56,7 @@ from transformers.utils import get_full_repo_name, send_example_telemetry
 from alpa.adaptdl.pollux_agent import pollux_agent
 import numpy as np
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
+from alpa.adaptdl.api import reallocate_and_update_state
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
@@ -578,6 +579,10 @@ def main():
             #     alpa.init(cluster='ray')
             #     # print(f"GLOBAL PHYSICAL MESH after shutdown - {alpa.get_global_physical_mesh()}")
             
+            if pollux_agent.reallocation_approaching:
+                p_train_step.get_last_executable().sync()
+                state = reallocate_and_update_state(state)
+
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 

@@ -64,7 +64,7 @@ if global_config.backend == "gpu" and global_config.has_cuda:
     from alpa.collective import worker_nccl_util
 
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.sched_requests import register_placement_group, initial_request_placement_group
+from alpa.adaptdl.sched_requests import register_placement_group, initial_request_placement_group, reallocation_request_placement_group
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -2146,7 +2146,8 @@ class DeviceCluster:
     def __init__(self,
                  num_nodes: int = None,
                  num_devices_per_node: int = None,
-                 namespace: Optional[str] = None):
+                 namespace: Optional[str] = None,
+                 is_reallocation: Optional[bool] = False):
         # pylint: disable=import-outside-toplevel
         ray_global_node = ray_worker._global_node
         try:
@@ -2207,7 +2208,10 @@ class DeviceCluster:
                 if num_hosts and num_devices_per_node:
                     register_placement_group(num_hosts, self.host_num_devices, pg_name)
                 else:
-                    initial_request_placement_group(pg_name)
+                    if not is_reallocation:
+                        initial_request_placement_group(pg_name)
+                    else:
+                        reallocation_request_placement_group(pg_name)
 
                 # Below is just to request a placement group for all the devices from the scheduler, only for testing
                 # register_placement_group(num_hosts, self.host_num_devices, pg_name)
@@ -2341,7 +2345,8 @@ def init_global_cluster(cluster: str,
                         cluster_address: Optional[str] = None,
                         num_nodes: Optional[int] = None,
                         num_devices_per_node: Optional[int] = None,
-                        namespace: Optional[str] = None):
+                        namespace: Optional[str] = None,
+                        is_reallocation: Optional[bool] = False):
     global global_cluster, global_physical_mesh, global_virtual_physical_mesh
 
     if cluster == "local":
@@ -2353,7 +2358,7 @@ def init_global_cluster(cluster: str,
                      ignore_reinit_error=True,
                      namespace=namespace)
         update_jax_platform("cpu")
-        global_cluster = DeviceCluster(num_nodes, num_devices_per_node, namespace)
+        global_cluster = DeviceCluster(num_nodes, num_devices_per_node, namespace, is_reallocation)
         global_virtual_physical_mesh = (
             global_cluster.get_virtual_physical_mesh())
 

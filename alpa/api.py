@@ -32,7 +32,8 @@ def init(cluster: str = "ray",
          num_nodes: Optional[int] = None,
          num_devices_per_node: Optional[int] = None,
          namespace: Optional[str] = "alpa_default_space",
-         scheduler_address: Optional[str] = None):
+         scheduler_address: Optional[str] = None,
+         is_reallocation: Optional[bool] = False):
     """Initialize the global environment.
 
     `devices_per_node, num_nodes` are used to specify the number of devices.
@@ -60,8 +61,9 @@ def init(cluster: str = "ray",
         pollux_agent.scheduler_enabled = True
         pollux_agent.scheduler_address = scheduler_address
         namespace = pollux_agent.namespace
-        register_job()
-        pollux_agent.init_sched_utils()
+        if not is_reallocation:
+            register_job()
+            pollux_agent.init_sched_utils()
         
     global is_initialized
 
@@ -70,7 +72,7 @@ def init(cluster: str = "ray",
     is_initialized = True
 
     init_global_cluster(cluster, cluster_address, num_nodes,
-                        num_devices_per_node, namespace)
+                        num_devices_per_node, namespace, is_reallocation)
 
 
 def shutdown(is_reallocation = False):

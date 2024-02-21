@@ -40,6 +40,7 @@ class PolluxAgent:
         self.scheduler_address = None
         self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
         self.job_id = None
+        self.reallocation_approaching = False
         # print("PolluxAgent initialized.")
 
     def init_sched_utils(self):
