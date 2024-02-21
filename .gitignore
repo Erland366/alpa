@@ -77,3 +77,4 @@ examples/ViT/vit-base-patch16-imagenette/
 *.ipynb_checkpoints
 alpa_debug_info*
 pickle_objects*
+examples/BERT/bert-qa-squad/

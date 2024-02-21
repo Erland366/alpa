@@ -75,6 +75,7 @@ class QADataset(Dataset):
         return item
 
 alpa.init(cluster="ray")
+# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1)
 
 
 logger = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ class TrainingArguments:
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
     num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
     warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
+    logging_steps: int = field(default=100, metadata={"help": "Log every X updates steps."})
     save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
     eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
     seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
@@ -913,12 +914,12 @@ def main():
     rng = jax.random.PRNGKey(training_args.seed)
     # dropout_rngs = jax.random.split(rng, jax.local_device_count())
 
-    train_batch_size = int(training_args.per_device_train_batch_size) * jax.local_device_count()
+    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
     per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
-    eval_batch_size = per_device_eval_batch_size * jax.local_device_count()
+    eval_batch_size = per_device_eval_batch_size * alpa.get_global_num_devices()
     # endregion
     
-    train_loader = DataLoader(train_dataset_pytorch, batch_size=train_batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset_pytorch, batch_size=train_batch_size, shuffle=True, drop_last=True)
 
     # region Load model
     model = FlaxAutoModelForQuestionAnswering.from_pretrained(
@@ -970,8 +971,9 @@ def main():
     # p_train_step = jax.pmap(train_step, axis_name="batch", donate_argnums=(0,))
     # p_train_step = jax.jit(train_step, donate_argnums=(0,))
     method = alpa.ShardParallel()
-    # method = alpa.PipeshardParallel()
-    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+    # method = alpa.PipeshardParallel(num_micro_batches=8)
+    # p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+    p_train_step = alpa.parallelize(train_step, method=method)
     # endregion
 
     # region Define eval step functions
@@ -995,6 +997,9 @@ def main():
     step_per_epoch = len(train_dataset) // train_batch_size
     total_steps = step_per_epoch * num_epochs
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+
+    dump_debug_info_train_step = dump_debug_info_eval_step = True
+    t_throughput = time.time()
     
     for epoch in epochs:
         train_start = time.time()
@@ -1022,6 +1027,14 @@ def main():
 
             cur_step = epoch * step_per_epoch + step
 
+            if dump_debug_info_train_step:
+                dump_debug_info_train_step = False
+                executable = p_train_step.get_last_executable()
+                executable.sync()
+                executable.dump_debug_info("alpa_debug_info")
+                epochs.write(f"Initial compilation completed. "
+                             f"Time elapsed: {time.time() - train_start:.2f} s")
+
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
                 # Save metrics
                 # train_metric = unreplicate(train_metric)
@@ -1029,12 +1042,17 @@ def main():
                 if has_tensorboard and jax.process_index() == 0:
                     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
 
+                train_metrics = []
+
+                elapsed_throughput = time.time() - t_throughput
+                throughput = training_args.logging_steps * train_batch_size / elapsed_throughput
+                t_throughput = time.time()
+
                 epochs.write(
                     f"Step... ({cur_step}/{total_steps} | Training Loss: {train_metric['loss']}, Learning Rate:"
-                    f" {train_metric['learning_rate']})"
+                    f" {train_metric['learning_rate']} | Throughput: {throughput})"
                 )
 
-                train_metrics = []
 
             # if (
             #     training_args.do_eval
@@ -1098,22 +1116,22 @@ def main():
             #     if has_tensorboard and jax.process_index() == 0:
             #         write_eval_metric(summary_writer, eval_metrics, cur_step)
 
-            if (cur_step % training_args.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
-                # save checkpoint after each epoch and push checkpoint to the hub
-                if jax.process_index() == 0:
-                    # params = jax.device_get(unreplicate(state.params))
-                    # params = state.params
-                    # Getting proper values from the state to save the model weights
-                    flattened_params = tree_flatten(state.params)
-                    for i, leaf in enumerate(flattened_params[0]):
-                        if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                            flattened_params[0][i] = leaf._value
-                    unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
-                    params = unflattened_params
-                    model.save_pretrained(training_args.output_dir, params=params)
-                    tokenizer.save_pretrained(training_args.output_dir)
-                    if training_args.push_to_hub:
-                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+            # if (cur_step % training_args.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
+            #     # save checkpoint after each epoch and push checkpoint to the hub
+            #     if jax.process_index() == 0:
+            #         # params = jax.device_get(unreplicate(state.params))
+            #         # params = state.params
+            #         # Getting proper values from the state to save the model weights
+            #         flattened_params = tree_flatten(state.params)
+            #         for i, leaf in enumerate(flattened_params[0]):
+            #             if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+            #                 flattened_params[0][i] = leaf._value
+            #         unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
+            #         params = unflattened_params
+            #         model.save_pretrained(training_args.output_dir, params=params)
+            #         tokenizer.save_pretrained(training_args.output_dir)
+            #         if training_args.push_to_hub:
+            #             repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
         epochs.desc = f"Epoch ... {epoch + 1}/{num_epochs}"
     # endregion
 
