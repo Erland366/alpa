@@ -80,7 +80,7 @@ class PolluxAgent:
         #         print(f"Median current BS {self.total_batch_size} iteration time - {np.median(np.array(self.bs_t_iter[self.total_batch_size]))} \
         #             Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
         #             Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
-        if self.iter % 20 == 0:
+        if self.scheduler_enabled and self.iter % 20 == 0:
             dumped = pickle.dumps(self)
             from alpa.adaptdl.sched_requests import update_state
             update_state(dumped)
