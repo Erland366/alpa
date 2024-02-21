@@ -5,7 +5,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from typing import Union, Optional, List, Tuple, Set, Dict
 from enum import Enum
-from pollux_job import PolluxJob, JobState
+from pollux_job import PolluxJob, JobState, ResourceReleaseReason
 from ray.util.placement_group import get_current_placement_group,\
     PlacementGroup
 import time
@@ -258,14 +258,22 @@ class Orchestrator:
         self.jobs[job_id].pollux_agent = pollux_agent
         
     
-    def release_resources(self, job_id: str):
-         if job_id not in self.allocation_matrix.keys():
-             raise SchedulerError("This job does not have any allocated resources!")
-         placement_group = ray.util.get_placement_group(self.jobs[job_id].pg_name)
-         ray.util.remove_placement_group(placement_group)
-         self.jobs[job_id].status = JobState.ended
-         del self.allocation_matrix[job_id]
-         logger.info(f"Resources of job {job_id} released!")
+    def release_resources(self, job_id: str, reason: ResourceReleaseReason):
+        if job_id not in self.allocation_matrix.keys():
+            raise SchedulerError("This job does not have any allocated resources!")
+        try:
+            placement_group = ray.util.get_placement_group(self.jobs[job_id].pg_name)
+            ray.util.remove_placement_group(placement_group)
+            if reason is ResourceReleaseReason.reallocation:
+                self.jobs[job_id].status = JobState.reallocating
+            else:
+                self.jobs[job_id].status = JobState.ended
+            del self.allocation_matrix[job_id]
+            logger.info(f"Resources of job {job_id} released!")
+        except:
+            # del self.allocation_matrix[job_id]
+            raise SchedulerError("Placement group not found, job probably called alpa.shutdown().")
+
         
         
 orchestrator = Orchestrator()

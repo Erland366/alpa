@@ -2358,7 +2358,7 @@ def init_global_cluster(cluster: str,
             global_cluster.get_virtual_physical_mesh())
 
 
-def shutdown_global_cluster():
+def shutdown_global_cluster(is_reallocation = False):
     global global_cluster, global_physical_mesh, global_virtual_physical_mesh
 
     if global_physical_mesh:
@@ -2370,7 +2370,11 @@ def shutdown_global_cluster():
             global_virtual_physical_mesh.launched_physical_mesh_group.shutdown()
         global_virtual_physical_mesh = None
 
-    global_cluster.delete_placement_group()
+    if not pollux_agent.scheduler_enabled:
+        global_cluster.delete_placement_group()
+    else:
+        from alpa.adaptdl.sched_requests import release_resources
+        release_resources(is_reallocation)
     global_cluster = None
     update_jax_platform("gpu")
 

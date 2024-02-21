@@ -12,7 +12,7 @@ class JobState(str, Enum):
     queued = "queued"
     allocated = "allocated"
     started = "started"
-    restarting = "restarting"
+    reallocating = "reallocating"
     ended = "ended"
 
 
@@ -27,3 +27,8 @@ class PolluxJob:
         self.id = id
         self.creation_time = datetime.now()
         self.status = JobState.registered
+
+
+class ResourceReleaseReason(str, Enum):
+    reallocation = "reallocation"
+    ended = "ended"

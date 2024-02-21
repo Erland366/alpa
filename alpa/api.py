@@ -73,12 +73,12 @@ def init(cluster: str = "ray",
                         num_devices_per_node, namespace)
 
 
-def shutdown():
+def shutdown(is_reallocation = False):
     """Shutdown the global environment."""
     global is_initialized
     assert is_initialized is True
     is_initialized = False
-    shutdown_global_cluster()
+    shutdown_global_cluster(is_reallocation)
 
 
 def parallelize(fun: Optional[Callable] = None,

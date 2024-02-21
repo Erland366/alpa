@@ -7,7 +7,7 @@ from enum import Enum
 import uvicorn
 from contextlib import asynccontextmanager
 from orchestrator import orchestrator
-from pollux_job import PolluxJob
+from pollux_job import PolluxJob, ResourceReleaseReason
 from pydantic import BaseModel
 import pickle
 import logging
@@ -75,9 +75,9 @@ async def get_all_jobs():
     return info
 
 @app.post("/release-resources")
-async def release_resources(job_id: str):
+async def release_resources(job_id: str, reason: ResourceReleaseReason):
     try:
-        orchestrator.release_resources(job_id)
+        orchestrator.release_resources(job_id, reason)
         return {"message": f"successfully released resources of job {job_id}"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
