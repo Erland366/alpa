@@ -16,6 +16,7 @@ python run_qa_alpa.py \
   --per_device_train_batch_size 12 \
   --output_dir ./bert-qa-squad \
   --eval_steps 1000
+  --cache_dir ./cache
 ```
 
 Installation:

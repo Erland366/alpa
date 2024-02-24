@@ -78,3 +78,4 @@ examples/ViT/vit-base-patch16-imagenette/
 alpa_debug_info*
 pickle_objects*
 examples/BERT/bert-qa-squad/
+examples/BERT/cache/

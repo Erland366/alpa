@@ -61,6 +61,7 @@ import alpa
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 from torch.utils.data import Dataset, DataLoader
 import torch
+from alpa.adaptdl.pollux_agent import pollux_agent
 
 class QADataset(Dataset):
     def __init__(self, hf_dataset):
@@ -915,6 +916,9 @@ def main():
     # dropout_rngs = jax.random.split(rng, jax.local_device_count())
 
     train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
+    # train_batch_size += 1
+    # train_batch_size = 2240
+    pollux_agent.total_batch_size = train_batch_size
     per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
     eval_batch_size = per_device_eval_batch_size * alpa.get_global_num_devices()
     # endregion
@@ -971,7 +975,8 @@ def main():
     # p_train_step = jax.pmap(train_step, axis_name="batch", donate_argnums=(0,))
     # p_train_step = jax.jit(train_step, donate_argnums=(0,))
     method = alpa.ShardParallel()
-    # method = alpa.PipeshardParallel(num_micro_batches=8)
+    # method = alpa.DataParallel()
+    # method = alpa.PipeshardParallel(num_micro_batches=32, stage_option="auto")
     # p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_train_step = alpa.parallelize(train_step, method=method)
     # endregion
@@ -1046,11 +1051,12 @@ def main():
 
                 elapsed_throughput = time.time() - t_throughput
                 throughput = training_args.logging_steps * train_batch_size / elapsed_throughput
+                t_iter = elapsed_throughput / training_args.logging_steps
                 t_throughput = time.time()
 
                 epochs.write(
                     f"Step... ({cur_step}/{total_steps} | Training Loss: {train_metric['loss']}, Learning Rate:"
-                    f" {train_metric['learning_rate']} | Throughput: {throughput})"
+                    f" {train_metric['learning_rate']} | Throughput: {throughput}) | T_iter: {t_iter}"
                 )
 
 
