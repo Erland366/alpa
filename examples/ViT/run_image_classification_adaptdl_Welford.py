@@ -54,14 +54,19 @@ from transformers import (
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
 #from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale
-from alpa.adaptdl.gns_util import extract_values_with_key_p, normsqr_groups, compute_gradsnorms
+from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
+                                   normsqr_groups, 
+                                   compute_gradsnorms, 
+                                   update_variance, 
+                                   compute_variance, 
+                                   init_dict, 
+                                   compute_grad_flat_mean)
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
 from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn
-#from alpa.adaptdl.gradient_noise_scale import gns
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -106,7 +111,7 @@ class TrainingArguments:
     adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
+    num_train_epochs: float = field(default=100.0, metadata={"help": "Total number of training epochs to perform."})
     warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
     logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
     save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
@@ -120,7 +125,7 @@ class TrainingArguments:
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
     pretrain: bool = field(
-        default=False, metadata={"help": "Whether or not to pretrain."}
+        default=True, metadata={"help": "Whether or not to pretrain."}
     )
 
     def __post_init__(self):
@@ -252,6 +257,8 @@ def create_learning_rate_fn(
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
 
+def get_current_batch_size():
+    return pollux_agent.total_batch_size
 
 def main():
     
@@ -417,15 +424,12 @@ def main():
         dataset=train_dataset,
         batch_size=train_batch_size,
         shuffle=False, # TODO: handle shuffle=True
-        num_workers=data_args.preprocessing_num_workers,
-        drop_last=True,
         collate_fn=collate_fn,
-        # num_workers=data_args.preprocessing_num_workers
     )
     
     train_loader.autoscale_batch_size(max_batch_size = 60 * alpa.get_global_num_devices(), 
                                       #local_bsz_bounds=(16, 96), gradient_accumulation=False)
-                                        local_bsz_bounds=(1, 64), gradient_accumulation=False)
+                                        local_bsz_bounds=(4, 60), gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
@@ -465,9 +469,9 @@ def main():
         train_batch_size,
         training_args.num_train_epochs,
         training_args.warmup_steps,
-        training_args.learning_rate
+        training_args.learning_rate,
     )
-    
+
     scaling_rule = LinearScale()
     # scaling_rule = SqrtScale()
     
@@ -477,6 +481,7 @@ def main():
 
     # create adam optimizer
     adamw = optax.adamw(
+        #learning_rate=linear_decay_lr_schedule_fn,
         learning_rate=scaled_linear_decay_lr_schedule_fn,
         b1=training_args.adam_beta1,
         b2=training_args.adam_beta2,
@@ -490,18 +495,14 @@ def main():
     gns.init_batch_size = train_batch_size
     gns.num_replicas = alpa.get_global_num_devices()
     gns.accum_scale = alpa.get_global_num_devices()
-    #gns(state=extract_values_with_key_p(state.params), 
-                             #mp_scaler=None, 
-                             #num_workers=alpa.get_global_num_devices(), 
-                             #init_batch_size=train_batch_size)
+    params_keys, params_dict, variance_stats_flat = init_dict(state=state)
     
-
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, batch):
+    def train_step(state, batch, params_keys, variance_stats_flat, step):
 
         def compute_loss(params):
             labels = batch.pop("labels")
@@ -512,18 +513,28 @@ def main():
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
+
+        grads_flat, keys = tree_flatten(grad)
         
-        pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
-        gradients=extract_values_with_key_p(grad)
-        preconditioners=extract_values_with_key_p(pinv)
+
+        for name, grd in zip(params_keys, grads_flat):
+            #variance_stats_flat[name] = update_variance(variance_stats_flat[name], compute_grad_flat_mean(grd), variance_stats_flat[name]['n'])
+            variance_stats_flat[name] = update_variance(variance_stats_flat[name], compute_grad_flat_mean(grd), step[0])
+
+        flattened_grds = extract_values_with_key_p(grad)
+        grad_norm_squared2 = jnp.sum(jnp.array([jnp.sum(jnp.square(g)) for g in flattened_grds]))
+        grad_norm_squared = sum(jnp.sum(grad ** 2) for grad in grads_flat)
+        #estimated_variance = {name: compute_variance(variance_stats_flat[name]) for name in variance_stats_flat}
+        #trace_covariance = sum(estimated_variance.values())
+        trace_covariance = jnp.sum(jnp.array([compute_variance(variance_stats_flat[name]) for name in variance_stats_flat]))
         
-        local_sqr_val, grads_normsqr = compute_gradsnorms(gradients=gradients, 
-                                            preconditioners=preconditioners 
-                                            )
         
         metrics = {"loss": loss, 
-                   "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
-                   "pgns_grads_norms": grads_normsqr, "local_sqr_val": local_sqr_val 
+                   "learning_rate": linear_decay_lr_schedule_fn(state.step), 
+                   "grad_norm_squared": grad_norm_squared,
+                   "grad_norm_squared2": grad_norm_squared2,  
+                   "trace_covariance": trace_covariance,
+                   "variance_stats_flat": variance_stats_flat 
                    }
 
         return new_state, metrics
@@ -541,14 +552,15 @@ def main():
 
     # Create parallel version of the train and eval step
     # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
+    method = alpa.PipeshardParallel(stage_option="uniform") #uniform
     # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
-    ##method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
-    method = alpa.PipeshardParallel(stage_option="uniform")
+    # method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
     # p_train_step = alpa.parallelize(train_step,
                                     # method=method,
                                     # donate_argnums=(0,))
     
-    p_train_step = alpa.parallelize(train_step, method=method)
+    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+    
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -582,22 +594,10 @@ def main():
             if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
                 (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
                 state = update_state_on_bs_change(state)
-            state, train_metric = p_train_step(state, batch)
-            gns.update_state(state, train_metric["local_sqr_val"], train_metric["pgns_grads_norms"])
+            state, train_metric = p_train_step(state, batch, params_keys, variance_stats_flat, jnp.array([step]))
+            gns.update_state(state, train_metric["trace_covariance"], train_metric["grad_norm_squared"])
+            #update_grad_params(train_metric["grad_norm_squared"], train_metric["trace_covariance"])
             
-            #if step == len(train_loader) -1:
-                #timer = time.time()
-                #gns.compute_pgns_p(train_metric["pgns_grads_norms"], 
-                #            train_metric["local_sqr_val"])
-                #update_grad_params(gns.sqr_avg(), gns.var_avg())
-                #print(f'time for pgns computation: {time.time() - timer}')
-            
-            # print(f"Last batch shape - {batch['pixel_values'].shape}")
-            
-            # Testing if LR is scaling correctly
-            # if step % 15 == 0:
-                # print(f"Learning rate at step #{step}: {train_metric['learning_rate']}")
-                
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
@@ -622,8 +622,8 @@ def main():
             f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
             f" {train_metric['learning_rate']}), "
             f"Throughput: {images_per_second:.2f} images/s, "
-            f"pgns_grads_norms: {train_metric['pgns_grads_norms']},)"
-            f"local_sqr_val: {train_metric['local_sqr_val']})"   
+            f"pgns_grads_norms: {train_metric['grad_norm_squared']},)"
+            f"local_sqr_val: {train_metric['trace_covariance']})"   
         )
 
         # # ======================== Evaluating ==============================

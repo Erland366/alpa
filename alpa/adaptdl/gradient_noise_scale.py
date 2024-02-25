@@ -32,6 +32,17 @@ class GradientNoiseScale():
         self.accum_count = None
         self.init_batch_size = init_batch_size
         self.smoothing = smoothing
+        self.store_grads = []
+        #self.precondionners = []
+        self.running_noise = 0.0
+        self.running_scale = 0.0
+        self.noise = None
+        self.scale = None
+        self.noise_scale = None
+        self.biased_sqr = 0.0 
+        self.unbias_sqr = 0.0 
+        self.biased_var = 0.0 
+        self.unbias_var = 0.0
         
 
     @property
@@ -62,16 +73,16 @@ class GradientNoiseScale():
         pinv = jax.tree_util.tree_map(ones_like, grads._value)
         return pinv
    
-    def update_state(self, state, local_sqr_val, pgns_grads_norms):
+    def update_state(self, state):
         self.state                      = state
-        self.pgns['local_sqr_val']      = local_sqr_val._value
-        self.pgns['pgns_grads_norms']   = pgns_grads_norms._value
+        #self.pgns['local_sqr_val']      = local_sqr_val._value
+        #self.pgns['pgns_grads_norms']   = pgns_grads_norms._value
 
     def _reset_avg(self, param_name):
         self._state.pop(param_name + "_biased", None)
         self._state.pop(param_name + "_unbias", None)
     
-    def _update_avg(self, param_name, value, factor):
+    def _update_avg_2(self, param_name, value, factor):
         biased = self._state.get(param_name + "_biased", 0.0)
         unbias = self._state.get(param_name + "_unbias", 0.0)
         biased = factor * biased + (1.0 - factor) * value
@@ -80,7 +91,9 @@ class GradientNoiseScale():
         self._state[param_name + "_unbias"] = unbias
         self._state[param_name] = biased / unbias
 
-    
+    def _update_avg(self, param_name, value):
+        self._state[param_name] = value
+
     def compute_pgns_p(self, grads_normsqr, local_sqr_):  
 
         #self._local_sqr = local_sqr_._value
@@ -107,6 +120,12 @@ class GradientNoiseScale():
         self._update_avg('sqr_avg', grad_sqr, theta)
         self._update_avg('var_avg', grad_var, theta)
         self.set_progress(self.get_progress() + self.gain(scale))
+        return self._state
+    
+    def compute_pgns(self, grad_sqr, grad_var):
+        self._update_avg('sqr_avg', grad_sqr)
+        self._update_avg('var_avg', grad_var)
+        #return self.pgns['local_sqr_val'] / self.pgns['pgns_grads_norms']
         return self._state
     
 gns = GradientNoiseScale()

@@ -2,6 +2,7 @@ import time
 import numpy as np
 from numpy.typing import NDArray
 from typing import TypeVar
+from sklearn.linear_model import LinearRegression
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import WhiteKernel, ConstantKernel, RBF, DotProduct
 from collections import defaultdict
@@ -27,8 +28,8 @@ class PolluxAgent:
         self.alloc_vector = None # allocation vector in AdaptDL
         self.training_dp_cost = None
         self.bs_dp = {}
-        self.bs_dp_regressor = GaussianProcessRegressor(kernel=linear_rbf_kernel)
-        self.bs_exectime_regressor = GaussianProcessRegressor(kernel=linear_rbf_kernel)
+        self.bs_dp_regressor = LinearRegression()
+        self.bs_exectime_regressor = LinearRegression()
         self.bs_t_iter = defaultdict(list)
         self.bs_t_exec_timecosts = defaultdict(list)
         self.bs_t_diff = defaultdict(list)
@@ -61,13 +62,12 @@ class PolluxAgent:
         
     
     def report_iteration(self, state, t_iter, executable_time_cost=None):
-        assert self.total_batch_size != None, "Batch size should be set in the training code using pollux_agent.total_batch_size"
+        # assert self.total_batch_size != None, "Batch size should be set in the training code using pollux_agent.total_batch_size"
         # self.state = state
         self.t_iters.append(t_iter)
         self.bs_t_iter[self.total_batch_size].append(t_iter)
         if executable_time_cost is not None:
             self.bs_t_exec_timecosts[self.total_batch_size].append(executable_time_cost)
-            # self.bs_t_exec_timecosts[self.total_batch_size].append(t_iter)
             self.bs_t_diff[self.total_batch_size].append(t_iter - executable_time_cost)
         self.iter += 1
         self.throughputs.append(self.total_batch_size / t_iter if self.total_batch_size is not None else 1 / t_iter)
@@ -90,7 +90,7 @@ class PolluxAgent:
             
             
     def _fit_batchsize_dynp(self):
-        # assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to fit the regressor."
+        assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to fit the regressor."
         
         x_bs = np.array(list(self.bs_dp.keys())).reshape(-1, 1)
         y_dp = np.array(list(self.bs_dp.values())).reshape(-1, 1)
@@ -98,13 +98,13 @@ class PolluxAgent:
         self.bs_dp_regressor.fit(x_bs, y_dp)
         
     def predict_dynp_cost(self, batch_sizes): # TODO: handle typing
-        # assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to make predictions."
+        assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to make predictions."
         assert batch_sizes.ndim == 2 and batch_sizes.shape[1] == 1, "Input batch sizes np.ndarray should be of shape (N, 1)."
         self._fit_batchsize_dynp()
         return self.bs_dp_regressor.predict(batch_sizes)
     
     def _fit_batchsize_exectime(self):
-        # assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to fit the regressor."
+        #assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to fit the regressor."
         
         x_bs = np.array(list(self.bs_t_exec_timecosts.keys())).reshape(-1, 1)
         y_dp = np.array(list([np.median(np.array(l)) for l in self.bs_t_exec_timecosts.values()])).reshape(-1, 1)
@@ -112,7 +112,7 @@ class PolluxAgent:
         self.bs_exectime_regressor.fit(x_bs, y_dp)
         
     def predict_exectime(self, batch_sizes): # TODO: handle typing
-        # assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to make predictions."
+        #assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to make predictions."
         assert batch_sizes.ndim == 2 and batch_sizes.shape[1] == 1, "Input batch sizes np.ndarray should be of shape (N, 1)."
         self._fit_batchsize_exectime()
         return self.bs_exectime_regressor.predict(batch_sizes)

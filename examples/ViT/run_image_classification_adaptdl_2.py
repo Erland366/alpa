@@ -54,14 +54,23 @@ from transformers import (
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
 #from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale
-from alpa.adaptdl.gns_util import extract_values_with_key_p, normsqr_groups, compute_gradsnorms
+from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
+                                   normsqr_groups, 
+                                   compute_gradsnorms, 
+                                   update_variance, 
+                                   compute_variance, 
+                                   init_dict, 
+                                   compute_grad_flat_mean, 
+                                   flatten_gradients, 
+                                   running_gradient,
+                                   run_grads, 
+                                   init_running_gradients)
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
 from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn
-#from alpa.adaptdl.gradient_noise_scale import gns
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -71,6 +80,12 @@ def count_params(model):
 
 alpa.init(cluster="ray")
 logger = logging.getLogger(__name__)
+
+handler = logging.FileHandler('/home/haifatl/Documents/alpa/alpa-adaptdl-7/alpa-adaptdl/examples/ViT/noise_scale_vit_sgd.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING.keys())
@@ -120,7 +135,7 @@ class TrainingArguments:
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
     pretrain: bool = field(
-        default=False, metadata={"help": "Whether or not to pretrain."}
+        default=True, metadata={"help": "Whether or not to pretrain."}
     )
 
     def __post_init__(self):
@@ -225,6 +240,16 @@ class DataTrainingArguments:
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
 
+@dataclass
+class RunningGradientsState:
+    store_grads: list
+    noise: float
+    scale: float
+    noise_scale: float
+    beta: float
+    running_noise: float
+    running_scale: float
+    n_batch: int
 
 def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
@@ -251,6 +276,9 @@ def create_learning_rate_fn(
     )
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
+
+def get_current_batch_size():
+    return pollux_agent.total_batch_size
 
 
 def main():
@@ -416,23 +444,28 @@ def main():
     train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
         dataset=train_dataset,
         batch_size=train_batch_size,
-        shuffle=False, # TODO: handle shuffle=True
-        num_workers=data_args.preprocessing_num_workers,
-        drop_last=True,
+        shuffle=True, # TODO: handle shuffle=True
         collate_fn=collate_fn,
-        # num_workers=data_args.preprocessing_num_workers
     )
     
-    train_loader.autoscale_batch_size(max_batch_size = 60 * alpa.get_global_num_devices(), 
+    train_loader.autoscale_batch_size(max_batch_size = 20 * alpa.get_global_num_devices(), 
                                       #local_bsz_bounds=(16, 96), gradient_accumulation=False)
-                                        local_bsz_bounds=(1, 64), gradient_accumulation=False)
+                                        local_bsz_bounds=(4, 20), gradient_accumulation=False)
 
-    eval_loader = torch.utils.data.DataLoader(
-        eval_dataset,
+    #eval_loader = torch.utils.data.DataLoader(
+    #    eval_dataset,
+    #    batch_size=eval_batch_size,
+    #    shuffle=False,
+    #    num_workers=data_args.preprocessing_num_workers,
+    #    persistent_workers=True,
+    #    drop_last=False,
+    #    collate_fn=collate_fn,
+    #)
+
+    eval_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+        dataset=eval_dataset,
         batch_size=eval_batch_size,
-        shuffle=False,
-        num_workers=data_args.preprocessing_num_workers,
-        persistent_workers=True,
+        shuffle=False, 
         drop_last=False,
         collate_fn=collate_fn,
     )
@@ -465,9 +498,9 @@ def main():
         train_batch_size,
         training_args.num_train_epochs,
         training_args.warmup_steps,
-        training_args.learning_rate
+        training_args.learning_rate,
     )
-    
+
     scaling_rule = LinearScale()
     # scaling_rule = SqrtScale()
     
@@ -476,13 +509,16 @@ def main():
                                                              scaling_rule=scaling_rule)
 
     # create adam optimizer
-    adamw = optax.adamw(
-        learning_rate=scaled_linear_decay_lr_schedule_fn,
-        b1=training_args.adam_beta1,
-        b2=training_args.adam_beta2,
-        eps=training_args.adam_epsilon,
-        weight_decay=training_args.weight_decay,
-    )
+    #adamw = optax.adamw(
+        #learning_rate=linear_decay_lr_schedule_fn,
+    #    learning_rate=scaled_linear_decay_lr_schedule_fn,
+    #    b1=training_args.adam_beta1,
+    #    b2=training_args.adam_beta2,
+    #    eps=training_args.adam_epsilon,
+    #    weight_decay=training_args.weight_decay,
+    #)
+
+    adamw = optax.sgd(learning_rate=scaled_linear_decay_lr_schedule_fn)
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
@@ -490,12 +526,19 @@ def main():
     gns.init_batch_size = train_batch_size
     gns.num_replicas = alpa.get_global_num_devices()
     gns.accum_scale = alpa.get_global_num_devices()
-    #gns(state=extract_values_with_key_p(state.params), 
-                             #mp_scaler=None, 
-                             #num_workers=alpa.get_global_num_devices(), 
-                             #init_batch_size=train_batch_size)
     
-
+    #running_grd, running_grd_sqr = init_running_gradients(state.params)
+    initial_state = RunningGradientsState(
+    store_grads=[],
+    noise=0.0,
+    scale=0.0,
+    noise_scale=0.0,
+    beta=0.9,
+    running_noise=0.0,
+    running_scale=0.0,
+    n_batch=5
+)
+    
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
         return loss.mean()
@@ -512,21 +555,97 @@ def main():
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
-        
-        pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
-        gradients=extract_values_with_key_p(grad)
-        preconditioners=extract_values_with_key_p(pinv)
-        
-        local_sqr_val, grads_normsqr = compute_gradsnorms(gradients=gradients, 
-                                            preconditioners=preconditioners 
-                                            )
+
+        grads_flat = flatten_gradients(grad)
+        #running_grd, running_grd_sqr, noise, scale = running_gradient(running_grd, running_grd_sqr, grads_flat, step)
         
         metrics = {"loss": loss, 
-                   "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
-                   "pgns_grads_norms": grads_normsqr, "local_sqr_val": local_sqr_val 
+                   "learning_rate": linear_decay_lr_schedule_fn(state.step), 
+                   #"noise": noise,
+                   #"scale": scale 
                    }
 
-        return new_state, metrics
+        return new_state, metrics, grads_flat
+    
+    def train_step_gns(state, batch, 
+                       #store_grads, 
+                       n_batch, 
+                       running_noise, running_scale, 
+                       beta, iteration):
+
+        def compute_loss(params):
+            labels = batch.pop("labels")
+            logits = state.apply_fn(**batch, params=params, train=True)[0]
+            loss = loss_fn(logits, labels)
+            return loss
+        
+        #def true_fn(batch, store_grads, n_batch, running_scale, running_noise, iteration, beta):
+        #    return run_grads(batch['pixel_values'], store_grads, n_batch, running_scale, running_noise, iteration, beta)
+        
+        grad_fn = alpa.value_and_grad(compute_loss)
+        loss, grad = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grad)
+
+        grads_flat = flatten_gradients(grad)
+        
+
+        #for i in range(len(store_grads)):
+        #    if store_grads[i] is None:
+        #        store_grads[i] = grads_flat
+        #        break
+
+        #stored_grads.append(grads_flat)
+
+        #result = jax.lax.cond(
+        #    iteration % 5 == 0,
+        #    lambda *args: true_fn(*args),
+        #    lambda *args: None,  # Do nothing when the condition is false
+        #    batch, stored_grads, n_batch, running_scale, running_noise, iteration, beta
+        #)
+        
+        #noise = result[0] if result is not None else 0.0
+        #scale = result[1] if result is not None else 0.0
+        #noise_scale = result[2] if result is not None else 0.0
+        #stored_grads = result[3] if result is not None else store_grads
+        #running_noise = result[4] if result is not None else running_noise 
+        #running_scale = result[5] if result is not None else running_scale
+
+        
+        #if len(stored_grads) == 5:
+        #    noise, scale, noise_scale, store_grads, running_noise, running_scale = run_grads(batch['pixel_values'], 
+        #                                                                                 store_grads, n_batch, 
+        #                                                                                 running_scale, running_noise, 
+        #                                                                                 iteration, beta)
+        #else:
+        #    noise = 0.0
+        #    scale = 0.0
+        #    noise_scale = 0.0
+
+        noise = 0
+        scale = 0
+        noise_scale = 0
+        
+        metrics = {"loss": loss, 
+                   "learning_rate": linear_decay_lr_schedule_fn(state.step), 
+                   "noise": noise,
+                   "scale": scale,
+                   "noise_scale": noise_scale 
+                   }
+
+        #return new_state, metrics, store_grads, running_noise, running_scale
+        return new_state, metrics, running_noise, running_scale
+    
+    def compute_gns(shape, 
+                       store_grads, # flattened gradients
+                       n_batch, 
+                       running_noise, running_scale, 
+                       beta, iteration):
+
+        noise, scale, noise_scale, running_noise, running_scale = run_grads(shape, 
+                                                                            store_grads, n_batch, 
+                                                                            running_scale, running_noise, 
+                                                                            beta, iteration)
+        return noise, scale, noise_scale, running_noise, running_scale
 
     # Define eval fn
     def eval_step(params, batch):
@@ -540,15 +659,14 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    # method = alpa.Zero3Parallel() # ~14000 at 1000th iteration
-    # method = alpa.PipeshardParallel() # averagTe throughput for per-GPU batch size 64 - 16023
-    ##method = alpa.ShardParallel() # average throughput for per-GPU batch size 64 - 14336 samples/sec
-    method = alpa.PipeshardParallel(stage_option="uniform")
-    # p_train_step = alpa.parallelize(train_step,
-                                    # method=method,
-                                    # donate_argnums=(0,))
+    # method = alpa.Zero3Parallel() 
+    #method = alpa.PipeshardParallel(stage_option="uniform") 
+    # method = alpa.PipeshardParallel() 
+    method = alpa.ShardParallel() 
+
+    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+    p_compute_gns = alpa.parallelize(compute_gns, method=method)
     
-    p_train_step = alpa.parallelize(train_step, method=method)
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -574,32 +692,65 @@ def main():
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
         train_metrics = []
+        noise_scale_list = []
+        steps_list = []
+        losses = []
+        epoch_losses = []
+        gns.store_grads = []
 
         steps_per_epoch = len(train_dataset) // train_batch_size
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for step, batch in enumerate(train_loader):
-            if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
-                (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
-                state = update_state_on_bs_change(state)
-            state, train_metric = p_train_step(state, batch)
-            gns.update_state(state, train_metric["local_sqr_val"], train_metric["pgns_grads_norms"])
+            #if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
+            #    (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
+            #    state = update_state_on_bs_change(state)
+            state, train_metric, grads_flat = p_train_step(state, batch)
+            gns.store_grads.append(grads_flat)
+            epoch_losses.append(train_metric['loss']._value)
+            #state, train_metric, running_noise, running_scale = p_train_step_gns(state, batch, 
+            #                                                                                #gns.store_grads, 
+            #                                                                                initial_state.n_batch, 
+            #                                                                                gns.running_noise, 
+            #                                                                                gns.running_scale, 
+            #                                                                                initial_state.beta, jnp.array([step]))
             
-            #if step == len(train_loader) -1:
-                #timer = time.time()
-                #gns.compute_pgns_p(train_metric["pgns_grads_norms"], 
-                #            train_metric["local_sqr_val"])
-                #update_grad_params(gns.sqr_avg(), gns.var_avg())
-                #print(f'time for pgns computation: {time.time() - timer}')
             
-            # print(f"Last batch shape - {batch['pixel_values'].shape}")
             
-            # Testing if LR is scaling correctly
-            # if step % 15 == 0:
-                # print(f"Learning rate at step #{step}: {train_metric['learning_rate']}")
-                
+            #gns.store_grads = store_grads
+            #gns.running_noise = running_noise
+            #gns.running_scale = running_scale
+            #gns.noise = train_metric["noise"]
+            #gns.scale = train_metric["scale"]
+            gns.update_state(state)
+            if len(gns.store_grads) == initial_state.n_batch:
+                print(f'computing pgns at step : {step}')
+                pgnstime = time.time()
+                noise, scale, noise_scale, running_noise, running_scale = p_compute_gns(batch['pixel_values'].shape[0], 
+                                                                                                gns.store_grads, # flattened gradients
+                                                                                                initial_state.n_batch, 
+                                                                                                gns.running_noise, gns.running_scale, 
+                                                                                                initial_state.beta, jnp.array([step]))
+                p_compute_gns.get_last_executable().sync()
+                pgnstime = time.time() - pgnstime
+                gns.store_grads = []
+                gns.noise = noise
+                gns.scale = scale
+                gns.running_noise = running_noise
+                gns.running_scale = running_scale
+                gns.noise_scale = noise_scale
+                noise_scale_list.append(noise_scale._value[0])
+                steps_list.append(step)
+                print(f'noise: {noise._value}, scale: {scale._value}, noise_scale: {noise_scale._value}')
+                print(f'pgns computation time: {pgnstime}')
+                logger.info(f'epoch: {epoch}, step: {step}')
+                logger.info(f'noise: {noise._value}, scale: {scale._value}, noise_scale: {noise_scale._value}')
+                logger.info(f'pgns computation time: {pgnstime}')
+                update_grad_params(scale._value[0], noise._value[0])
+            
+            
             train_metrics.append(train_metric)
-
+        
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
             if dump_debug_info_train_step:
@@ -617,43 +768,46 @@ def main():
         train_time += time.time() - train_start
         last_time = time.time()
 
+        logger.info(f'noise_scales: {noise_scale_list}, steps: {steps_list}')
+        losses.append(jnp.mean(jnp.array(epoch_losses)))
+
         train_step_progress_bar.close()
         epochs.write(
             f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
             f" {train_metric['learning_rate']}), "
-            f"Throughput: {images_per_second:.2f} images/s, "
-            f"pgns_grads_norms: {train_metric['pgns_grads_norms']},)"
-            f"local_sqr_val: {train_metric['local_sqr_val']})"   
+            f"Throughput: {images_per_second:.2f} images/s, "   
         )
+    
 
         # # ======================== Evaluating ==============================
-        # eval_metrics = []
-        # eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-        # eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
-        # for batch in eval_loader:
-        #     # Model forward
-        #     metrics = p_eval_step(state.params, batch)
-        #     eval_metrics.append(metrics)
+        print('EVALUATING')
+        eval_metrics = []
+        eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+        eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
+        for batch in eval_loader:
+            # Model forward
+            metrics = p_eval_step(state.params, batch)
+            eval_metrics.append(metrics)
 
-        #     if dump_debug_info_eval_step:
-        #         dump_debug_info_eval_step = False
-        #         executable = p_eval_step.get_last_executable()
-        #         executable.dump_debug_info("alpa_debug_info")
+            if dump_debug_info_eval_step:
+                dump_debug_info_eval_step = False
+                executable = p_eval_step.get_last_executable()
+                executable.dump_debug_info("alpa_debug_info")
 
-        #     eval_step_progress_bar.update(1)
+            eval_step_progress_bar.update(1)
 
-        # # normalize eval metrics
-        # eval_metrics = alpa.util.get_metrics(eval_metrics)
-        # eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+        # normalize eval metrics
+        eval_metrics = alpa.util.get_metrics(eval_metrics)
+        eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-        # # Print metrics and update progress bar
-        # eval_step_progress_bar.close()
-        # desc = (
-        #     f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {round(eval_metrics['loss'].item(), 4)} | "
-        #     f"Eval Accuracy: {round(eval_metrics['accuracy'].item(), 4)})"
-        # )
-        # epochs.write(desc)
-        # epochs.desc = desc
+        # Print metrics and update progress bar
+        eval_step_progress_bar.close()
+        desc = (
+            f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {round(eval_metrics['loss'].item(), 4)} | "
+            f"Eval Accuracy: {round(eval_metrics['accuracy'].item(), 4)})"
+        )
+        epochs.write(desc)
+        epochs.desc = desc
 
         # # Save metrics
         # if has_tensorboard and jax.process_index() == 0:
@@ -667,6 +821,8 @@ def main():
         #     model.save_pretrained(training_args.output_dir, params=params)
         #     if training_args.push_to_hub:
         #         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+
+    logger.info(f'losses: {losses}')
 
 
 if __name__ == "__main__":
