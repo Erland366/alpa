@@ -16,7 +16,7 @@ def checkpoint_path():
     Returns:
         str: checkpoint path or ``None``.
     """
-    return os.getenv("ADAPTDL_CHECKPOINT_PATH", "/home/coder/alpa-adaptdl/examples/ViT/adaptdl-checkpoints")
+    return os.getenv("ADAPTDL_CHECKPOINT_PATH", "adaptdl-checkpoints")
 
 
 def share_path():
