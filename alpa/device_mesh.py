@@ -2258,6 +2258,7 @@ class DeviceCluster:
         else:
             self.host_info = all_host_info
             self.host_ips = all_host_ips
+        pollux_agent.alloc_vector = self.host_num_devices
 
     def delete_placement_group(self):
         """remove the placement group for the current device cluster."""

@@ -25,7 +25,7 @@ class PolluxAgent:
         self.last_state_retrieved_batch_size = None
         self.t_compilation = None
         self.dataset_size = None
-        self.alloc_vector = None # allocation vector in AdaptDL
+        self._alloc_vector = None # allocation vector in AdaptDL
         self.training_dp_cost = None
         self.bs_dp = {}
         self.bs_dp_regressor = LinearRegression()
@@ -42,6 +42,8 @@ class PolluxAgent:
         self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
         self.job_id = None
         self.reallocation_approaching = False
+
+        self.p_train_step = None
         # print("PolluxAgent initialized.")
 
     def init_sched_utils(self):
@@ -59,11 +61,26 @@ class PolluxAgent:
     @total_batch_size.setter
     def total_batch_size(self, new_total_batch_size):
         self._total_batch_size = new_total_batch_size
+
+
+    @property
+    def alloc_vector(self):
+        return self._alloc_vector
+    
+    @alloc_vector.setter
+    def alloc_vector(self, new_alloc_vector):
+        self._alloc_vector = new_alloc_vector
+
+    
+    def get_throughput_features(self):
+        num_gpus = self._alloc_vector[0] # assumes that each allocated node has the same # of GPUs - Alpa
+        num_nodes = len(self._alloc_vector)
+        return (self._total_batch_size, num_gpus, num_nodes)
         
     
     def report_iteration(self, state, t_iter, executable_time_cost=None):
         # assert self.total_batch_size != None, "Batch size should be set in the training code using pollux_agent.total_batch_size"
-        # self.state = state
+        self.state = state
         self.t_iters.append(t_iter)
         self.bs_t_iter[self.total_batch_size].append(t_iter)
         if executable_time_cost is not None:
@@ -82,12 +99,29 @@ class PolluxAgent:
         #             Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
         #             Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
         if self.scheduler_enabled and self.iter % 20 == 0:
-            dumped = pickle.dumps(self)
-            from alpa.adaptdl.sched_requests import update_state
-            update_state(dumped)
+            self.pickle_and_update_scheduler()
         if self.iter % 500 == 0:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
             
+
+    def pickle_and_update_scheduler(self):
+        dumped = pickle.dumps(self)
+        from alpa.adaptdl.sched_requests import update_state
+        update_state(dumped)
+
+    
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state['p_train_step']
+        del state['state']
+        # TODO: also make sure that PGNS value is materialized
+        return state
+
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # self.p_train_step = None
+
             
     def _fit_batchsize_dynp(self):
         assert len(self.bs_dp) >= 2, "At least 2 batch size - DynP costs are required to fit the regressor."
