@@ -30,12 +30,12 @@ class GoodputFunction(object):
         self._init_batch_size = init_batch_size
 
     def __call__(self, num_nodes, 
-                 num_replicas, atomic_bsz, accum_steps):
-        return self.evaluate(num_nodes, num_replicas, atomic_bsz, accum_steps)
+                 num_workers, atomic_bsz, accum_steps):
+        return self.evaluate(num_nodes, num_workers, atomic_bsz, accum_steps)
     
-    def evaluate(self, num_nodes, num_replicas, atomic_bsz, accum_steps):
+    def evaluate(self, num_nodes, num_workers, atomic_bsz, accum_steps):
         global LOGGER
-        batch_size = num_replicas * atomic_bsz * (accum_steps + 1)
+        batch_size = num_workers * atomic_bsz * (accum_steps + 1)
         assert np.all(self._init_batch_size <= batch_size)
         bsz_logs = atomic_bsz
         selogs = self.efficiency(batch_size)
@@ -75,7 +75,7 @@ class GoodputFunction(object):
         throughtput = pollux_agent.predict_throughput(batch_sizes=batchsizes)
         return throughtput
     
-    def optimize(self, num_nodes, num_replicas, max_batch_size=None, 
+    def optimize(self, num_nodes, num_workers, max_batch_size=None, 
                  atomic_bsz_range=None, accumulation=None):
         if max_batch_size is None:
             max_batch_size = self._init_batch_size
@@ -83,9 +83,9 @@ class GoodputFunction(object):
         atomic_bsz_range = atomic_bsz_range or (None, None)
         min_atomic_bsz = atomic_bsz_range[0] or 1
         max_atomic_bsz = atomic_bsz_range[1] or max_batch_size
-        min_batch_size = jnp.maximum(self._init_batch_size, min_atomic_bsz * num_replicas)
+        min_batch_size = jnp.maximum(self._init_batch_size, min_atomic_bsz * num_workers)
         batch_size = jnp.geomspace(min_batch_size, max_batch_size)
-        local_bsz = batch_size / num_replicas
+        local_bsz = batch_size / num_workers
         eps = 1e-8
         if accumulation:
             pass
@@ -93,7 +93,7 @@ class GoodputFunction(object):
             accum_steps = jnp.zeros_like(local_bsz)
             print(f'accum_steps: {accum_steps}')
             atomic_bsz = jnp.where(
-                num_replicas == 1,
+                num_workers == 1,
                 self._init_batch_size,
                 jnp.ceil(local_bsz - eps)
             )
@@ -102,7 +102,7 @@ class GoodputFunction(object):
         atomic_bsz = jnp.minimum(max_atomic_bsz, atomic_bsz)
         #print(f'atomic_bsz: {atomic_bsz}')
         goodput = self.evaluate(num_nodes=num_nodes, 
-                                    num_replicas=num_replicas, 
+                                    num_workers=num_workers, 
                                     atomic_bsz=atomic_bsz, 
                                     accum_steps=accum_steps)
         #print(f'goodput: {goodput}')

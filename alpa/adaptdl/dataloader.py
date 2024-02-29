@@ -154,7 +154,7 @@ class AdaptiveDataLoaderHelper(object):
         self._gradient_accumulation = False
         self._speedup_threshold = 1.05
         self._accum_count = 0
-        self._num_replicas = alpa.get_global_num_devices()
+        self._num_workers = alpa.get_global_num_devices()
         self._num_nodes = 1
 
     @property
@@ -263,9 +263,9 @@ class AdaptiveDataLoaderHelper(object):
             raise ValueError("invalid max_batch_size")
         if local_bsz_bounds is not None and (
                 local_bsz_bounds[0] is not None and
-                local_bsz_bounds[0] > jnp.round(self.batch_size / self._num_replicas)  or
+                local_bsz_bounds[0] > jnp.round(self.batch_size / self._num_workers)  or
                 local_bsz_bounds[1] is not None and
-                local_bsz_bounds[1] < jnp.round(self.batch_size / self._num_replicas)):
+                local_bsz_bounds[1] < jnp.round(self.batch_size / self._num_workers)):
             raise ValueError("invalid local_bsz_bounds")
         self._max_batch_size = max_batch_size
         self._local_bsz_bounds = local_bsz_bounds
@@ -285,37 +285,38 @@ class AdaptiveDataLoaderHelper(object):
         goodput_fn = get_goodput_fn()
 
         if self.max_batch_size is None or goodput_fn is None:
-            self._state.current_local_bsz = np.ceil(self.batch_size / self._num_replicas).astype(np.int32)
+            self._state.current_local_bsz = np.ceil(self.batch_size / self._num_workers).astype(np.int32)
             self._state.accumulation_steps = 0
         elif not self._state.current_local_bsz:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
-                self._num_nodes, self._num_replicas,
+                self._num_nodes, self._num_workers,
                 max_batch_size=self._max_batch_size,
                 atomic_bsz_range=self._local_bsz_bounds,
                 accumulation=self._gradient_accumulation
             )
             self._state.current_local_bsz = atomic_bsz
             self._state.accumulation_steps = accum_steps
-        elif self._state.current_local_bsz in [16, 32, 64, 128] and epoch < 4:
+        elif self._state.current_local_bsz in [4, 8, 16, 32] and epoch < 4:
         #elif self._state.current_local_bsz in [1, 4, 6, 8] and epoch < 3:
             self._state.current_local_bsz *= 2
         else:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
-                self._num_nodes, self._num_replicas,
+                self._num_nodes, self._num_workers,
                 max_batch_size=self._max_batch_size,
                 atomic_bsz_range=self._local_bsz_bounds,
                 accumulation=self._gradient_accumulation
             )
             current_goodput= goodput_fn(
-                self._num_nodes, self._num_replicas,
+                self._num_nodes, self._num_workers,
                 self.current_local_bsz,
                 self.accumulation_steps
             )
             #print(jnp.maximum(current_goodput, 1e-8))
             speedup = suggest_goodput / jnp.maximum(current_goodput, 1e-8)
             if speedup > self._speedup_threshold:
-                self._state.current_local_bsz = atomic_bsz
-                self._state.accumulation_steps = accum_steps
+                if atomic_bsz <= 2 * self._state.current_local_bsz:
+                    self._state.current_local_bsz = atomic_bsz
+                    self._state.accumulation_steps = accum_steps
         pollux_agent.total_batch_size = int(jax.device_get(self._state.current_local_bsz).item())* alpa.get_global_num_devices() if isinstance(self._state.current_local_bsz, jnp.DeviceArray) else self._state.current_local_bsz * alpa.get_global_num_devices()
         #pollux_agent.total_batch_size = self._state.current_local_bsz * alpa.get_global_num_devices()
         
@@ -545,8 +546,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
             print(f'cannot import gns: {e}')
         
         epoch = current_epoch()
-        #num_replicas = alpa.adaptdl.env.num_replicas()
-        num_replicas = alpa.get_global_num_devices()
+        num_workers = alpa.get_global_num_devices()
         with self._elastic.context():
             if self._elastic.skipdone():
                 return
@@ -556,7 +556,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
                 
-                self.batch_sampler.batch_size = (self._elastic._sync_local_bsz(epoch)) * num_replicas
+                self.batch_sampler.batch_size = (self._elastic._sync_local_bsz(epoch)) * num_workers
                 self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
                     
                 
