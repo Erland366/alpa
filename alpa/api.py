@@ -140,21 +140,30 @@ class ParallelizedFunc:
     @traceback_util.api_boundary
     def __call__(self, *args):
         """Launch the computation on the driver."""
-        compil_start = time.time()
+        if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
+            compil_start = time.perf_counter()
+
+        # compilation usually ends after the below line, but the first iteration (executable.launch_on_driver) takes long
         executable, _, out_tree, args_flat = (
             self._decode_args_and_get_executable(*args))
-        compil_time = time.time() - compil_start
-        if pollux_agent.t_compilation is None:
-            pollux_agent.t_compilation = compil_time
         
-        iter_start = time.time()
+        if len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
+            executable.sync()
+            iter_start = time.perf_counter()
+
         out = executable.launch_on_driver(*args_flat)
-        executable.sync() # synchronization for correct time measurement (TODO: remove after experimenting)
-        t_iter = time.time() - iter_start
-        # TODO: handle isinstance() with typing instead
-        #pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)
-        pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, 
-                                      t_iter, executable.get_execution_time_costs()[-1])
+        
+        if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
+            compil_time = time.perf_counter() - compil_start
+            pollux_agent.t_compilation[pollux_agent.get_current_config()] = compil_time
+            # below assumes that the first argument to __call__ is a TrainState
+            pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state)
+        elif len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
+            executable.sync()
+            t_iter = time.perf_counter() - iter_start
+            pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)
+        else:
+            pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state)
         
         return tree_unflatten(out_tree(), out)
 
