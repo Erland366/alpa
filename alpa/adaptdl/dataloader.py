@@ -571,6 +571,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     if self._elastic.current_index >= len(self.dataset):
                         done = True
                         break
+                done = True
 
                 # alpa.adaptdl.checkpoint.save_all_states()
 
