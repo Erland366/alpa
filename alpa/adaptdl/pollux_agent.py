@@ -155,11 +155,6 @@ class PolluxAgent:
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         
         with open(filename,'wb') as f:
-            pickle.dump({'iter': self.iter, 't_iters': self.t_iters, 't_grads': self.t_grads, 'throughputs': self.throughputs, 
-                        '_total_batch_size': self._total_batch_size, 'last_state_retrieved_batch_size': self.last_state_retrieved_batch_size,
-                        't_compilation': self.t_compilation, 'dataset_size': self.dataset_size, 'alloc_vector': self.alloc_vector,
-                        'bs_exectime_regressor': self.bs_t_iter_regressor, 'bs_t_iter': self.bs_t_iter,
-                        'bs_t_exec_timecosts': self.bs_t_exec_timecosts, 'bs_t_diff': self.bs_t_diff},
-                        f)
+            pickle.dump(self, f)
     
 pollux_agent = PolluxAgent()
