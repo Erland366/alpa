@@ -15,7 +15,7 @@ python run_qa_alpa.py \
   --num_train_epochs 2 \
   --per_device_train_batch_size 12 \
   --output_dir ./bert-qa-squad \
-  --eval_steps 1000
+  --eval_steps 1000 \
   --cache_dir ./cache
 ```
 
