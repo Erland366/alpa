@@ -60,7 +60,7 @@ class PolluxAgent:
                     Median current BS {self.total_batch_size} 'pure' execution time - {np.median(np.array(self.bs_t_exec_timecosts[self.total_batch_size]))} \
                     Median current BS {self.total_batch_size} 'sync' time - {np.median(np.array(self.bs_t_diff[self.total_batch_size]))}")
         if self.iter % 500 == 0:
-            self._save_objects(f'/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/alpa/adaptdl/pickle_objects/4gp/objects_iteration{self.iter}.pkl')
+            self._save_objects(f'/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/alpa/adaptdl/pickle_objects/2GPU_3090/objects_iteration{self.iter}.pkl')
             
             
     def _fit_batchsize_dynp(self):

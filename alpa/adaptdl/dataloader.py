@@ -32,8 +32,8 @@ import datetime
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
-handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/huggingface/transformers/examples/flax/BERT/logs/Bert_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-#handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/ViT/logs/ViT_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+#handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/huggingface/transformers/examples/flax/BERT/logs/Bert_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/ViT/logs/ViT_bsz_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
@@ -152,7 +152,7 @@ class AdaptiveDataLoaderHelper(object):
         self.batch_size = batch_size
         self.future_exit = None
         self._gradient_accumulation = False
-        self._speedup_threshold = 1.05
+        self._speedup_threshold = 1.2
         self._accum_count = 0
         self._num_workers = alpa.get_global_num_devices()
         self._num_nodes = 1
@@ -296,9 +296,9 @@ class AdaptiveDataLoaderHelper(object):
             )
             self._state.current_local_bsz = atomic_bsz
             self._state.accumulation_steps = accum_steps
-        elif self._state.current_local_bsz in [4, 8, 16, 32] and epoch < 4:
-        #elif self._state.current_local_bsz in [1, 4, 6, 8] and epoch < 3:
+        elif self._state.current_local_bsz in [2, 4, 8, 18] and epoch < 4:
             self._state.current_local_bsz *= 2
+            
         else:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
                 self._num_nodes, self._num_workers,
@@ -314,9 +314,9 @@ class AdaptiveDataLoaderHelper(object):
             #print(jnp.maximum(current_goodput, 1e-8))
             speedup = suggest_goodput / jnp.maximum(current_goodput, 1e-8)
             if speedup > self._speedup_threshold:
-                if atomic_bsz <= 2 * self._state.current_local_bsz:
-                    self._state.current_local_bsz = atomic_bsz
-                    self._state.accumulation_steps = accum_steps
+                ##if atomic_bsz <= 2 * self._state.current_local_bsz:
+                self._state.current_local_bsz = atomic_bsz
+                self._state.accumulation_steps = accum_steps
         pollux_agent.total_batch_size = int(jax.device_get(self._state.current_local_bsz).item())* alpa.get_global_num_devices() if isinstance(self._state.current_local_bsz, jnp.DeviceArray) else self._state.current_local_bsz * alpa.get_global_num_devices()
         #pollux_agent.total_batch_size = self._state.current_local_bsz * alpa.get_global_num_devices()
         

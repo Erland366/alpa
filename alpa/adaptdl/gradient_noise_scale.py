@@ -1,10 +1,11 @@
 import jax
 import jax.numpy as jnp
 #import time
-#import alpa
+import alpa
 
 #from jax.tree_util import tree_flatten, tree_unflatten
 #from jax.lib import xla_bridge
+from alpa.device_mesh import DistributedArray
 
 class GradientNoiseScale():
     def __init__(self, mp_scaler=None, 
@@ -19,14 +20,14 @@ class GradientNoiseScale():
         #self.num_replicas = num_workers
         self.num_workers = num_workers
         self.accum_scale = accum_scale
-        self.accum_count = None
+        self.accum_count = 1
         self.init_batch_size = init_batch_size
-        self.store_grads = None         #previous Gradient
+        self.store_grads = jax.tree_util.tree_map(jnp.zeros_like, state)         #previous Gradient
         #self.running_noise = 0.0
         #self.running_scale = 0.0
-        self.noise = None
-        self.scale = None
-        self.noise_scale = None
+        self.noise = 0.0
+        self.scale = 0.0
+        self.noise_scale = 0.0
         self.biased_sqr = 0.0 
         self.unbias_sqr = 0.0 
         self.biased_var = 0.0 
