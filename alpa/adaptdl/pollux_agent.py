@@ -16,7 +16,7 @@ linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10
 
 class PolluxAgent:
     def __init__(self, state=None):
-        self.NUM_SYNC_PER_CONFIG = 16 # number of times to synchronize iterations to measure T_iter for each configuration
+        self.NUM_SYNC_PER_CONFIG = 100 # number of times to synchronize iterations to measure T_iter for each configuration
 
         self.state = state
         self.iter = 0
