@@ -62,6 +62,7 @@ from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 from torch.utils.data import Dataset, DataLoader
 import torch
 from alpa.adaptdl.pollux_agent import pollux_agent
+from alpa.adaptdl.api import reallocate_and_update_state
 
 class QADataset(Dataset):
     def __init__(self, hf_dataset):
@@ -76,6 +77,7 @@ class QADataset(Dataset):
         return item
 
 alpa.init(cluster="ray")
+# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1)
 
 
@@ -1026,6 +1028,11 @@ def main():
         for step, batch in enumerate(tqdm(train_loader)):
             batch = {k: v.numpy() for k, v in batch.items()}
             dropout_rng, rng = jax.random.split(rng)
+
+            if pollux_agent.reallocation_approaching:
+                p_train_step.get_last_executable().sync()
+                state = reallocate_and_update_state(state)
+
             state, train_metric = p_train_step(state, batch, dropout_rng)
             # p_train_step.get_last_executable().sync()
             train_metrics.append(train_metric)
