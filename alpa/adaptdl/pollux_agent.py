@@ -11,6 +11,7 @@ import os
 import atexit
 import threading
 import asyncio
+from collections.abc import Iterable
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -96,6 +97,9 @@ class PolluxAgent:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
         if not self.training_started_for_config[self.get_current_config()]:
             self.training_started_for_config[self.get_current_config()] = True
+        if self.iter % 100 == 0:
+            print(f"Throughput - {self.predict_throughput_from_configs([self.get_current_config()])}")
+            print(f"Median T_iter list - {list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()])}")
 
 
     def pickle_and_update_scheduler(self):
@@ -139,6 +143,8 @@ class PolluxAgent:
     
     def predict_throughput(self, batch_sizes):
         # TODO: clean up unnecessary reshapes
+        if not isinstance(batch_sizes, Iterable):
+            batch_sizes = [batch_sizes]
         return np.array(batch_sizes).reshape(-1, 1) / self.predict_t_iter(batch_sizes).reshape(-1, 1)
 
     def predict_t_iter_from_configs(self, configs): # TODO: handle typing
