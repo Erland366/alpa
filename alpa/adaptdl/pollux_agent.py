@@ -12,6 +12,7 @@ import atexit
 import threading
 import asyncio
 from collections.abc import Iterable
+import jax.numpy as jnp
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -145,6 +146,8 @@ class PolluxAgent:
         # TODO: clean up unnecessary reshapes
         if not isinstance(batch_sizes, Iterable):
             batch_sizes = [batch_sizes]
+        elif isinstance(batch_sizes, jnp.DeviceArray) and batch_sizes.ndim == 0:
+            batch_sizes = [float(batch_sizes)]
         return np.array(batch_sizes).reshape(-1, 1) / self.predict_t_iter(batch_sizes).reshape(-1, 1)
 
     def predict_t_iter_from_configs(self, configs): # TODO: handle typing
