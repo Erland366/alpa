@@ -6,6 +6,7 @@ import alpa
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax.lib import xla_bridge
 
+
 def extract_values_with_key_p(structure):
     flat_structure, tree_def = tree_flatten(structure)
     #flattened_gradients = [node._value for node in flat_structure]
@@ -29,6 +30,23 @@ def normsqr_groups(grads, pinvs):
     normsqr_list = [jnp.sum(jnp.square(g/p)) for g, p in zip(grads, pinvs)]
     return jnp.sum(jnp.array(normsqr_list))
 
+def compute_gradient_noise_scale(prev_grads, new_grads,
+                                  preconditioner, 
+                                  biased_sqr, unbias_sqr, biased_var, unbias_var,
+                                  count, scale, theta
+                                 ):
+        
+    grads_normsqr = normsqr_groups(new_grads, preconditioner)
+    local_sqr = (normsqr_groups(prev_grads, preconditioner)
+                             + grads_normsqr) / 2
+    avg_grads = average_groups(new_grads, prev_grads)
+    total_sqr = normsqr_groups(avg_grads, preconditioner)
+    grad_sqr = (count * total_sqr - local_sqr) / (count - 1) 
+    grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+    biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
+    biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
+    return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+
 def compute_gradsnorms(gradients, preconditioners):
     local_sqr_val = 0.0
 
@@ -41,17 +59,10 @@ def compute_gradsnorms(gradients, preconditioners):
     grads_normsqr = normsqr_groups(gradients, preconditioners)
     return local_sqr_val, grads_normsqr
 
-def average_groups_2(grads1, grads2):
+def average_groups(grads1, grads2):
     ret = []
     for group1, group2 in zip(grads1, grads2):
-        ret.append([])
-        for g1, g2 in zip(group1, group2):
-            if g1 is None:
-                ret[-1].append(g2)
-            elif g2 is None:
-                ret[-1].append(g1)
-            else:
-                ret[-1].append((g1 + g2) / 2)
+        ret.append((group1 + group2) / 2)
     return ret
 
 def update_avg(value, factor, biased, unbias):
@@ -61,19 +72,6 @@ def update_avg(value, factor, biased, unbias):
     value = biased / unbias
     
     return biased, unbias, value
-
-#def compute_pgns_values_2(store_grads, preconditioner, count=2, scale=1, smoothing=0.9):
-#    grads_normsqr = normsqr_groups(store_grads[1], preconditioner)
-#    local_sqr = (normsqr_groups(store_grads[0], preconditioner)
-#                             + grads_normsqr) / 2
-#    avg_grads = average_groups(store_grads[1], store_grads[0])
-#    total_sqr = normsqr_groups(avg_grads, preconditioner)
-#    grad_sqr = (count * total_sqr - local_sqr) / (count - 1)
-#    grad_var = (local_sqr - total_sqr) * scale / (count - 1)
-#    theta = smoothing ** scale
-#    grad_sqr = update_avg(grad_sqr, theta)
-#    grad_var = update_avg(grad_var, theta)
-#    return grad_sqr, grad_var
 
 def running_gradient(running_grd, running_grd_sqr, grads_flat, itr, beta=0.9):
     """

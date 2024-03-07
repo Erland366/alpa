@@ -26,7 +26,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict
 from jax.tree_util import tree_flatten, tree_unflatten
 
 # for dataset and preprocessing
@@ -56,7 +56,9 @@ from transformers.utils import get_full_repo_name, send_example_telemetry
 #from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale
 from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
                                    normsqr_groups,
-                                   update_avg, 
+                                   average_groups,
+                                   update_avg,
+                                   compute_gradient_noise_scale, 
                                    compute_gradsnorms, 
                                    update_variance, 
                                    compute_variance, 
@@ -139,6 +141,9 @@ class TrainingArguments:
     pretrain: bool = field(
         default=True, metadata={"help": "Whether or not to pretrain."}
     )
+    count: int = field(default=2, metadata={"help": "The number of stored grads."})
+    scale: int = field(default=1, metadata={"help": "Scale"})
+    smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -418,6 +423,9 @@ def main():
     eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
+    count = training_args.count
+    scale = training_args.scale
+    theta = training_args.smoothing * scale
 
     def collate_fn(examples):
         pixel_values = torch.stack([example[0] for example in examples])
@@ -523,35 +531,37 @@ def main():
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
-    gns.state = extract_values_with_key_p(state.params)
-    gns.init_batch_size = train_batch_size
-    gns.num_replicas = alpa.get_global_num_devices()
-    gns.accum_scale = alpa.get_global_num_devices()
-    
-    #running_grd, running_grd_sqr = init_running_gradients(state.params)
-    initial_state = RunningGradientsState(
-    store_grads=[],
-    noise=0.0,
-    scale=0.0,
-    noise_scale=0.0,
-    beta=0.9,
-    running_noise=0.0,
-    running_scale=0.0,
-    n_batch=2
-)
+    gns.initialize_gns(state=extract_values_with_key_p(state.params), 
+                       init_bsz=train_batch_size, 
+                       num_workers=alpa.get_global_num_devices(), 
+                       accum_scale=alpa.get_global_num_devices())
     
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, batch):
+    def train_step(state, 
+                   batch, 
+                   variables: Dict 
+                   #dropout_rng: PRNGKey, prev_grads, biased_sqr, unbias_sqr, biased_var, unbias_var, count, scale, theta
+                   ):
 
         def compute_loss(params):
             labels = batch.pop("labels")
             logits = state.apply_fn(**batch, params=params, train=True)[0]
             loss = loss_fn(logits, labels)
             return loss
+        
+        dropout_rng = variables.get('dropout_rng', None)
+        prev_grads = variables.get('gns_store_grads', None)
+        biased_sqr = variables.get('gns_biased_sqr', None)
+        unbias_sqr = variables.get('gns_unbias_sqr', None)
+        biased_var = variables.get('gns_biased_var', None)
+        unbias_var = variables.get('gns_unbias_var', None)
+        count = variables.get('count', None)
+        scale = variables.get('scale', None)
+        theta = variables.get('theta', None)
         
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
@@ -560,42 +570,39 @@ def main():
         pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
         gradients = extract_values_with_key_p(grad)
         preconditioners = extract_values_with_key_p(pinv)
+
+        def condition(prev_grads):
+            return prev_grads is not None
+        
+        prev_grads = jax.lax.cond(
+            condition(prev_grads),
+            lambda x: x,
+            lambda x: jax.tree_util.tree_map(jnp.zeros_like, gradients), 
+            prev_grads
+        )
+
+        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
+                                                                                                           preconditioners, 
+                                                                                                           biased_sqr, 
+                                                                                                           unbias_sqr, 
+                                                                                                           biased_var, 
+                                                                                                           unbias_var, 
+                                                                                                           count, 
+                                                                                                           scale, 
+                                                                                                           theta)
         
         metrics = {"loss": loss, 
                    "learning_rate": linear_decay_lr_schedule_fn(state.step), 
-                   #"noise": noise,
-                   #"scale": scale 
+                   "gradients": gradients, 
+                   "grad_sqr": grad_sqr, 
+                   "grad_var": grad_var, 
+                   "biased_sqr": biased_sqr,
+                   "unbias_sqr": unbias_sqr, 
+                   "biased_var": biased_var, 
+                   "unbias_var": unbias_var 
                    }
 
-        return new_state, metrics, gradients, preconditioners
-    
-    def compute_pgns_values(store_grads, preconditioner, biased_sqr, unbias_sqr, biased_var, unbias_var, count=2, scale=2, smoothing=0.9):
-        
-        def average_groups(grads1, grads2):
-            ret = []
-            for group1, group2 in zip(grads1, grads2):
-                #ret.append([])
-                #for g1, g2 in zip(group1, group2):
-                #    if g1 is None:
-                #        ret[-1].append(g2)
-                #    elif g2 is None:
-                #        ret[-1].append(g1)
-                #    else:
-                #        ret[-1].append((g1 + g2) / 2)
-                ret.append((group1 + group2) / 2)
-            return ret
-        
-        grads_normsqr = normsqr_groups(store_grads[1], preconditioner)
-        local_sqr = (normsqr_groups(store_grads[0], preconditioner)
-                             + grads_normsqr) / 2
-        avg_grads = average_groups(store_grads[1], store_grads[0])
-        total_sqr = normsqr_groups(avg_grads, preconditioner)
-        grad_sqr = (count * total_sqr - local_sqr) / (count - 1)
-        grad_var = (local_sqr - total_sqr) * scale / (count - 1)
-        theta = smoothing ** scale
-        biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
-        biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
-        return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+        return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch):
@@ -615,8 +622,6 @@ def main():
     method = alpa.ShardParallel() 
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
-    p_compute_pgns_values = alpa.parallelize(compute_pgns_values, method=method)
-    
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -657,37 +662,29 @@ def main():
             #if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
             #    (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
             #    state = update_state_on_bs_change(state)
-            state, train_metric, grads_flat, preconditioner = p_train_step(state, batch)
-            gns.store_grads.append(grads_flat)
-            epoch_losses.append(train_metric['loss']._value)
-            gns.update_state(state)
-            if len(gns.store_grads) == initial_state.n_batch:
-                print(f'computing pgns at step : {step}')
-                pgnstime = time.time()
-                grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = p_compute_pgns_values(gns.store_grads, 
-                                                                                                           preconditioner, 
-                                                                                                           gns.biased_sqr, 
-                                                                                                           gns.unbias_sqr, 
-                                                                                                           gns.biased_var, 
-                                                                                                           gns.unbias_var)
-                print(f'done computing pgns at step: {step}')
-                #p_compute_pgns_values.get_last_executable().sync()
-                pgnstime = time.time() - pgnstime
-                gns.store_grads = []
-                gns.noise = grad_sqr
-                gns.scale = grad_var
-                gns.biased_sqr = biased_sqr 
-                gns.unbias_sqr = unbias_sqr 
-                gns.biased_var = biased_var 
-                gns.unbias_var = unbias_var
-                
-                print(f'grad_sqr: {grad_sqr._value}, grad_var: {grad_var._value}')
-                #print(f'pgns computation time: {pgnstime}')
-                logger.info(f'epoch: {epoch}, step: {step}')
-                logger.info(f'grad_sqr: {grad_sqr._value}, grad_var: {grad_var._value}')
-                #logger.info(f'pgns computation time: {pgnstime}')
-                update_grad_params(grad_sqr._value, grad_var._value)
+            exec_time = time.time()
             
+            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
+
+            variables_dict = dict(variables_dict)
+            #state, train_metric = p_train_step(state, batch, dropout_rng, gns.store_grads, 
+            #                                    gns.biased_sqr, gns.unbias_sqr, gns.biased_var, gns.unbias_var, count, scale, theta)
+            
+            state, train_metric = p_train_step(state, batch, variables_dict)
+
+            exec_time = time.time() - exec_time
+            logger.info(f'train_step time: {exec_time}')
+            
+            epoch_losses.append(train_metric['loss']._value)
+            gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
+                             train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
+            
+                
+            print(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
+            
+            logger.info(f'epoch: {epoch}, step: {step}')
+            logger.info(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
+            update_grad_params(train_metric["grad_sqr"]._value, train_metric["grad_var"]._value)
             
             #train_metrics.append(train_metric)
         
