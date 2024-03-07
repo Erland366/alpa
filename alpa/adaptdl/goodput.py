@@ -95,7 +95,7 @@ class GoodputFunction(object):
             print(f'accum_steps: {accum_steps}')
             # TODO: akhmed: num_replicas was 1, I set it to -1 to test adaptive BS on a single GPU
             atomic_bsz = jnp.where(
-                num_replicas == -1,
+                num_workers == -1,
                 self._init_batch_size,
                 jnp.ceil(local_bsz - eps)
             )
