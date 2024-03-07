@@ -296,7 +296,7 @@ class AdaptiveDataLoaderHelper(object):
             )
             self._state.current_local_bsz = atomic_bsz
             self._state.accumulation_steps = accum_steps
-        elif self._state.current_local_bsz in [2, 4, 8, 18] and epoch < 4:
+        elif self._state.current_local_bsz in [2, 4, 8, 16] and epoch < 4:
             self._state.current_local_bsz *= 2
             
         else:
