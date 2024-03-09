@@ -113,6 +113,9 @@ class Orchestrator:
             jsonable_job_object.pollux_agent_jsonable['job_id'] = v.pollux_agent.job_id
             jsonable_job_object.pollux_agent_jsonable['grad_norm_sqr'] = v.pollux_agent.grad_norm_sqr
             jsonable_job_object.pollux_agent_jsonable['grad_variance'] = v.pollux_agent.grad_variance
+            jsonable_job_object.pollux_agent_jsonable['max_batch_size'] = v.pollux_agent.max_batch_size
+            jsonable_job_object.pollux_agent_jsonable['local_bsz_bounds'] = v.pollux_agent.local_bsz_bounds
+            jsonable_job_object.pollux_agent_jsonable['init_batch_size'] = v.pollux_agent.init_batch_size
 
             jsonable_jobs[k] = jsonable_job_object
         return jsonable_jobs
