@@ -47,7 +47,7 @@ class Orchestrator:
         self._ray_init(address=self.ray_cluster_address, namespace=self.ray_cluster_namespace)
         self.allocation_matrix = {}
         self.jobs_queue = []
-        self.realloc_requests_once = False # temporary for tests
+        self.realloc_requests_once = True # temporary for tests
         self.first_job_arrived = False
         self.job_ids_reallocating_resources = {}
         
@@ -96,14 +96,33 @@ class Orchestrator:
         job = PolluxJob(id=job_id)
         self.jobs[job_id] = job
         return job_id
-    
+
+    def get_jsonable_jobs(self):
+        jsonable_jobs = {}
+        for k, v in self.jobs.items():
+            jsonable_job_object = PolluxJob(v.id)
+            jsonable_job_object.creation_time = v.creation_time
+            jsonable_job_object.status = v.status
+            jsonable_job_object.pg_name = v.pg_name
+            jsonable_job_object.pollux_agent_jsonable = {}
+            jsonable_job_object.pollux_agent_jsonable['iter'] = v.pollux_agent.iter
+            jsonable_job_object.pollux_agent_jsonable['total_batch_size'] = v.pollux_agent.total_batch_size
+            jsonable_job_object.pollux_agent_jsonable['alloc_vector'] = v.pollux_agent.alloc_vector
+            jsonable_job_object.pollux_agent_jsonable['scheduler_enabled'] = v.pollux_agent.scheduler_enabled
+            jsonable_job_object.pollux_agent_jsonable['scheduler_address'] = v.pollux_agent.scheduler_address
+            jsonable_job_object.pollux_agent_jsonable['job_id'] = v.pollux_agent.job_id
+            jsonable_job_object.pollux_agent_jsonable['grad_norm_sqr'] = v.pollux_agent.grad_norm_sqr
+            jsonable_job_object.pollux_agent_jsonable['grad_variance'] = v.pollux_agent.grad_variance
+
+            jsonable_jobs[k] = jsonable_job_object
+        return jsonable_jobs
     
     def get_all_jobs(self):
-        return self.jobs
+        return self.get_jsonable_jobs()
     
     def get_all_info(self):
         info = {"ip_address": self.ip_address,
-                "jobs": self.jobs,
+                "jobs": self.get_jsonable_jobs(),
                 "ray_cluster_address": self.ray_cluster_address,
                 "ray_cluster_namespace": self.ray_cluster_namespace,
                 "allocation_matrix": {k: v.tolist() for k, v in self.allocation_matrix.items()},

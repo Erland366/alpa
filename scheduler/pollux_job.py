@@ -27,6 +27,7 @@ class PolluxJob:
         self.id = id
         self.creation_time = datetime.now()
         self.status = JobState.registered
+        self.pollux_agent_jsonable = None
 
 
 class ResourceReleaseReason(str, Enum):
