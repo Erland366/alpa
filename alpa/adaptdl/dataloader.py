@@ -152,7 +152,7 @@ class AdaptiveDataLoaderHelper(object):
         self.batch_size = batch_size
         self.future_exit = None
         self._gradient_accumulation = False
-        self._speedup_threshold = 1.2
+        self._speedup_threshold = 1.05
         self._accum_count = 0
         self._num_workers = alpa.get_global_num_devices()
         self._num_nodes = 1
@@ -270,6 +270,10 @@ class AdaptiveDataLoaderHelper(object):
         self._max_batch_size = max_batch_size
         self._local_bsz_bounds = local_bsz_bounds
         self._gradient_accumulation = gradient_accumulation
+
+        pollux_agent.max_batch_size = max_batch_size
+        pollux_agent.local_bsz_bounds = local_bsz_bounds
+
         self.train()
 
     def _sync_local_bsz(self, epoch):
@@ -524,6 +528,8 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
             kwargs.get("worker_init_fn"), kwargs.get("num_workers"))
         super().__init__(dataset, batch_size, shuffle=False, **kwargs)
         AdaptiveDataLoaderMixin.__init__(self, batch_size)
+
+        pollux_agent.init_batch_size = batch_size
 
     def __iter__(self):
         """

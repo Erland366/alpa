@@ -64,6 +64,12 @@ class PolluxAgent:
         self.grad_variance = None
         #
 
+        # Dataloader-related parameters
+        self.max_batch_size = None
+        self.local_bsz_bounds = None
+        self.init_batch_size = None
+        #
+
         # print("PolluxAgent initialized.")
 
     def init_sched_utils(self):
