@@ -32,7 +32,7 @@ class PolluxAgent:
         self.dataset_size = None
         self._alloc_vector = None # allocation vector in AdaptDL
 
-        self.bs_t_iter_regressor = LinearRegression()
+        self.alloc_config_regressor = defaultdict(init_regressor)
 
         self.bs_t_iter = defaultdict(list)
         self.bs_t_exec_timecosts = defaultdict(list)
@@ -103,7 +103,22 @@ class PolluxAgent:
         num_gpus = self._alloc_vector[0] # assumes that each allocated node has the same # of GPUs - Alpa
         num_nodes = len(self._alloc_vector)
         return (self._total_batch_size, num_gpus, num_nodes)
-        
+
+
+    def get_current_alloc_config(self):
+        num_gpus = self._alloc_vector[0]
+        num_nodes = len(self._alloc_vector)
+        return (num_gpus, num_nodes)
+
+
+    def count_bs_observations(self, alloc_config=None):
+        if alloc_config is None:
+            alloc_config = self.get_current_alloc_config()
+        count = {}
+        for k, v in self.config_t_iter.items():
+            if (k[1], k[2]) == (alloc_config):
+                count[k[0]] = len(v)
+        return count
     
     def report_iteration(self, state, t_iter=None, executable_time_cost=None):
         # assert self.total_batch_size != None, "Total batch size should be set in the training code using pollux_agent.total_batch_size"
@@ -121,7 +136,11 @@ class PolluxAgent:
         if not self.training_started_for_config[self.get_current_config()]:
             self.training_started_for_config[self.get_current_config()] = True
         if self.iter % 100 == 0:
-            print(f"Throughput - {self.predict_throughput_from_configs([self.get_current_config()])}")
+            print(f"Throughput for each seen allocation:")
+            self._fit_config_iter()
+            for alloc in self.alloc_config_regressor.keys():
+                print(f"Allocation {alloc} - {self.predict_throughput(self.total_batch_size, alloc_config=alloc)}")
+            print(f"Count of observations: {self.count_bs_observations()}")
             print(f"Median T_iter list - {list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()])}")
 
 
@@ -159,26 +178,38 @@ class PolluxAgent:
         
         x_bs = np.array(list(self.config_t_iter.keys()))
         y_dp = np.array(list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()]))
+
+        alloc_config_columns = x_bs[:, 1:3]
+        alloc_configs = np.unique(alloc_config_columns, axis=0)
+
+        for alloc_config in alloc_configs:
+            indices = np.where((x_bs[:, 1] == alloc_config[0]) & (x_bs[:, 2] == alloc_config[1]))[0]
+
+            x_bs_subset = x_bs[indices, 0].reshape(-1, 1)
+            y_dp_subset = y_dp[indices]
+
+            regressor = self.alloc_config_regressor[tuple(alloc_config)]
+
+            regressor.fit(x_bs_subset, y_dp_subset)
         
-        self.bs_t_iter_regressor.fit(x_bs, y_dp)
-        
-    def predict_t_iter(self, batch_sizes): # TODO: handle typing
+    def predict_t_iter(self, batch_sizes, alloc_config): # TODO: handle typing
         #assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to make predictions."
         # assert batch_sizes.ndim == 2 and batch_sizes.shape[1] == 1, "Input batch sizes np.ndarray should be of shape (N, 1)."
         self._fit_config_iter()
-        current_config = self.get_current_config()
-        same_config_batch_sizes = np.array([(bs, current_config[1], current_config[2]) for bs in batch_sizes])
-        return self.bs_t_iter_regressor.predict(same_config_batch_sizes)
+        return self.alloc_config_regressor[alloc_config].predict(np.array(batch_sizes).reshape(-1, 1))
     
-    def predict_throughput(self, batch_sizes):
+    def predict_throughput(self, batch_sizes, alloc_config=None):
         # TODO: clean up unnecessary reshapes
+        if alloc_config is None:
+            alloc_config = self.get_current_alloc_config()
         if not isinstance(batch_sizes, Iterable):
             batch_sizes = [batch_sizes]
         elif isinstance(batch_sizes, jnp.DeviceArray) and batch_sizes.ndim == 0:
             batch_sizes = [float(batch_sizes)]
-        return np.array(batch_sizes).reshape(-1, 1) / self.predict_t_iter(batch_sizes).reshape(-1, 1)
+        return np.array(batch_sizes).reshape(-1, 1) / self.predict_t_iter(batch_sizes, alloc_config).reshape(-1, 1)
 
     def predict_t_iter_from_configs(self, configs): # TODO: handle typing
+        raise NotImplementedError
         self._fit_config_iter()
         return self.bs_t_iter_regressor.predict(np.array(configs))
 
@@ -186,6 +217,7 @@ class PolluxAgent:
         """
         Example usage:      pollux_agent.predict_throughput_from_configs([(128, 4, 1), (128, 2, 1), (256, 1, 2)])
         """
+        raise NotImplementedError
         return np.array(configs)[:, 0].reshape(-1, 1) / self.predict_t_iter_from_configs(configs).reshape(-1, 1)
         
     def _save_objects(self, filename):
@@ -193,5 +225,8 @@ class PolluxAgent:
         
         with open(filename,'wb') as f:
             pickle.dump(self, f)
+
+def init_regressor():
+    return LinearRegression()
     
 pollux_agent = PolluxAgent()
