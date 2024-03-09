@@ -42,6 +42,9 @@ class PolluxAgent:
         
         self.bs_sync_starttime = None
         self.bs_sync_interval = 30 # seconds
+
+        self.scheduler_update_last_time = None
+        self.scheduler_update_interval = 10 # seconds
         
         self.scheduler_enabled = False
         self.scheduler_address = None
@@ -103,8 +106,10 @@ class PolluxAgent:
             self.config_t_iter[self.get_current_config()].append(t_iter)
         self.iter += 1
         
-        if self.scheduler_enabled and self.iter % 20 == 0:
+        current_time = time.time()
+        if self.scheduler_enabled and (self.scheduler_update_last_time is None or current_time - self.scheduler_update_last_time > self.scheduler_update_interval):
             self.pickle_and_update_scheduler()
+            self.scheduler_update_last_time = current_time
         if self.iter % 500 == 0:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
         if not self.training_started_for_config[self.get_current_config()]:
