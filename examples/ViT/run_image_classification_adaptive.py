@@ -73,7 +73,7 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -82,7 +82,8 @@ import datetime
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
 
-alpa.init(cluster="ray")
+# alpa.init(cluster="ray")
+alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 logger = logging.getLogger(__name__)
 
 # handler = logging.FileHandler(f"/home/haifatl/Documents/alpa/alpa-adaptdl-feb11/alpa-adaptdl/examples/ViT/logs/gradsqr_gradvar_vit_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -461,7 +462,7 @@ def main():
         drop_last=True,
     )
     
-    train_loader.autoscale_batch_size(max_batch_size = 80 * alpa.get_global_num_devices(), 
+    train_loader.autoscale_batch_size(max_batch_size = 400, 
                                         local_bsz_bounds=(2, 80), gradient_accumulation=False)
 
     #eval_loader = torch.utils.data.DataLoader(
@@ -673,6 +674,31 @@ def main():
             variables_dict = dict(variables_dict)
             #state, train_metric = p_train_step(state, batch, dropout_rng, gns.store_grads, 
             #                                    gns.biased_sqr, gns.unbias_sqr, gns.biased_var, gns.unbias_var, count, scale, theta)
+
+            if pollux_agent.reallocation_approaching:
+                p_train_step.get_last_executable().sync()
+
+                materialized_variables_dict = {}
+                for k, v in variables_dict.items():
+                    if isinstance(v, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                        materialized_variables_dict[k] = v._value
+                    elif isinstance(v, list):
+                        materialized_list = []
+                        for el in v:
+                            if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                                materialized_list.append(el._value)
+                            else:
+                                materialized_list.append(el)
+                        materialized_variables_dict[k] = materialized_list
+                    else:
+                        materialized_variables_dict[k] = v
+                variables_dict = materialized_variables_dict
+                if isinstance(pollux_agent.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
+                     and isinstance(pollux_agent.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
+                    pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
+
+                state = reallocate_and_update_state(state)
             
             state, train_metric = p_train_step(state, batch, variables_dict)
 
