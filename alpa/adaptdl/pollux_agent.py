@@ -159,7 +159,8 @@ class PolluxAgent:
         del state['p_train_step']
         del state['state']
         # TODO: also make sure that PGNS value is materialized
-        if isinstance(self.grad_norm_sqr_abstract, alpa.DistributedArray) and isinstance(self.grad_variance_abstract, alpa.DistributedArray):
+        if isinstance(self.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
+             and isinstance(self.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
             self.grad_norm_sqr = self.grad_norm_sqr_abstract._value.item()
             self.grad_variance = self.grad_variance_abstract._value.item()
         del state['grad_norm_sqr_abstract']
