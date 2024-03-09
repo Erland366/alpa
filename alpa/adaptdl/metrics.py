@@ -6,6 +6,7 @@ import jax.numpy as jnp
 
 from alpa.adaptdl.goodput import GoodputFunction
 import alpa
+from alpa.adaptdl.pollux_agent import pollux_agent
 
 _GRAD_PARAM_DICT = None
 
@@ -18,6 +19,8 @@ def update_grad_params(grad_norm_sqr, grad_variance):
     # # print(f'grad_params: {grad_params}')
     # _metric_state().grad_params = (grad_params[0], grad_params[1])
     _metric_state().grad_params = (grad_norm_sqr, grad_variance)
+    pollux_agent.grad_norm_sqr_abstract = grad_norm_sqr
+    pollux_agent.grad_variance_abstract = grad_variance
     # print(_metric_state().grad_params)
 
 

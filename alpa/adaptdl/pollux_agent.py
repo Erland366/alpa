@@ -13,6 +13,7 @@ import threading
 import asyncio
 from collections.abc import Iterable
 import jax.numpy as jnp
+import alpa
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -51,6 +52,15 @@ class PolluxAgent:
         self.p_train_step = None
 
         self.training_started_for_config = defaultdict(bool)
+
+        # PGNS-related parameters.
+        # Normally, they are DistributedArray's, need to be materialized (causes sync) before sending/using
+        self.grad_norm_sqr_abstract = None
+        self.grad_variance_abstract = None
+        self.grad_norm_sqr = None
+        self.grad_variance = None
+        #
+
         # print("PolluxAgent initialized.")
 
     def init_sched_utils(self):
@@ -67,6 +77,7 @@ class PolluxAgent:
     
     @total_batch_size.setter
     def total_batch_size(self, new_total_batch_size):
+        new_total_batch_size = int(new_total_batch_size)
         self._total_batch_size = new_total_batch_size
 
 
@@ -118,6 +129,12 @@ class PolluxAgent:
         del state['p_train_step']
         del state['state']
         # TODO: also make sure that PGNS value is materialized
+        if isinstance(self.grad_norm_sqr_abstract, alpa.DistributedArray) and isinstance(self.grad_variance_abstract, alpa.DistributedArray):
+            self.grad_norm_sqr = self.grad_norm_sqr_abstract._value.item()
+            self.grad_variance = self.grad_variance_abstract._value.item()
+        del state['grad_norm_sqr_abstract']
+        del state['grad_variance_abstract']
+        # Another approach to avoid data race - create separate variables for materialized versions of PGNS values, and delete DistributedArray variables from the dict here
         return state
 
 
