@@ -302,7 +302,7 @@ class AdaptiveDataLoaderHelper(object):
             self._state.accumulation_steps = accum_steps
         # elif self._state.current_local_bsz in [2, 4, 8, 16] and epoch < 4:
             # self._state.current_local_bsz *= 2
-        elif len(pollux_agent.count_bs_observations()) < 3:
+        elif not pollux_agent.fixed_regressors and len(pollux_agent.count_bs_observations()) < 3:
             incremented_local_bs = self._state.current_local_bsz + 8
             if incremented_local_bs > self._local_bsz_bounds[1]:
                 self._state.current_local_bsz = self._local_bsz_bounds[0]

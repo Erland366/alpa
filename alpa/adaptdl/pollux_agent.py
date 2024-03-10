@@ -72,6 +72,8 @@ class PolluxAgent:
         self.init_batch_size = None
         #
 
+        self.fixed_regressors = False
+
         # print("PolluxAgent initialized.")
 
     def init_sched_utils(self):
@@ -99,6 +101,11 @@ class PolluxAgent:
     @alloc_vector.setter
     def alloc_vector(self, new_alloc_vector):
         self._alloc_vector = new_alloc_vector
+
+
+    def fix_regressors(self):
+        self.fixed_regressors = True
+        self.NUM_SYNC_PER_CONFIG = 0
 
     
     def get_current_config(self):
@@ -181,6 +188,9 @@ class PolluxAgent:
     
     def _fit_config_iter(self):
         #assert len(self.bs_t_exec_timecosts) >= 2, "At least 2 batch size - execution time costs are required to fit the regressor."
+
+        if self.fixed_regressors:
+            return
         
         x_bs = np.array(list(self.config_t_iter.keys()))
         y_dp = np.array(list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()]))

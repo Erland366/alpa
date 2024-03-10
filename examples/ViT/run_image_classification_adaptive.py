@@ -78,6 +78,7 @@ import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 import datetime
+import numpy as np
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
@@ -440,6 +441,14 @@ def main():
     pollux_agent.total_batch_size = train_batch_size
     pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
+
+    pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.00206749])
+    pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.019354801896649114
+    pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00108904])
+    pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.027093764782572798
+    pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00056805])
+    pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.028780623571947224
+    pollux_agent.fix_regressors()
 
     # Create data loaders
     # train_loader = torch.utils.data.DataLoader(
