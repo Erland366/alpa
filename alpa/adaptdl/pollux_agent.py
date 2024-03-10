@@ -14,6 +14,8 @@ import asyncio
 from collections.abc import Iterable
 import jax.numpy as jnp
 import alpa
+from typing import Union, Optional, List, Tuple, Set, Dict
+from sklearn.base import RegressorMixin
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -32,7 +34,7 @@ class PolluxAgent:
         self.dataset_size = None
         self._alloc_vector = None # allocation vector in AdaptDL
 
-        self.alloc_config_regressor = defaultdict(init_regressor)
+        self.alloc_config_regressor : Dict[Tuple[int, int, int], RegressorMixin] = defaultdict(init_regressor)
 
         self.bs_t_iter = defaultdict(list)
         self.bs_t_exec_timecosts = defaultdict(list)
@@ -142,6 +144,9 @@ class PolluxAgent:
                 print(f"Allocation {alloc} - {self.predict_throughput(self.total_batch_size, alloc_config=alloc)}")
             print(f"Count of observations: {self.count_bs_observations()}")
             print(f"Median T_iter list - {list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()])}")
+            print(f"Parameters of regressors:")
+            for alloc, regressor in self.alloc_config_regressor.items():
+                print(f"Allocation {alloc} - coef: {regressor.coef_}, intercept: {regressor.intercept_}")
 
 
     def pickle_and_update_scheduler(self):
