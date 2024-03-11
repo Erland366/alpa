@@ -13,10 +13,15 @@ from util import try_import_ray_worker, is_ray_node_resource
 import uuid
 import asyncio
 from datetime import datetime
+from cluster_optimization import list_possible_allocations
+from goodput import GoodputFunction
+import math
+from collections import defaultdict
 
 RAY_CLUSTER_ADDRESS = "127.0.0.1:6379"
 RAY_CLUSTER_NAMESPACE = "Alpa-AdaptDL-Ray-NameSpace"
 POLICY_INITIAL_NUM_GPU = 1
+FAIRNESS_KNOB = -1
 
 logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -306,24 +311,121 @@ class Orchestrator:
             raise SchedulerError("Placement group not found, job probably called alpa.shutdown().")
 
 
+    def get_fair_num_gpus(self):
+        total_num_gpus = np.sum(self.all_host_num_devices)
+        num_running_jobs = len(self.allocation_matrix)
+
+        share = total_num_gpus // num_running_jobs
+        if share == 0:
+            return 0
+        power = 2 ** math.floor(math.log2(share))
+        return power
+
+
+    def optimize_resource_allocation(self) -> Dict:
+        candidate_jobs = {}
+        for job_id, job in self.jobs.items():
+            if job.status == JobState.allocated and job.pollux_agent is not None \
+                and (job.pollux_agent.grad_norm_sqr is not None and job.pollux_agent.grad_variance is not None):
+                candidate_jobs[job_id] = job
+        
+        possible_allocations = list_possible_allocations(self.all_host_num_devices, candidate_jobs)
+        print(possible_allocations)
+
+        fair_num_gpus = self.get_fair_num_gpus()
+        fair_allocation = (fair_num_gpus, 1) # TODO: account for cases when fair_num_gpus > #GPUs per node
+        print(f"Fair allocation - {fair_allocation}")
+
+        allocation_fitness = defaultdict(float) # each value intitialized with 0.0
+
+        if len(candidate_jobs):
+            for i, allocation in enumerate(possible_allocations):
+                fitness = float()
+                print(f"Computing goodput for allocation {allocation}:")
+                for job_id, alloc_config in allocation.items():
+                    print(f"Goodput for job {job_id} with allocation config {alloc_config}:")
+                    grad_params = (self.jobs[job_id].pollux_agent.grad_norm_sqr, self.jobs[job_id].pollux_agent.grad_variance)
+                    goodput_fn = GoodputFunction(grad_params, self.jobs[job_id].pollux_agent.init_batch_size, self.jobs[job_id].pollux_agent)
+                    suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
+                        alloc_config[1], alloc_config[0] * alloc_config[1], alloc_config, 
+                        max_batch_size=self.jobs[job_id].pollux_agent.max_batch_size,
+                        atomic_bsz_range=self.jobs[job_id].pollux_agent.local_bsz_bounds,
+                        accumulation=False
+                    )
+
+                    fair_suggest_goodput, fair_atomic_bsz, fair_accum_steps = goodput_fn.optimize(
+                        fair_allocation[1], fair_allocation[0] * fair_allocation[1], fair_allocation, 
+                        max_batch_size=self.jobs[job_id].pollux_agent.max_batch_size,
+                        atomic_bsz_range=self.jobs[job_id].pollux_agent.local_bsz_bounds,
+                        accumulation=False
+                    )
+
+                    speedup = suggest_goodput / fair_suggest_goodput
+                    num_jobs = len(self.allocation_matrix)
+                    fitness_component = (1 / num_jobs) * speedup ** FAIRNESS_KNOB
+
+                    print(f"Speedup - {speedup}, fitness_component - {fitness_component}")
+                    
+                    fitness += fitness_component
+
+                    print(f"Goodput - {suggest_goodput}, local_bsz - {atomic_bsz}, accum_steps - {accum_steps}")
+                    print(f"Fair Goodput - {fair_suggest_goodput}, fair local_bsz - {fair_atomic_bsz}, fair accum_steps - {fair_accum_steps}")
+
+                fitness = fitness ** (1 / FAIRNESS_KNOB)
+                allocation_fitness[i] = fitness
+            
+            max_fitness_allocation_index = max(allocation_fitness, key=allocation_fitness.get)
+            print(f"Maximum fitness allocation index - {max_fitness_allocation_index}")
+            print(f"Maximum fitness allocation - {possible_allocations[max_fitness_allocation_index]}")
+
+            return possible_allocations[max_fitness_allocation_index]
+
+        return None
+
+        # for job_id, job in self.candidate_jobs.items():
+        #     print(f"Max BS: {job.pollux_agent.max_batch_size}")
+        #     print(f"Init BS: {job.pollux_agent.init_batch_size}")
+        #     print(f"local bsz bounds: {job.pollux_agent.local_bsz_bounds}")
+
+
     async def periodically_reallocate_resources(self):
         logger.info(f"Resource reallocation timer started!")
+        await asyncio.sleep(30)
         while True and not self.realloc_requests_once:
             await asyncio.sleep(30)
-            # Using all jobs for now, allocating 2 GPUs each
-            job_ids_to_reallocate = [j for j in self.jobs.keys() if self.jobs[j].status == JobState.allocated]
-            allocations = (2, 1)
-            #
+            # # Using all jobs for now, allocating 2 GPUs each
+            # job_ids_to_reallocate = [j for j in self.jobs.keys() if self.jobs[j].status == JobState.allocated]
+            # allocations = (2, 1)
 
-            for job_id in job_ids_to_reallocate:
-                self.job_ids_reallocating_resources[job_id] = allocations
+            # for job_id in job_ids_to_reallocate:
+            #     self.job_ids_reallocating_resources[job_id] = allocations
+            # #
 
-            await self.send_reallocation_notices(job_ids_to_reallocate)
+            self.job_ids_reallocating_resources = self.optimize_resource_allocation()
+
+
+            if self.job_ids_reallocating_resources is not None:
+                for job_id in list(self.job_ids_reallocating_resources.keys()):
+                    if self.job_ids_reallocating_resources[job_id] == self.get_current_job_allocation(job_id):
+                        del self.job_ids_reallocating_resources[job_id]
+
+                if len(self.job_ids_reallocating_resources):
+                    print(f"Doing the following reallocations: {self.job_ids_reallocating_resources}")
+                    await self.send_reallocation_notices(self.job_ids_reallocating_resources)
+
             while len(self.job_ids_reallocating_resources) > 0:
                 await asyncio.sleep(1)
             logger.info(f"All jobs have their resources reallocated.")
-            self.realloc_requests_once = True
+            # self.realloc_requests_once = True
         logger.info(f"Done reallocating resources")
+
+
+    def get_current_job_allocation(self, job_id: str):
+        if job_id not in self.allocation_matrix.keys():
+            return None
+        num_gpus_per_node = np.max(self.allocation_matrix[job_id]) # assuming that number of GPUs on each node is equal
+        num_nodes = np.sum(self.allocation_matrix[job_id] == num_gpus_per_node)
+        return (num_gpus_per_node, num_nodes)
 
 
     async def send_reallocation_notices(self, job_ids: List[str]): # input list of relevant jobs
