@@ -39,6 +39,9 @@ LOG.setLevel(logging.INFO)
 # handler.setFormatter(formatter)
 # LOG.addHandler(handler)
 
+def get_num_workers():
+    return alpa.get_global_num_devices()
+
 
 class ElasticSampler(Sampler):
     """
@@ -154,7 +157,6 @@ class AdaptiveDataLoaderHelper(object):
         self._gradient_accumulation = False
         self._speedup_threshold = 1.05
         self._accum_count = 0
-        self._num_workers = alpa.get_global_num_devices()
         self._num_nodes = 1
 
     @property
@@ -263,9 +265,9 @@ class AdaptiveDataLoaderHelper(object):
             raise ValueError("invalid max_batch_size")
         if local_bsz_bounds is not None and (
                 local_bsz_bounds[0] is not None and
-                local_bsz_bounds[0] > jnp.round(self.batch_size / self._num_workers)  or
+                local_bsz_bounds[0] > jnp.round(self.batch_size / get_num_workers())  or
                 local_bsz_bounds[1] is not None and
-                local_bsz_bounds[1] < jnp.round(self.batch_size / self._num_workers)):
+                local_bsz_bounds[1] < jnp.round(self.batch_size / get_num_workers())):
             raise ValueError("invalid local_bsz_bounds")
         self._max_batch_size = max_batch_size
         self._local_bsz_bounds = local_bsz_bounds
@@ -289,11 +291,11 @@ class AdaptiveDataLoaderHelper(object):
         goodput_fn = get_goodput_fn()
 
         if self.max_batch_size is None or goodput_fn is None:
-            self._state.current_local_bsz = np.ceil(self.batch_size / self._num_workers).astype(np.int32)
+            self._state.current_local_bsz = np.ceil(self.batch_size / get_num_workers()).astype(np.int32)
             self._state.accumulation_steps = 0
         elif not self._state.current_local_bsz:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
-                self._num_nodes, self._num_workers,
+                self._num_nodes, get_num_workers(),
                 max_batch_size=self._max_batch_size,
                 atomic_bsz_range=self._local_bsz_bounds,
                 accumulation=self._gradient_accumulation
@@ -310,13 +312,13 @@ class AdaptiveDataLoaderHelper(object):
                 self._state.current_local_bsz = incremented_local_bs
         else:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
-                self._num_nodes, self._num_workers,
+                self._num_nodes, get_num_workers(),
                 max_batch_size=self._max_batch_size,
                 atomic_bsz_range=self._local_bsz_bounds,
                 accumulation=self._gradient_accumulation
             )
             current_goodput= goodput_fn(
-                self._num_nodes, self._num_workers,
+                self._num_nodes, get_num_workers(),
                 self.current_local_bsz,
                 self.accumulation_steps
             )
@@ -556,7 +558,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
             print(f'cannot import gns: {e}')
         
         epoch = current_epoch()
-        num_workers = alpa.get_global_num_devices()
+        num_workers = get_num_workers()
         with self._elastic.context():
             if self._elastic.skipdone():
                 return
