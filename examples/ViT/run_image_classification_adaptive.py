@@ -474,23 +474,23 @@ def main():
     train_loader.autoscale_batch_size(max_batch_size = 400, 
                                         local_bsz_bounds=(8, 80), gradient_accumulation=False)
 
-    #eval_loader = torch.utils.data.DataLoader(
-    #    eval_dataset,
-    #    batch_size=eval_batch_size,
-    #    shuffle=False,
-    #    num_workers=data_args.preprocessing_num_workers,
-    #    persistent_workers=True,
-    #    drop_last=False,
-    #    collate_fn=collate_fn,
-    #)
-
-    eval_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
-        dataset=eval_dataset,
-        batch_size=eval_batch_size,
-        shuffle=False, 
-        drop_last=False,
-        collate_fn=collate_fn,
+    eval_loader = torch.utils.data.DataLoader(
+       eval_dataset,
+       batch_size=eval_batch_size,
+       shuffle=False,
+       num_workers=data_args.preprocessing_num_workers,
+       persistent_workers=True,
+       drop_last=True,
+       collate_fn=collate_fn,
     )
+
+    # eval_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+    #     dataset=eval_dataset,
+    #     batch_size=eval_batch_size,
+    #     shuffle=False, 
+    #     drop_last=False,
+    #     collate_fn=collate_fn,
+    # )
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
