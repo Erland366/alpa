@@ -38,7 +38,8 @@ def get_goodput_fn():
     state = _metric_state()
     if state.grad_params is None:
         return None
-    if isinstance(state.grad_params[0], alpa.DistributedArray) and isinstance(state.grad_params[1], alpa.DistributedArray):
+    if isinstance(state.grad_params[0], (alpa.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
+        and isinstance(state.grad_params[1], (alpa.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
         state.grad_params = (state.grad_params[0]._value, state.grad_params[1]._value)
     return GoodputFunction(state.grad_params, state.init_batch_size)
 
