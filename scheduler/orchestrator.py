@@ -141,7 +141,8 @@ class Orchestrator:
                 "all_host_info": self.all_host_info,
                 "all_host_ips": self.all_host_ips,
                 "all_host_num_devices": self.all_host_num_devices.tolist(),
-                "all_node_ids": self.all_node_ids}
+                "all_node_ids": self.all_node_ids,
+                "job_ids_reallocating_resources": self.job_ids_reallocating_resources}
         return info
     
     
@@ -305,6 +306,7 @@ class Orchestrator:
                 self.jobs[job_id].status = JobState.reallocating
             else:
                 self.jobs[job_id].status = JobState.ended
+                self.job_ids_reallocating_resources.pop(job_id, None)
             del self.allocation_matrix[job_id]
             logger.info(f"Resources of job {job_id} released!")
         except:
@@ -333,14 +335,14 @@ class Orchestrator:
         possible_allocations = list_possible_allocations(self.all_host_num_devices, candidate_jobs)
         print(f"Possible allocations - {possible_allocations}")
 
-        fair_num_gpus = self.get_fair_num_gpus()
-        fair_allocation = (fair_num_gpus, 1) # TODO: account for cases when fair_num_gpus > #GPUs per node
-        print(f"Fair allocation - {fair_allocation}")
-
         allocation_fitness = defaultdict(float) # each value intitialized with 0.0
         optim_atomic_bszs = copy.deepcopy(possible_allocations)
 
         if len(candidate_jobs):
+            fair_num_gpus = self.get_fair_num_gpus()
+            fair_allocation = (fair_num_gpus, 1) # TODO: account for cases when fair_num_gpus > #GPUs per node
+            print(f"Fair allocation - {fair_allocation}")
+
             for i, allocation in enumerate(possible_allocations):
                 fitness = float()
                 print(f"Computing goodput for allocation {allocation}:")
@@ -385,7 +387,7 @@ class Orchestrator:
 
             return possible_allocations[max_fitness_allocation_index], optim_atomic_bszs[max_fitness_allocation_index]
 
-        return None
+        return None, None
 
         # for job_id, job in self.candidate_jobs.items():
         #     print(f"Max BS: {job.pollux_agent.max_batch_size}")
@@ -398,30 +400,33 @@ class Orchestrator:
         await asyncio.sleep(30)
         while True and not self.realloc_requests_once:
             await asyncio.sleep(30)
-            # # Using all jobs for now, allocating 2 GPUs each
-            # job_ids_to_reallocate = [j for j in self.jobs.keys() if self.jobs[j].status == JobState.allocated]
-            # allocations = (2, 1)
+            try:
+                # # Using all jobs for now, allocating 2 GPUs each
+                # job_ids_to_reallocate = [j for j in self.jobs.keys() if self.jobs[j].status == JobState.allocated]
+                # allocations = (2, 1)
 
-            # for job_id in job_ids_to_reallocate:
-            #     self.job_ids_reallocating_resources[job_id] = allocations
-            # #
+                # for job_id in job_ids_to_reallocate:
+                #     self.job_ids_reallocating_resources[job_id] = allocations
+                # #
 
-            self.job_ids_reallocating_resources, optim_atomic_bszs = self.optimize_resource_allocation()
+                self.job_ids_reallocating_resources, optim_atomic_bszs = self.optimize_resource_allocation()
 
 
-            if self.job_ids_reallocating_resources is not None:
-                for job_id in list(self.job_ids_reallocating_resources.keys()):
-                    if self.job_ids_reallocating_resources[job_id] == self.get_current_job_allocation(job_id):
-                        del self.job_ids_reallocating_resources[job_id]
+                if self.job_ids_reallocating_resources is not None:
+                    for job_id in list(self.job_ids_reallocating_resources.keys()):
+                        if self.job_ids_reallocating_resources[job_id] == self.get_current_job_allocation(job_id):
+                            del self.job_ids_reallocating_resources[job_id]
 
-                if len(self.job_ids_reallocating_resources):
-                    print(f"Doing the following reallocations: {self.job_ids_reallocating_resources}")
-                    await self.send_reallocation_notices(self.job_ids_reallocating_resources)
+                    if len(self.job_ids_reallocating_resources):
+                        print(f"Doing the following reallocations: {self.job_ids_reallocating_resources}")
+                        await self.send_reallocation_notices(self.job_ids_reallocating_resources)
 
-            while len(self.job_ids_reallocating_resources) > 0:
-                await asyncio.sleep(1)
-            logger.info(f"All jobs have their resources reallocated.")
-            # self.realloc_requests_once = True
+                    while len(self.job_ids_reallocating_resources) > 0:
+                        await asyncio.sleep(1)
+                logger.info(f"All jobs have their resources reallocated.")
+                # self.realloc_requests_once = True
+            except Exception as e:
+                print(repr(e))
         logger.info(f"Done reallocating resources")
 
 
@@ -445,7 +450,7 @@ class Orchestrator:
             raise SchedulerError("This job is not supposed to request resource reallocation!")
         
         reallocating_resources = self.job_ids_reallocating_resources[job_id]
-        self.job_ids_reallocating_resources.pop(job_id, None)
+        self.job_ids_reallocating_resources.pop(job_id, None) # TODO: ensure that reference to 'reallocating_resources' is unaffected
         while len(self.job_ids_reallocating_resources) > 0:
             await asyncio.sleep(1)
 
