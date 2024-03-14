@@ -558,7 +558,6 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
             print(f'cannot import gns: {e}')
         
         epoch = current_epoch()
-        num_workers = get_num_workers()
         with self._elastic.context():
             if self._elastic.skipdone():
                 return
@@ -568,9 +567,9 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
                 
-                self.batch_sampler.batch_size = (self._elastic._sync_local_bsz(epoch)) * num_workers
+                self.batch_sampler.batch_size = (self._elastic._sync_local_bsz(epoch)) * get_num_workers()
                 self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
-                    
+                bs_changed = False
                 
                 LOG.info(f"selected Batch size - {self.batch_sampler.batch_size} at EPOCH: {epoch}")
                 for idx, batch in enumerate(super().__iter__()):
@@ -582,9 +581,18 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     self._elastic.current_index += self.batch_sampler.batch_size
                     #if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
                     if self._elastic.current_index >= len(self.dataset):
-                        done = True
+                        # done = True
                         break
-                done = True
+                    if pollux_agent.update_dataloader_batchsize:
+                        bs_changed = True
+                        pollux_agent.update_dataloader_batchsize = False
+                        break
+                if not bs_changed:
+                    done = True
+                    print(f"self._elastic.current_index BEFORE: {self._elastic.current_index}")
+                    self._elastic.current_index -= \
+                            self._elastic.current_index % -len(self.dataset)
+                    print(f"self._elastic.current_index AFTER: {self._elastic.current_index}")
 
                 # alpa.adaptdl.checkpoint.save_all_states()
 

@@ -53,6 +53,7 @@ class PolluxAgent:
         self.namespace = "Alpa-AdaptDL-Ray-NameSpace"
         self.job_id = None
         self.reallocation_approaching = False
+        self.update_dataloader_batchsize = False
 
         self.p_train_step = None
 

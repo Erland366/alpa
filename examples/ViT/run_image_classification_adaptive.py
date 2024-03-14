@@ -708,6 +708,8 @@ def main():
                     pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
 
                 state = reallocate_and_update_state(state)
+
+                continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
             
             state, train_metric = p_train_step(state, batch, variables_dict)
 

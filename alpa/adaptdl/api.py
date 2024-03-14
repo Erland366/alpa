@@ -76,5 +76,6 @@ def reallocate_and_update_state(state):
     alpa.init(cluster='ray', scheduler_address=pollux_agent.scheduler_address, is_reallocation=True)
 
     pollux_agent.reallocation_approaching = False
+    pollux_agent.update_dataloader_batchsize = True
     
     return state
