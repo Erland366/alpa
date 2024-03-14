@@ -17,6 +17,7 @@ from cluster_optimization import list_possible_allocations
 from goodput import GoodputFunction
 import math
 from collections import defaultdict
+import copy
 
 RAY_CLUSTER_ADDRESS = "127.0.0.1:6379"
 RAY_CLUSTER_NAMESPACE = "Alpa-AdaptDL-Ray-NameSpace"
@@ -52,7 +53,7 @@ class Orchestrator:
         self._ray_init(address=self.ray_cluster_address, namespace=self.ray_cluster_namespace)
         self.allocation_matrix = {}
         self.jobs_queue = []
-        self.realloc_requests_once = True # temporary for tests
+        self.realloc_requests_once = False # temporary for tests
         self.first_job_arrived = False
         self.job_ids_reallocating_resources = {}
         
@@ -322,7 +323,7 @@ class Orchestrator:
         return power
 
 
-    def optimize_resource_allocation(self) -> Dict:
+    def optimize_resource_allocation(self) -> Tuple[Dict, Dict]:
         candidate_jobs = {}
         for job_id, job in self.jobs.items():
             if job.status == JobState.allocated and job.pollux_agent is not None \
@@ -330,13 +331,14 @@ class Orchestrator:
                 candidate_jobs[job_id] = job
         
         possible_allocations = list_possible_allocations(self.all_host_num_devices, candidate_jobs)
-        print(possible_allocations)
+        print(f"Possible allocations - {possible_allocations}")
 
         fair_num_gpus = self.get_fair_num_gpus()
         fair_allocation = (fair_num_gpus, 1) # TODO: account for cases when fair_num_gpus > #GPUs per node
         print(f"Fair allocation - {fair_allocation}")
 
         allocation_fitness = defaultdict(float) # each value intitialized with 0.0
+        optim_atomic_bszs = copy.deepcopy(possible_allocations)
 
         if len(candidate_jobs):
             for i, allocation in enumerate(possible_allocations):
@@ -352,6 +354,8 @@ class Orchestrator:
                         atomic_bsz_range=self.jobs[job_id].pollux_agent.local_bsz_bounds,
                         accumulation=False
                     )
+
+                    optim_atomic_bszs[i][job_id] = atomic_bsz
 
                     fair_suggest_goodput, fair_atomic_bsz, fair_accum_steps = goodput_fn.optimize(
                         fair_allocation[1], fair_allocation[0] * fair_allocation[1], fair_allocation, 
@@ -377,8 +381,9 @@ class Orchestrator:
             max_fitness_allocation_index = max(allocation_fitness, key=allocation_fitness.get)
             print(f"Maximum fitness allocation index - {max_fitness_allocation_index}")
             print(f"Maximum fitness allocation - {possible_allocations[max_fitness_allocation_index]}")
+            print(f"Config for best allocation - {optim_atomic_bszs[max_fitness_allocation_index]}")
 
-            return possible_allocations[max_fitness_allocation_index]
+            return possible_allocations[max_fitness_allocation_index], optim_atomic_bszs[max_fitness_allocation_index]
 
         return None
 
@@ -401,7 +406,7 @@ class Orchestrator:
             #     self.job_ids_reallocating_resources[job_id] = allocations
             # #
 
-            self.job_ids_reallocating_resources = self.optimize_resource_allocation()
+            self.job_ids_reallocating_resources, optim_atomic_bszs = self.optimize_resource_allocation()
 
 
             if self.job_ids_reallocating_resources is not None:
