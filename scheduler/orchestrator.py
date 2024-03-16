@@ -104,6 +104,7 @@ class Orchestrator:
         return job_id
 
     def get_jsonable_jobs(self):
+        # TODO: Need a better way to exclude non-jsonable attributes of PolluxAgent. Also, the below is not protected from null
         jsonable_jobs = {}
         for k, v in self.jobs.items():
             jsonable_job_object = PolluxJob(v.id)
@@ -123,6 +124,7 @@ class Orchestrator:
             jsonable_job_object.pollux_agent_jsonable['local_bsz_bounds'] = v.pollux_agent.local_bsz_bounds
             jsonable_job_object.pollux_agent_jsonable['init_batch_size'] = v.pollux_agent.init_batch_size
             jsonable_job_object.pollux_agent_jsonable['total_overhead_time'] = v.pollux_agent.total_overhead_time
+            jsonable_job_object.pollux_agent_jsonable['start_time'] = v.pollux_agent.start_time
 
             jsonable_jobs[k] = jsonable_job_object
         return jsonable_jobs

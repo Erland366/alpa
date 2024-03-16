@@ -76,6 +76,7 @@ class PolluxAgent:
 
         self.fixed_regressors = False
 
+        self.start_time = time.time()
         self.total_overhead_time = float()
 
         # print("PolluxAgent initialized.")
