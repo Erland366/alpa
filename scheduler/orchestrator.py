@@ -373,6 +373,19 @@ class Orchestrator:
                         accumulation=False
                     )
 
+                    # Applying reallocation factor
+                    job_age = self.jobs[job_id].pollux_agent.get_job_age()
+                    total_overhead = self.jobs[job_id].pollux_agent.total_overhead_time
+                    expected_overhead = self.jobs[job_id].pollux_agent.expected_recompilation_overhead()
+                    reallocation_factor = (job_age - total_overhead) / (job_age + expected_overhead)
+
+                    if self.get_current_job_allocation(job_id) != alloc_config:
+                        print(f"Applying realloc factor {reallocation_factor} to allocation config {alloc_config}")
+                        print(f"Goodput before: {suggest_goodput}")
+                        suggest_goodput *= reallocation_factor
+                        print(f"Goodput after: {suggest_goodput}")
+                    # ============================
+
                     speedup = suggest_goodput / fair_suggest_goodput
                     num_jobs = len(self.allocation_matrix)
                     fitness_component = (1 / num_jobs) * speedup ** FAIRNESS_KNOB
