@@ -24,8 +24,9 @@ class PolluxAgent:
         self.NUM_SYNC_PER_CONFIG = 100 # number of times to synchronize iterations to measure T_iter for each configuration
         self.IS_COMPIL_THRESHOLD = 2 # number of seconds, above which time spent counts as compilation overhead
         self.BS_RECOMPILATION_FACTOR_ENABLED = True
-        
+
         self.state = state
+        self.train_metric = None
         self.iter = 0
         self.t_iters = []
         self.t_grads = []
@@ -136,9 +137,10 @@ class PolluxAgent:
                 count[k[0]] = len(v)
         return count
     
-    def report_iteration(self, state, t_iter=None, executable_time_cost=None):
+    def report_iteration(self, state, train_metric, t_iter=None, executable_time_cost=None):
         # assert self.total_batch_size != None, "Total batch size should be set in the training code using pollux_agent.total_batch_size"
         self.state = state
+        self.train_metric = train_metric
         if t_iter is not None:
             self.config_t_iter[self.get_current_config()].append(t_iter)
         self.iter += 1
@@ -177,6 +179,7 @@ class PolluxAgent:
         state = self.__dict__.copy()
         del state['p_train_step']
         del state['state']
+        del state['train_metric']
         # TODO: also make sure that PGNS value is materialized
         if isinstance(self.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
              and isinstance(self.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):

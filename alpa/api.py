@@ -160,6 +160,8 @@ class ParallelizedFunc:
 
         out = executable.launch_on_driver(*args_flat)
 
+        unflattened_out_tree = tree_unflatten(out_tree(), out)
+
         if was_recompilation_of_seen_config:
             executable.sync()
             compil_time = time.perf_counter() - compil_start
@@ -175,15 +177,20 @@ class ParallelizedFunc:
             pollux_agent.overhead_time_list.append(compil_time)
             print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
             # below assumes that the first argument to __call__ is a TrainState
-            pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state)
+            pollux_agent.report_iteration(unflattened_out_tree[0] if isinstance(unflattened_out_tree[0], train_state.TrainState) else pollux_agent.state, 
+                                        unflattened_out_tree[1] if isinstance(unflattened_out_tree[1], dict) else pollux_agent.train_metric)
         elif len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
             executable.sync()
             t_iter = time.perf_counter() - iter_start
-            pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state, t_iter)
+            pollux_agent.report_iteration(unflattened_out_tree[0] if isinstance(unflattened_out_tree[0], train_state.TrainState) else pollux_agent.state, 
+                                        unflattened_out_tree[1] if isinstance(unflattened_out_tree[1], dict) else pollux_agent.train_metric,
+                                        t_iter=t_iter)
         else:
-            pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state)
-        
-        return tree_unflatten(out_tree(), out)
+            pollux_agent.report_iteration(unflattened_out_tree[0] if isinstance(unflattened_out_tree[0], train_state.TrainState) else pollux_agent.state, 
+                                        unflattened_out_tree[1] if isinstance(unflattened_out_tree[1], dict) else pollux_agent.train_metric)
+
+        # return tree_unflatten(out_tree(), out)
+        return unflattened_out_tree
 
     def get_executable(self, *args):
         """Get the compiled exectuable."""
