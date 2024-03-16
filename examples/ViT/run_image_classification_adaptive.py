@@ -79,6 +79,7 @@ import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 import datetime
 import numpy as np
+import wandb
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
@@ -419,6 +420,15 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
         )
 
+    run = wandb.init(
+        # Set the project where this run will be logged
+        project="ViT_adaptive",
+        config={
+            "model_name_or_path": model_args.model_name_or_path,
+            "training_args": training_args,
+        }
+    )
+
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
@@ -605,7 +615,7 @@ def main():
                                                                                                            theta)
         
         metrics = {"loss": loss, 
-                   "learning_rate": linear_decay_lr_schedule_fn(state.step), 
+                   "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
                    "gradients": gradients, 
                    "grad_sqr": grad_sqr, 
                    "grad_var": grad_var, 
@@ -632,8 +642,8 @@ def main():
     # method = alpa.Zero3Parallel() 
     #method = alpa.PipeshardParallel(stage_option="uniform") 
     # method = alpa.PipeshardParallel() 
-    # method = alpa.ShardParallel() 
-    method = alpa.DataParallel()
+    method = alpa.ShardParallel() 
+    # method = alpa.DataParallel()
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)

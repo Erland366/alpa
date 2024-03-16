@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import alpa
 from typing import Union, Optional, List, Tuple, Set, Dict
 from sklearn.base import RegressorMixin
+import wandb
 
 linear_rbf_kernel = DotProduct() + RBF() + WhiteKernel(noise_level_bounds=(1e-10, 1e5)) # lower bound lowered to avoid a warning
 
@@ -148,7 +149,8 @@ class PolluxAgent:
         current_time = time.time()
         if self.scheduler_enabled and (self.scheduler_update_last_time is None or current_time - self.scheduler_update_last_time > self.scheduler_update_interval):
             self.pickle_and_update_scheduler()
-            self.scheduler_update_last_time = current_time
+            self.wandb_log()
+            self.scheduler_update_last_time = time.time()
         if self.iter % 500 == 0:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
         if not self.training_started_for_config[self.get_current_config()]:
@@ -169,6 +171,38 @@ class PolluxAgent:
         dumped = pickle.dumps(self)
         from alpa.adaptdl.sched_requests import update_state
         update_state(dumped)
+
+    
+    def wandb_log(self):
+        from alpa.adaptdl.goodput import GoodputFunction
+
+        stat_eff_table = None
+        current_stat_eff = None
+
+        if self.grad_norm_sqr is not None and self.grad_variance is not None:
+            goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
+            min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
+            batch_size = jnp.geomspace(min_batch_size, self.max_batch_size)
+            stat_eff = goodput_fn.efficiency(batch_size)
+            print(f"stat_eff: {stat_eff}")
+            table_data = [[x, y] for (x, y) in zip(batch_size, stat_eff)]
+            stat_eff_table = wandb.Table(data=table_data, columns=["batch_size", "SE"])
+            current_stat_eff = goodput_fn.efficiency(self.total_batch_size)
+
+        wandb.log({
+            "loss": self.train_metric['loss']._value, 
+            "lr": self.train_metric['learning_rate']._value,
+            "job_age": self.get_job_age(),
+            "pure_training_time": self.get_job_age() - self.total_overhead_time,
+            "time": time.time(),
+            "total_overhead_time": self.total_overhead_time,
+            "batch_size": self.total_batch_size,
+            "num_gpus": alpa.get_global_num_devices(),
+            "grad_norm_sqr": self.grad_norm_sqr,
+            "grad_variance": self.grad_variance,
+            "SE_vs_BS": wandb.plot.line(stat_eff_table, "batch_size", "SE", title="Statistical Efficiency vs. Batch Size Plot") if stat_eff_table is not None else None,
+            "current_stat_eff": current_stat_eff,
+            })
 
     
     def __getstate__(self):
