@@ -140,22 +140,38 @@ class ParallelizedFunc:
     @traceback_util.api_boundary
     def __call__(self, *args):
         """Launch the computation on the driver."""
-        if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
-            compil_start = time.perf_counter()
+        # if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
+        compil_start = time.perf_counter()
 
         # compilation usually ends after the below line, but the first iteration (executable.launch_on_driver) takes long
         executable, _, out_tree, args_flat = (
             self._decode_args_and_get_executable(*args))
+
+        was_recompilation_of_seen_config = False
         
+        if pollux_agent.get_current_config() in pollux_agent.t_compilation.keys():
+            compil_time = time.perf_counter() - compil_start
+            if compil_time > 1:
+                was_recompilation_of_seen_config = True
+
         if len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
             executable.sync()
             iter_start = time.perf_counter()
 
         out = executable.launch_on_driver(*args_flat)
+
+        if was_recompilation_of_seen_config:
+            executable.sync()
+            compil_time = time.perf_counter() - compil_start
+            pollux_agent.total_overhead_time += compil_time
+            print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
+            was_recompilation_of_seen_config = False
         
         if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
             compil_time = time.perf_counter() - compil_start
             pollux_agent.t_compilation[pollux_agent.get_current_config()] = compil_time
+            pollux_agent.total_overhead_time += compil_time
+            print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
             # below assumes that the first argument to __call__ is a TrainState
             pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state)
         elif len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
