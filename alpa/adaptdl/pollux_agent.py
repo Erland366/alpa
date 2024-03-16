@@ -23,7 +23,8 @@ class PolluxAgent:
     def __init__(self, state=None):
         self.NUM_SYNC_PER_CONFIG = 100 # number of times to synchronize iterations to measure T_iter for each configuration
         self.IS_COMPIL_THRESHOLD = 2 # number of seconds, above which time spent counts as compilation overhead
-
+        self.BS_RECOMPILATION_FACTOR_ENABLED = True
+        
         self.state = state
         self.iter = 0
         self.t_iters = []

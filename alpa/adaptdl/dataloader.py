@@ -323,6 +323,20 @@ class AdaptiveDataLoaderHelper(object):
                 self.accumulation_steps
             )
             #print(jnp.maximum(current_goodput, 1e-8))
+
+            # Applying reallocation factor
+            if pollux_agent.BS_RECOMPILATION_FACTOR_ENABLED:
+                job_age = pollux_agent.get_job_age()
+                total_overhead = pollux_agent.total_overhead_time
+                expected_overhead = pollux_agent.expected_recompilation_overhead()
+                recompilation_factor = (job_age - total_overhead) / (job_age + expected_overhead)
+
+                print(f"Applying realloc factor {recompilation_factor}:")
+                print(f"Goodput before: {suggest_goodput}")
+                suggest_goodput *= recompilation_factor
+                print(f"Goodput after: {suggest_goodput}")
+            # ============================
+
             speedup = suggest_goodput / jnp.maximum(current_goodput, 1e-8)
             if speedup > self._speedup_threshold:
                 ##if atomic_bsz <= 2 * self._state.current_local_bsz:
@@ -589,10 +603,8 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                         break
                 if not bs_changed:
                     done = True
-                    print(f"self._elastic.current_index BEFORE: {self._elastic.current_index}")
                     self._elastic.current_index -= \
                             self._elastic.current_index % -len(self.dataset)
-                    print(f"self._elastic.current_index AFTER: {self._elastic.current_index}")
 
                 # alpa.adaptdl.checkpoint.save_all_states()
 
