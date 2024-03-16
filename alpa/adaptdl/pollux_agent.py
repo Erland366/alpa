@@ -78,6 +78,7 @@ class PolluxAgent:
 
         self.start_time = time.time()
         self.total_overhead_time = float()
+        self.overhead_time_list = list()
 
         # print("PolluxAgent initialized.")
 
@@ -240,6 +241,15 @@ class PolluxAgent:
         """
         raise NotImplementedError
         return np.array(configs)[:, 0].reshape(-1, 1) / self.predict_t_iter_from_configs(configs).reshape(-1, 1)
+
+    def get_job_age(self):
+        return time.time() - self.start_time
+
+    def expected_recompilation_overhead(self):
+        if len(self.overhead_time_list) > 1:
+            return self.overhead_time_list[1]
+        else:
+            return None
         
     def _save_objects(self, filename):
         os.makedirs(os.path.dirname(filename), exist_ok=True)

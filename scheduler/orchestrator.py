@@ -126,6 +126,10 @@ class Orchestrator:
             jsonable_job_object.pollux_agent_jsonable['total_overhead_time'] = v.pollux_agent.total_overhead_time
             jsonable_job_object.pollux_agent_jsonable['start_time'] = v.pollux_agent.start_time
 
+            jsonable_job_object.pollux_agent_jsonable['job_age'] = v.pollux_agent.get_job_age()
+            jsonable_job_object.pollux_agent_jsonable['expected_recompilation_overhead'] = v.pollux_agent.expected_recompilation_overhead()
+            jsonable_job_object.pollux_agent_jsonable['overhead_time_list'] = v.pollux_agent.overhead_time_list
+
             jsonable_jobs[k] = jsonable_job_object
         return jsonable_jobs
     

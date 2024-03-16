@@ -164,6 +164,7 @@ class ParallelizedFunc:
             executable.sync()
             compil_time = time.perf_counter() - compil_start
             pollux_agent.total_overhead_time += compil_time
+            pollux_agent.overhead_time_list.append(compil_time)
             print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
             was_recompilation_of_seen_config = False
         
@@ -171,6 +172,7 @@ class ParallelizedFunc:
             compil_time = time.perf_counter() - compil_start
             pollux_agent.t_compilation[pollux_agent.get_current_config()] = compil_time
             pollux_agent.total_overhead_time += compil_time
+            pollux_agent.overhead_time_list.append(compil_time)
             print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
             # below assumes that the first argument to __call__ is a TrainState
             pollux_agent.report_iteration(args[0] if isinstance(args[0], train_state.TrainState) else pollux_agent.state)
