@@ -192,6 +192,8 @@ class PolluxAgent:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
             min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
             batch_size = jnp.geomspace(min_batch_size, self.max_batch_size)
+            eps = 1e-8
+            batch_size = jnp.ceil(batch_size - eps)
             stat_eff = goodput_fn.efficiency(batch_size)
             throughput = jnp.ravel(self.predict_throughput(batch_size))
             goodput = stat_eff * throughput
