@@ -155,16 +155,16 @@ class PolluxAgent:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
         if not self.training_started_for_config[self.get_current_config()]:
             self.training_started_for_config[self.get_current_config()] = True
-        if self.iter % 100 == 0:
-            print(f"Throughput for each seen allocation:")
-            self._fit_config_iter()
-            for alloc in self.alloc_config_regressor.keys():
-                print(f"Allocation {alloc} - {self.predict_throughput(self.total_batch_size, alloc_config=alloc)}")
-            print(f"Count of observations: {self.count_bs_observations()}")
-            print(f"Median T_iter list - {list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()])}")
-            print(f"Parameters of regressors:")
-            for alloc, regressor in self.alloc_config_regressor.items():
-                print(f"Allocation {alloc} - coef: {regressor.coef_}, intercept: {regressor.intercept_}")
+        # if self.iter % 100 == 0:
+        #     print(f"Throughput for each seen allocation:")
+        #     self._fit_config_iter()
+        #     for alloc in self.alloc_config_regressor.keys():
+        #         print(f"Allocation {alloc} - {self.predict_throughput(self.total_batch_size, alloc_config=alloc)}")
+        #     print(f"Count of observations: {self.count_bs_observations()}")
+        #     print(f"Median T_iter list - {list([np.median(np.sort(np.array(l))) for l in self.config_t_iter.values()])}")
+        #     print(f"Parameters of regressors:")
+        #     for alloc, regressor in self.alloc_config_regressor.items():
+        #         print(f"Allocation {alloc} - coef: {regressor.coef_}, intercept: {regressor.intercept_}")
 
 
     def pickle_and_update_scheduler(self):
@@ -177,17 +177,23 @@ class PolluxAgent:
         from alpa.adaptdl.goodput import GoodputFunction
 
         stat_eff_table = None
+        goodput_table = None
         current_stat_eff = None
+        current_goodput = None
 
         if self.grad_norm_sqr is not None and self.grad_variance is not None:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
             min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
             batch_size = jnp.geomspace(min_batch_size, self.max_batch_size)
             stat_eff = goodput_fn.efficiency(batch_size)
-            print(f"stat_eff: {stat_eff}")
-            table_data = [[x, y] for (x, y) in zip(batch_size, stat_eff)]
-            stat_eff_table = wandb.Table(data=table_data, columns=["batch_size", "SE"])
+            throughput = jnp.ravel(self.predict_throughput(batch_size))
+            goodput = stat_eff * throughput
+            table_data_se = [[x, y] for (x, y) in zip(batch_size, stat_eff)]
+            table_data_goodput = [[x, y] for (x, y) in zip(batch_size, goodput)]
+            stat_eff_table = wandb.Table(data=table_data_se, columns=["batch_size", "SE"])
+            goodput_table = wandb.Table(data=table_data_goodput, columns=["batch_size", "Goodput"])
             current_stat_eff = goodput_fn.efficiency(self.total_batch_size)
+            current_goodput = current_stat_eff * self.predict_throughput(self.total_batch_size)[0]
 
         wandb.log({
             "loss": self.train_metric['loss']._value, 
@@ -202,6 +208,8 @@ class PolluxAgent:
             "grad_variance": self.grad_variance,
             "SE_vs_BS": wandb.plot.line(stat_eff_table, "batch_size", "SE", title="Statistical Efficiency vs. Batch Size Plot") if stat_eff_table is not None else None,
             "current_stat_eff": current_stat_eff,
+            "Goodput_vs_BS": wandb.plot.line(goodput_table, "batch_size", "Goodput", title="Goodput vs. Batch Size Plot") if goodput_table is not None else None,
+            "current_goodput": current_goodput,
             })
 
     
