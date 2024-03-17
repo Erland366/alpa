@@ -177,6 +177,12 @@ class PolluxAgent:
         from alpa.adaptdl.sched_requests import update_state
         update_state(dumped)
 
+
+    def log_async(self, data):
+        def log_thread():
+            wandb.log(data)
+        threading.Thread(target=log_thread).start()
+    
     
     def wandb_log(self):
         from alpa.adaptdl.goodput import GoodputFunction
@@ -185,8 +191,6 @@ class PolluxAgent:
         goodput_table = None
         current_stat_eff = None
         current_goodput = None
-
-        goodput_computation_time = time.perf_counter()
 
         if self.grad_norm_sqr is not None and self.grad_variance is not None:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
@@ -204,13 +208,7 @@ class PolluxAgent:
             current_stat_eff = goodput_fn.efficiency(self.total_batch_size)
             current_goodput = current_stat_eff * self.predict_throughput(self.total_batch_size)[0]
 
-        goodput_computation_time = time.perf_counter() - goodput_computation_time
-
-        print(f"goodput_computation_time: {goodput_computation_time}")
-
-        wandb_log_time = time.perf_counter()
-
-        wandb.log({
+        data = {
             "loss": self.train_metric['loss']._value, 
             "lr": self.train_metric['learning_rate']._value,
             "job_age": self.get_job_age(),
@@ -225,11 +223,10 @@ class PolluxAgent:
             "current_stat_eff": current_stat_eff,
             "Goodput_vs_BS": wandb.plot.line(goodput_table, "batch_size", "Goodput", title="Goodput vs. Batch Size Plot") if goodput_table is not None else None,
             "current_goodput": current_goodput,
-            })
+            }
 
-        wandb_log_time = time.perf_counter() - wandb_log_time
-
-        print(f"wandb_log_time: {wandb_log_time}")
+        # Asynchronously logging wandb data so that training is not blocked. Each log otherwise takes ~1s.
+        self.log_async(data)
 
     
     def __getstate__(self):
