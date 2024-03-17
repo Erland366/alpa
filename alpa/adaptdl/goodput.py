@@ -65,11 +65,11 @@ class GoodputFunction(object):
         scale = batch_size / self._init_batch_size
         denom = grad_var / scale + grad_sqr
         gain = np.where(denom > 0, (grad_var + grad_sqr) / denom, 1.0)
-        LOGGER.info(f'Efficiency & GNS Computation')
-        LOGGER.info(f'grad_sqr: {grad_sqr}')
-        LOGGER.info(f'grad_var: {grad_var}')
-        LOGGER.info(f'scale: {scale}')
-        LOGGER.info(f'gain (GNS): {gain}')
+        # LOGGER.info(f'Efficiency & GNS Computation')
+        # LOGGER.info(f'grad_sqr: {grad_sqr}')
+        # LOGGER.info(f'grad_var: {grad_var}')
+        # LOGGER.info(f'scale: {scale}')
+        # LOGGER.info(f'gain (GNS): {gain}')
         return gain / scale
     
     def throughtput(self, batchsizes):
