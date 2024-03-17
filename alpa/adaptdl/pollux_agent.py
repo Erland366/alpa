@@ -192,7 +192,7 @@ class PolluxAgent:
         current_stat_eff = None
         current_goodput = None
 
-        if self.grad_norm_sqr is not None and self.grad_variance is not None:
+        if self.grad_norm_sqr is not None and self.grad_variance is not None and self.local_bsz_bounds is not None:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
             min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
             batch_size = jnp.geomspace(min_batch_size, self.max_batch_size)
