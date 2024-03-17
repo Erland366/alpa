@@ -426,6 +426,8 @@ def main():
         project="ViT_adaptive",
         config={
             "model_name_or_path": model_args.model_name_or_path,
+            "model_args": model_args,
+            "data_args": data_args,
             "training_args": training_args,
         }
     )
