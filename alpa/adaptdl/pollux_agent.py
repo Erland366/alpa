@@ -51,6 +51,10 @@ class PolluxAgent:
 
         self.scheduler_update_last_time = None
         self.scheduler_update_interval = 10 # seconds
+
+        self.wandb_logging_enabled = True
+        self.wandb_log_last_time = None
+        self.wandb_log_interval = 10 # seconds
         
         self.scheduler_enabled = False
         self.scheduler_address = None
@@ -146,11 +150,12 @@ class PolluxAgent:
             self.config_t_iter[self.get_current_config()].append(t_iter)
         self.iter += 1
         
-        current_time = time.time()
-        if self.scheduler_enabled and (self.scheduler_update_last_time is None or current_time - self.scheduler_update_last_time > self.scheduler_update_interval):
+        if self.scheduler_enabled and (self.scheduler_update_last_time is None or time.time() - self.scheduler_update_last_time > self.scheduler_update_interval):
             self.pickle_and_update_scheduler()
-            self.wandb_log()
             self.scheduler_update_last_time = time.time()
+        if self.wandb_logging_enabled and (self.wandb_log_last_time is None or time.time() - self.wandb_log_last_time > self.wandb_log_interval):
+            self.wandb_log()
+            self.wandb_log_last_time = time.time()
         if self.iter % 500 == 0:
             self._save_objects(f'pickle_objects/objects_iteration{self.iter}.pkl')
         if not self.training_started_for_config[self.get_current_config()]:
@@ -181,6 +186,8 @@ class PolluxAgent:
         current_stat_eff = None
         current_goodput = None
 
+        goodput_computation_time = time.perf_counter()
+
         if self.grad_norm_sqr is not None and self.grad_variance is not None:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
             min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
@@ -194,6 +201,12 @@ class PolluxAgent:
             goodput_table = wandb.Table(data=table_data_goodput, columns=["batch_size", "Goodput"])
             current_stat_eff = goodput_fn.efficiency(self.total_batch_size)
             current_goodput = current_stat_eff * self.predict_throughput(self.total_batch_size)[0]
+
+        goodput_computation_time = time.perf_counter() - goodput_computation_time
+
+        print(f"goodput_computation_time: {goodput_computation_time}")
+
+        wandb_log_time = time.perf_counter()
 
         wandb.log({
             "loss": self.train_metric['loss']._value, 
@@ -211,6 +224,10 @@ class PolluxAgent:
             "Goodput_vs_BS": wandb.plot.line(goodput_table, "batch_size", "Goodput", title="Goodput vs. Batch Size Plot") if goodput_table is not None else None,
             "current_goodput": current_goodput,
             })
+
+        wandb_log_time = time.perf_counter() - wandb_log_time
+
+        print(f"wandb_log_time: {wandb_log_time}")
 
     
     def __getstate__(self):
