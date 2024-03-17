@@ -313,12 +313,13 @@ class Orchestrator:
                 self.jobs[job_id].status = JobState.reallocating
             else:
                 self.jobs[job_id].status = JobState.ended
-                self.job_ids_reallocating_resources.pop(job_id, None)
+                if self.job_ids_reallocating_resources is not None:
+                    self.job_ids_reallocating_resources.pop(job_id, None)
             del self.allocation_matrix[job_id]
             logger.info(f"Resources of job {job_id} released!")
-        except:
+        except Exception as e:
             # del self.allocation_matrix[job_id]
-            raise SchedulerError("Placement group not found, job probably called alpa.shutdown().")
+            raise SchedulerError(f"Placement group not found, job probably called alpa.shutdown(). Exception: {e}")
 
 
     def get_fair_num_gpus(self):
