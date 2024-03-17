@@ -405,6 +405,7 @@ def main():
         logger.warning("You are instantiating a new config instance from scratch.")
 
     if model_args.model_name_or_path and not training_args.pretrain:
+        print(f"Finetuning mode")
         model = FlaxAutoModelForImageClassification.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -642,8 +643,8 @@ def main():
     # method = alpa.Zero3Parallel() 
     #method = alpa.PipeshardParallel(stage_option="uniform") 
     # method = alpa.PipeshardParallel() 
-    method = alpa.ShardParallel() 
-    # method = alpa.DataParallel()
+    # method = alpa.ShardParallel() 
+    method = alpa.DataParallel()
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)
