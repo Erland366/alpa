@@ -85,6 +85,7 @@ def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
 
 # alpa.init(cluster="ray")
+# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_non-adaptive")
 alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 logger = logging.getLogger(__name__)
 
@@ -490,7 +491,7 @@ def main():
         drop_last=True,
     )
     
-    train_loader.autoscale_batch_size(max_batch_size = 400, 
+    train_loader.autoscale_batch_size(max_batch_size = 800, 
                                         local_bsz_bounds=(train_batch_size, 200), gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(

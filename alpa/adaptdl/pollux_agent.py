@@ -46,6 +46,7 @@ class PolluxAgent:
 
         self.config_t_iter = defaultdict(list) # dictionary of config : T_iter (from self.get_current_config())
         
+        self.periodic_bs_sync_enabled = True
         self.bs_sync_starttime = None
         self.bs_sync_interval = 30 # seconds
 

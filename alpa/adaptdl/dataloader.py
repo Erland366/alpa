@@ -577,6 +577,7 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                 return
             done = False
             bs_changed = False
+            reset_bs_sync_starttime = True
             while not done:
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
@@ -590,16 +591,21 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                     # with self._elastic.profile(self.training and idx >= 1):
                     # TODO: above profiler should be implemented and below code indented
                     yield batch
-                    pollux_agent.bs_sync_starttime = time.time()
+                    if reset_bs_sync_starttime:
+                        pollux_agent.bs_sync_starttime = time.time()
+                        reset_bs_sync_starttime = False
                     # Increment by the number of data samples processed
                     self._elastic.current_index += self.batch_sampler.batch_size
                     #if time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval:
                     if self._elastic.current_index >= len(self.dataset):
                         # done = True
                         break
-                    if pollux_agent.update_dataloader_batchsize:
+                    if pollux_agent.update_dataloader_batchsize or \
+                            (pollux_agent.periodic_bs_sync_enabled and pollux_agent.bs_sync_interval is not None \
+                            and time.time() - pollux_agent.bs_sync_starttime >= pollux_agent.bs_sync_interval):
                         bs_changed = True
                         pollux_agent.update_dataloader_batchsize = False
+                        reset_bs_sync_starttime = True
                         break
                 if not bs_changed:
                     done = True
