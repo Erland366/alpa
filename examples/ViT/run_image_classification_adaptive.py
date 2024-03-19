@@ -429,8 +429,14 @@ def main():
             "model_args": model_args,
             "data_args": data_args,
             "training_args": training_args,
-        }
+        },
+        save_code=True,
+        settings=wandb.Settings(code_dir=os.path.dirname(os.path.dirname(alpa.__file__)))
     )
+    run.log_code(
+                    os.path.dirname(os.path.dirname(alpa.__file__)),
+                    exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
+                    )
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
