@@ -492,7 +492,7 @@ def main():
     )
     
     train_loader.autoscale_batch_size(max_batch_size = 800, 
-                                        local_bsz_bounds=(train_batch_size, 200), gradient_accumulation=False)
+                                        local_bsz_bounds=(train_batch_size, 150), gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(
        eval_dataset,
