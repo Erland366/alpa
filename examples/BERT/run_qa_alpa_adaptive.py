@@ -996,8 +996,8 @@ def main():
         drop_last=True,
     )
 
-    # train_loader.autoscale_batch_size(max_batch_size = 400, 
-    #                                 local_bsz_bounds=(8, 80), gradient_accumulation=False)
+    train_loader.autoscale_batch_size(max_batch_size = 280, 
+                                    local_bsz_bounds=(train_batch_size, 70), gradient_accumulation=False)
 
     # train_loader = DataLoader(train_dataset_pytorch, batch_size=train_batch_size, shuffle=True, drop_last=True)
 
