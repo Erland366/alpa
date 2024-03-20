@@ -430,6 +430,20 @@ class Orchestrator:
                 #     self.job_ids_reallocating_resources[job_id] = allocations
                 # #
 
+
+                # Not reallocating if some jobs did not properly start yet
+                # Temporary solution
+                wait_for_other_jobs = False
+
+                for job_id, job in self.jobs.items():
+                    if job.status == JobState.allocated and (job.pollux_agent is None \
+                            or job.pollux_agent.grad_norm_sqr is None or job.pollux_agent.grad_variance is None):
+                        wait_for_other_jobs = True
+                
+                if wait_for_other_jobs:
+                    continue
+                ##########################################################
+
                 self.job_ids_reallocating_resources, optim_atomic_bszs = self.optimize_resource_allocation()
 
 
@@ -444,7 +458,7 @@ class Orchestrator:
 
                     while len(self.job_ids_reallocating_resources) > 0:
                         await asyncio.sleep(1)
-                logger.info(f"All jobs have their resources reallocated.")
+                    logger.info(f"All jobs have their resources reallocated.")
                 # self.realloc_requests_once = True
             except Exception as e:
                 print(repr(e))
