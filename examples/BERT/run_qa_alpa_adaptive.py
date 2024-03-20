@@ -101,8 +101,9 @@ class QADataset(Dataset):
         item = {key: torch.tensor(value) for key, value in item.items()}
         return item
 
-alpa.init(cluster="ray")
-# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
+# alpa.init(cluster="ray")
+# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_non-adaptive_bert")
+alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1)
 
 
@@ -978,13 +979,13 @@ def main():
     pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset_pytorch)
 
-    # pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.00206749])
-    # pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.019354801896649114
-    # pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00108904])
-    # pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.027093764782572798
-    # pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00056805])
-    # pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.028780623571947224
-    # pollux_agent.fix_regressors()
+    pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.004806])
+    pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.021575327546867917
+    pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00226393])
+    pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.031203793760921167
+    pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00112445])
+    pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.030955123211688196
+    pollux_agent.fix_regressors()
 
     train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
         dataset=train_dataset_pytorch,
@@ -1032,6 +1033,11 @@ def main():
             "training_args": training_args,
         }
     )
+
+    run.log_code(
+                os.path.dirname(os.path.dirname(alpa.__file__)),
+                exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
+                )
 
 
     learning_rate_fn = create_learning_rate_fn(
