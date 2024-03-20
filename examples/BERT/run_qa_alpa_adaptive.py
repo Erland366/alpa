@@ -1031,7 +1031,8 @@ def main():
             "model_args": model_args,
             "data_args": data_args,
             "training_args": training_args,
-        }
+        },
+        save_code=True,
     )
 
     run.log_code(
