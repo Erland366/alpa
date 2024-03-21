@@ -189,8 +189,10 @@ class PolluxAgent:
         from alpa.adaptdl.goodput import GoodputFunction
 
         stat_eff_table = None
+        throughput_table = None
         goodput_table = None
         current_stat_eff = None
+        current_throughput = None
         current_goodput = None
 
         if self.grad_norm_sqr is not None and self.grad_variance is not None and self.local_bsz_bounds is not None:
@@ -203,11 +205,14 @@ class PolluxAgent:
             throughput = jnp.ravel(self.predict_throughput(batch_size))
             goodput = stat_eff * throughput
             table_data_se = [[x, y] for (x, y) in zip(batch_size, stat_eff)]
+            table_data_throughput = [[x, y] for (x, y) in zip(batch_size, throughput)]
             table_data_goodput = [[x, y] for (x, y) in zip(batch_size, goodput)]
             stat_eff_table = wandb.Table(data=table_data_se, columns=["batch_size", "SE"])
+            throughput_table = wandb.Table(data=table_data_throughput, columns=["batch_size", "Throughput"])
             goodput_table = wandb.Table(data=table_data_goodput, columns=["batch_size", "Goodput"])
             current_stat_eff = goodput_fn.efficiency(self.total_batch_size)
-            current_goodput = current_stat_eff * self.predict_throughput(self.total_batch_size)[0]
+            current_throughput = self.predict_throughput(self.total_batch_size)[0]
+            current_goodput = current_stat_eff * current_throughput
 
         data = {
             "loss": self.train_metric['loss']._value, 
@@ -222,6 +227,8 @@ class PolluxAgent:
             "grad_variance": self.grad_variance,
             "SE_vs_BS": wandb.plot.line(stat_eff_table, "batch_size", "SE", title="Statistical Efficiency vs. Batch Size Plot") if stat_eff_table is not None else None,
             "current_stat_eff": current_stat_eff,
+            "Throughput_vs_BS": wandb.plot.line(throughput_table, "batch_size", "Throughput", title="Throughput vs. Batch Size Plot") if throughput_table is not None else None,
+            "current_throughput": current_throughput,
             "Goodput_vs_BS": wandb.plot.line(goodput_table, "batch_size", "Goodput", title="Goodput vs. Batch Size Plot") if goodput_table is not None else None,
             "current_goodput": current_goodput,
             }
