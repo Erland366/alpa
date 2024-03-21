@@ -68,7 +68,7 @@ from alpa.adaptdl.gns_util import (extract_values_with_key_p,
                                    normsqr_groups,
                                    average_groups,
                                    update_avg,
-                                   compute_gradient_noise_scale_no_ewma, 
+                                   compute_gradient_noise_scale, 
                                    compute_gradsnorms, 
                                    update_variance, 
                                    compute_variance, 
@@ -939,7 +939,7 @@ def main():
             prev_grads
         )
 
-        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale_no_ewma(prev_grads, gradients,
+        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
                                                                                                     preconditioners, 
                                                                                                     biased_sqr, 
                                                                                                     unbias_sqr, 
