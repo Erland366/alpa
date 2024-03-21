@@ -801,8 +801,8 @@ def main():
         persistent_workers=False if data_args.preprocessing_num_workers is None else True,
     )
 
-    # train_loader.autoscale_batch_size(max_batch_size = 64 * alpa.get_global_num_devices(), 
-                                    # local_bsz_bounds=(4, 64), gradient_accumulation=False)
+    train_loader.autoscale_batch_size(max_batch_size = 400, 
+                                    local_bsz_bounds=(train_batch_size / alpa.get_global_num_devices(), 100), gradient_accumulation=False)
 
     eval_loader = DataLoader(
         eval_dataset,
