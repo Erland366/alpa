@@ -1,0 +1,13 @@
+python run_qa_alpa_adaptive.py \
+  --model_name_or_path bert-base-uncased \
+  --dataset_name squad \
+  --do_train   \
+  --do_eval   \
+  --max_seq_length 384 \
+  --doc_stride 128 \
+  --learning_rate 1e-5 \
+  --num_train_epochs 1000000 \
+  --per_device_train_batch_size 12 \
+  --output_dir ./bert-qa-squad \
+  --eval_steps 1000 \
+  --cache_dir ./cache
