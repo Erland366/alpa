@@ -979,12 +979,12 @@ def main():
     pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset_pytorch)
 
-    pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.004806])
-    pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.021575327546867917
-    pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00226393])
-    pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.031203793760921167
-    pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00112445])
-    pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.030955123211688196
+    pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.00479348])
+    pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.02192572974932519
+    pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00227153])
+    pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.03077823208046282
+    pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00113308])
+    pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.02943616079366107
     pollux_agent.fix_regressors()
 
     train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
