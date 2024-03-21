@@ -188,10 +188,16 @@ class PolluxAgent:
     def wandb_log(self):
         from alpa.adaptdl.goodput import GoodputFunction
 
+        if not self.scheduler_enabled:
+            if isinstance(self.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
+                and isinstance(self.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                self.grad_norm_sqr = self.grad_norm_sqr_abstract._value.item()
+                self.grad_variance = self.grad_variance_abstract._value.item()
+
         stat_eff_table = None
         throughput_table = None
         goodput_table = None
-        current_stat_eff = None
+        current_stat_eff = None 
         current_throughput = None
         current_goodput = None
 
@@ -318,6 +324,8 @@ class PolluxAgent:
     def expected_recompilation_overhead(self):
         if len(self.overhead_time_list) > 1:
             return self.overhead_time_list[1]
+        elif len(self.overhead_time_list) == 1:
+            return self.overhead_time_list[0]
         else:
             return None
         
