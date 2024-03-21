@@ -47,6 +47,23 @@ def compute_gradient_noise_scale(prev_grads, new_grads,
     biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
     return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
 
+def compute_gradient_noise_scale_no_ewma(prev_grads, new_grads,
+                                  preconditioner, 
+                                  biased_sqr, unbias_sqr, biased_var, unbias_var,
+                                  count, scale, theta
+                                 ):
+        
+    grads_normsqr = normsqr_groups(new_grads, preconditioner)
+    local_sqr = (normsqr_groups(prev_grads, preconditioner)
+                             + grads_normsqr) / 2
+    avg_grads = average_groups(new_grads, prev_grads)
+    total_sqr = normsqr_groups(avg_grads, preconditioner)
+    grad_sqr = (count * total_sqr - local_sqr) / (count - 1) 
+    grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+    # biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
+    # biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
+    return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+
 def compute_gradsnorms(gradients, preconditioners):
     local_sqr_val = 0.0
 
