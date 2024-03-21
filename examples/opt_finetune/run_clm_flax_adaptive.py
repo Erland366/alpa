@@ -88,9 +88,9 @@ from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 import datetime
 import wandb
 
-alpa.init(cluster="ray")
+# alpa.init(cluster="ray")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_non-adaptive_bert")
-# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
+alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
@@ -802,7 +802,7 @@ def main():
     )
 
     train_loader.autoscale_batch_size(max_batch_size = 400, 
-                                    local_bsz_bounds=(train_batch_size / alpa.get_global_num_devices(), 100), gradient_accumulation=False)
+                                    local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 100), gradient_accumulation=False)
 
     eval_loader = DataLoader(
         eval_dataset,
@@ -978,11 +978,13 @@ def main():
         return {k: v.numpy() for k, v in batch.items()}
 
     # Create parallel version of the train and eval step
-    method = alpa.get_3d_parallel_method(
-            num_micro_batches=training_args.num_micro_batches,
-            data_parallel=-1,
-            operator_parallel=training_args.operator_parallel,
-            pipeline_parallel=training_args.pipeline_parallel)
+    # method = alpa.get_3d_parallel_method(
+    #         num_micro_batches=training_args.num_micro_batches,
+    #         data_parallel=-1,
+    #         operator_parallel=training_args.operator_parallel,
+    #         pipeline_parallel=training_args.pipeline_parallel)
+
+    method = alpa.DataParallel(num_micro_batches=training_args.num_micro_batches if training_args.num_micro_batches else None)
 
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
@@ -1049,6 +1051,23 @@ def main():
                     pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
                     pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
 
+                if isinstance(gns.store_grads, list):
+                    store_grads_materialized = []
+                    for el in gns.store_grads:
+                        if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                            store_grads_materialized.append(el._value)
+                        else:
+                            store_grads_materialized.append(el)
+                    gns.store_grads = store_grads_materialized
+                if isinstance(gns.biased_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    gns.biased_sqr = gns.biased_sqr._value
+                if isinstance(gns.unbias_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    gns.unbias_sqr = gns.unbias_sqr._value
+                if isinstance(gns.biased_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    gns.biased_var = gns.biased_var._value
+                if isinstance(gns.unbias_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    gns.unbias_var = gns.unbias_var._value
+
                 state = reallocate_and_update_state(state)
 
                 continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
@@ -1072,7 +1091,7 @@ def main():
 
             step_ct += 1
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
-                executable.sync()
+                p_train_step.get_last_executable().sync()
                 latency = (time.time() - last_time) / step_ct
                 throughput_tokens = np.prod(batch["input_ids"].shape) / latency
                 throughput_tflops = alpa.util.compute_gpt_tflops(
