@@ -32,7 +32,8 @@ from enum import Enum
 import functools
 from itertools import chain
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict
+from torch.utils.data import DataLoader
 
 import datasets
 import numpy as np
@@ -46,7 +47,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import transformers
-import tensorflow as tf
+# import tensorflow as tf
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import onehot, shard, shard_prng_key
@@ -61,14 +62,40 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
+from alpa.adaptdl.pollux_agent import pollux_agent
+from jax.tree_util import tree_flatten, tree_unflatten
+from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
+                                   normsqr_groups,
+                                   average_groups,
+                                   update_avg,
+                                   compute_gradient_noise_scale, 
+                                   compute_gradsnorms, 
+                                   update_variance, 
+                                   compute_variance, 
+                                   init_dict, 
+                                   compute_grad_flat_mean, 
+                                   flatten_gradients, 
+                                   running_gradient,
+                                   run_grads, 
+                                   init_running_gradients)
+from alpa.adaptdl.dataloader import current_dataloader
+from alpa.adaptdl.metrics import update_grad_params, update_progress
+from jax._src.config import flags
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state
+import alpa.adaptdl.dataloader
+import alpa.adaptdl.epoch
+from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
+import datetime
+import wandb
 
 alpa.init(cluster="ray")
+# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_non-adaptive_bert")
+# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
-from alpa.adaptdl.pollux_agent import pollux_agent
 
-tf.config.experimental.set_visible_devices([], 'GPU')
+# tf.config.experimental.set_visible_devices([], 'GPU')
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +148,12 @@ class TrainingArguments:
         default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
+    pretrain: bool = field(
+        default=False, metadata={"help": "Whether or not to pretrain."}
+    )
+    count: int = field(default=2, metadata={"help": "The number of stored grads."})
+    scale: int = field(default=1, metadata={"help": "Scale"})
+    smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -270,6 +303,18 @@ class DataTrainingArguments:
                 assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
 
 
+@dataclass
+class RunningGradientsState:
+    store_grads: list
+    noise: float
+    scale: float
+    noise_scale: float
+    beta: float
+    running_noise: float
+    running_scale: float
+    n_batch: int
+
+
 def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
                 min_batch_size: int, shuffle: bool = False):
     """
@@ -377,6 +422,11 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    try:
+        from alpa.adaptdl.gradient_noise_scale import gns
+    except Exception as e:
+        print(f'could not import gns: {e}')
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -546,7 +596,8 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    if model_args.model_name_or_path:
+    if model_args.model_name_or_path and not training_args.pretrain:
+        print(f"Finetuning mode")
         model = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -562,11 +613,29 @@ def main():
         #    dtype=getattr(jnp, model_args.dtype),
         #)
     else:
+        print(f"Pretraining mode")
         model = FlaxAutoModelForCausalLM.from_config(
             config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
         )
+
+    run = wandb.init(
+        # Set the project where this run will be logged
+        project="OPT_adaptive",
+        config={
+            "model_name_or_path": model_args.model_name_or_path,
+            "model_args": model_args,
+            "data_args": data_args,
+            "training_args": training_args,
+        },
+        save_code=True,
+    )
+
+    run.log_code(
+            os.path.dirname(os.path.dirname(alpa.__file__)),
+            exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
+            )
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -676,7 +745,8 @@ def main():
                                training_args.pipeline_parallel * eval_num_micro_batches)
 
     # Enable tensorboard only on the master node
-    has_tensorboard = is_tensorboard_available()
+    # has_tensorboard = is_tensorboard_available()
+    has_tensorboard = False
     if has_tensorboard:
         try:
             from flax.metrics.tensorboard import SummaryWriter
@@ -704,7 +774,42 @@ def main():
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
+
+    count = training_args.count
+    scale = training_args.scale
+    theta = training_args.smoothing * scale
+    
     pollux_agent.total_batch_size = train_batch_size
+    pollux_agent.last_state_retrieved_batch_size = train_batch_size
+    pollux_agent.dataset_size = len(train_dataset)
+
+    # pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.004806])
+    # pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.021575327546867917
+    # pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00226393])
+    # pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.031203793760921167
+    # pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00112445])
+    # pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.030955123211688196
+    # pollux_agent.fix_regressors()
+
+    train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+        dataset=train_dataset,
+        batch_size=train_batch_size,
+        shuffle=True, # TODO: handle shuffle=True
+        collate_fn=transformers.default_data_collator, # we don't need any special collator
+        drop_last=True,
+        num_workers=0 if data_args.preprocessing_num_workers is None else data_args.preprocessing_num_workers,
+        persistent_workers=False if data_args.preprocessing_num_workers is None else True,
+    )
+
+    # train_loader.autoscale_batch_size(max_batch_size = 64 * alpa.get_global_num_devices(), 
+                                    # local_bsz_bounds=(4, 64), gradient_accumulation=False)
+
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        collate_fn=transformers.default_data_collator, # we don't need any special collator 
+        )
 
     # Create learning rate schedule
     linear_decay_lr_schedule_fn = create_learning_rate_fn(
@@ -714,6 +819,11 @@ def main():
         training_args.warmup_steps,
         training_args.learning_rate,
     )
+
+    # scaling_rule = LinearScale()
+    scaling_rule = SqrtScale()
+    scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
+                                                        scaling_rule=scaling_rule)
 
     # We use Optax's "masking" functionality to not apply weight decay
     # to bias and LayerNorm scale parameters. decay_mask_fn returns a
@@ -735,13 +845,13 @@ def main():
         # We use the default parameters here to initialize adafactor,
         # For more details about the parameters please check https://github.com/deepmind/optax/blob/ed02befef9bf81cbbf236be3d2b0e032e9ed4a40/optax/_src/alias.py#L74
         optimizer = optax.adafactor(
-            learning_rate=linear_decay_lr_schedule_fn,
+            learning_rate=scaled_learning_rate_fn,
         )
     else:
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(
-                learning_rate=linear_decay_lr_schedule_fn,
+                learning_rate=scaled_learning_rate_fn,
                 b1=training_args.adam_beta1,
                 b2=training_args.adam_beta2,
                 eps=training_args.adam_epsilon,
@@ -760,6 +870,11 @@ def main():
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
                               dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
+    gns.initialize_gns(state=extract_values_with_key_p(state.params), 
+                init_bsz=train_batch_size, 
+                num_workers=alpa.get_global_num_devices(), 
+                accum_scale=alpa.get_global_num_devices())
+
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
@@ -769,13 +884,23 @@ def main():
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, batch):
+    def train_step(state, batch, variables: Dict):
 
         def compute_loss(params):
             labels = batch.pop("labels")
             logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
             loss = loss_fn(logits, labels)
             return loss
+
+        dropout_rng = variables.get('dropout_rng', None)
+        prev_grads = variables.get('gns_store_grads', None)
+        biased_sqr = variables.get('gns_biased_sqr', None)
+        unbias_sqr = variables.get('gns_unbias_sqr', None)
+        biased_var = variables.get('gns_biased_var', None)
+        unbias_var = variables.get('gns_unbias_var', None)
+        count = variables.get('count', None)
+        scale = variables.get('scale', None)
+        theta = variables.get('theta', None)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -800,7 +925,40 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
+        gradients = extract_values_with_key_p(grads)
+        preconditioners = extract_values_with_key_p(pinv)
+
+        def condition(prev_grads):
+            return prev_grads is not None
+        
+        prev_grads = jax.lax.cond(
+            condition(prev_grads),
+            lambda x: x,
+            lambda x: jax.tree_util.tree_map(jnp.zeros_like, gradients), 
+            prev_grads
+        )
+
+        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
+                                                                                                    preconditioners, 
+                                                                                                    biased_sqr, 
+                                                                                                    unbias_sqr, 
+                                                                                                    biased_var, 
+                                                                                                    unbias_var, 
+                                                                                                    count, 
+                                                                                                    scale, 
+                                                                                                    theta)
+
+        metrics = {"loss": loss, 
+            "learning_rate": scaled_learning_rate_fn(state.step), 
+            "gradients": gradients, 
+            "grad_sqr": grad_sqr, 
+            "grad_var": grad_var, 
+            "biased_sqr": biased_sqr,
+            "unbias_sqr": unbias_sqr, 
+            "biased_var": biased_var, 
+            "unbias_var": unbias_var 
+            }
 
         return new_state, metrics
 
@@ -813,6 +971,11 @@ def main():
         # summarize metrics
         metrics = {"loss": loss}
         return metrics
+
+    def process_batch(batch):
+        batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                             batch["attention_mask"]) - 1
+        return {k: v.numpy() for k, v in batch.items()}
 
     # Create parallel version of the train and eval step
     method = alpa.get_3d_parallel_method(
@@ -846,24 +1009,56 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
-    for epoch in epochs:
+    # for epoch in epochs:
+    for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================
         train_start = time.time()
 
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
 
-        # Generate an epoch by shuffling sampling indices from the train dataset
-        train_loader = data_loader(input_rng, train_dataset, train_batch_size,
-                                   train_min_batch_size, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
         # train
-        for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
-            batch = next(train_loader)
-            batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                                     batch["attention_mask"]) - 1
-            state, train_metric = p_train_step(state, batch)
-            train_metrics.append(train_metric)
+        for step, batch in enumerate(train_loader):
+            batch = process_batch(batch)
+
+            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
+
+            variables_dict = dict(variables_dict)
+
+            if pollux_agent.reallocation_approaching:
+                p_train_step.get_last_executable().sync()
+
+                materialized_variables_dict = {}
+                for k, v in variables_dict.items():
+                    if isinstance(v, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                        materialized_variables_dict[k] = v._value
+                    elif isinstance(v, list):
+                        materialized_list = []
+                        for el in v:
+                            if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                                materialized_list.append(el._value)
+                            else:
+                                materialized_list.append(el)
+                        materialized_variables_dict[k] = materialized_list
+                    else:
+                        materialized_variables_dict[k] = v
+                variables_dict = materialized_variables_dict
+                if isinstance(pollux_agent.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
+                     and isinstance(pollux_agent.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
+                    pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
+
+                state = reallocate_and_update_state(state)
+
+                continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
+
+            state, train_metric = p_train_step(state, batch, variables_dict)
+            # train_metrics.append(train_metric)
+
+            gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
+                    train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
+            update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
@@ -911,14 +1106,12 @@ def main():
             # if cur_step % training_args.eval_steps == 0 and cur_step > 0:
             #     # ======================== Evaluating ==============================
             #     eval_metrics = []
-            #     eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-            #                               eval_min_batch_size)
+
             #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-            #     for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+            #     for step, batch in enumerate(eval_loader):
             #         # Model forward
-            #         batch = next(eval_loader)
-            #         batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-            #                                  batch["attention_mask"]) - 1
+            #         batch = process_batch(batch)
+
             #         metrics = p_eval_step(state.params, batch)
             #         eval_metrics.append(metrics)
 
@@ -957,17 +1150,13 @@ def main():
             #     if training_args.push_to_hub:
             #         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
-    # Eval after training
+    # # Eval after training
     # if training_args.do_eval:
     #     eval_metrics = []
-    #     eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-    #                               eval_min_batch_size)
     #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-    #     for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+    #     for step, batch in enumerate(eval_loader):
     #         # Model forward
-    #         batch = next(eval_loader)
-    #         batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-    #                                  batch["attention_mask"]) - 1
+    #         batch = process_batch(batch)
     #         metrics = p_eval_step(state.params, batch)
     #         eval_metrics.append(metrics)
 

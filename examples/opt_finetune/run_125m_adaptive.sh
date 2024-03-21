@@ -1,4 +1,4 @@
-python3 run_clm_flax.py \
+python3 run_clm_flax_adaptive.py \
     --output_dir="./output" \
     --model_name_or_path="facebook/opt-125m" \
     --dataset_name="wikitext" \
@@ -14,7 +14,7 @@ python3 run_clm_flax.py \
     --learning_rate="5e-4" --warmup_steps="2000" \
     --adam_beta1="0.9" --adam_beta2="0.98" --weight_decay="0.01" \
     --overwrite_output_dir \
-    --num_train_epochs="8" \
+    --num_train_epochs="100000" \
     --logging_steps="16" \
     --save_steps="32" \
     --eval_steps="32" \

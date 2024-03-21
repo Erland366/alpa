@@ -80,3 +80,5 @@ pickle_objects*
 examples/BERT/bert-qa-squad/
 examples/BERT/cache/
 wandb/
+
+examples/opt_finetune/cache
