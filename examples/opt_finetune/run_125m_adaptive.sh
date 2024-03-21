@@ -18,4 +18,5 @@ python3 run_clm_flax_adaptive.py \
     --logging_steps="16" \
     --save_steps="32" \
     --eval_steps="32" \
-    --cache_dir="./cache"
+    --cache_dir="./cache" \
+    --max_train_samples=12000
