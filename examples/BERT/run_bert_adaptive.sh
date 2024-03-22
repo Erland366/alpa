@@ -7,7 +7,7 @@ python run_qa_alpa_adaptive.py \
   --doc_stride 128 \
   --learning_rate 1e-5 \
   --num_train_epochs 1000000 \
-  --per_device_train_batch_size 70 \
+  --per_device_train_batch_size 20 \
   --output_dir ./bert-qa-squad \
   --eval_steps 1000 \
   --cache_dir ./cache \
