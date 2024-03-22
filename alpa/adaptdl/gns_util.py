@@ -82,12 +82,26 @@ def average_groups(grads1, grads2):
         ret.append((group1 + group2) / 2)
     return ret
 
-def update_avg(value, factor, biased, unbias):
-    biased = factor * biased + (1.0 - factor) * value
-    unbias = factor * unbias + (1.0 - factor)
+# def update_avg(value, factor, biased, unbias):
+#     # epsilon = 1e-8
+#     biased = factor * biased + (1.0 - factor) * value
+#     unbias = factor * unbias + (1.0 - factor)
 
-    value = biased / unbias
+#     # value = biased / (unbias + epsilon)
+#     value = biased / unbias
     
+#     return biased, unbias, value
+
+def update_avg(value, factor, biased, unbias):
+    new_biased = factor * biased + (1.0 - factor) * value
+    new_unbias = factor * unbias + (1.0 - factor)
+    
+    biased = jnp.where(jnp.isnan(new_biased), biased, new_biased)
+    unbias = jnp.where(jnp.isnan(new_unbias), unbias, new_unbias)
+
+    value = biased / jnp.maximum(unbias, 1e-8)
+    value = jnp.where(jnp.isnan(value), biased, value)
+
     return biased, unbias, value
 
 def running_gradient(running_grd, running_grd_sqr, grads_flat, itr, beta=0.9):
