@@ -163,7 +163,7 @@ class TrainingArguments:
     pretrain: bool = field(
         default=True, metadata={"help": "Whether or not to pretrain."}
     )
-    num_micro_batches: int = field(default=None, metadata={"help": "The number of micro batches for gradient accumulation."})
+    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
