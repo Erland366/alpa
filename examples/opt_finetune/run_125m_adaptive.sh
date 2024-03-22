@@ -11,7 +11,7 @@ python3 run_clm_flax_adaptive.py \
     --operator_parallel 1 \
     --pipeline_parallel 1 \
     --dtype="float16" \
-    --learning_rate="1e-4" --warmup_steps="2000" \
+    --learning_rate="5e-4" --warmup_steps="2000" \
     --adam_beta1="0.9" --adam_beta2="0.98" --weight_decay="0.01" \
     --overwrite_output_dir \
     --num_train_epochs="100000" \
