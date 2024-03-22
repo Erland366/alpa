@@ -930,7 +930,8 @@ def main():
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # Define a summary writer
-    has_tensorboard = is_tensorboard_available()
+    # has_tensorboard = is_tensorboard_available()
+    has_tensorboard = False
     if has_tensorboard and jax.process_index() == 0:
         try:
             from flax.metrics.tensorboard import SummaryWriter
