@@ -289,11 +289,12 @@ class AdaptiveDataLoaderHelper(object):
             print(f'Cannot import gns: {e}')
         
         goodput_fn = get_goodput_fn()
-
+        if self.max_batch_size:
+            # If autoscaler is off 
+            pollux_agent.periodic_bs_sync_enabled = False
         if self.max_batch_size is None or goodput_fn is None:
             self._state.current_local_bsz = np.ceil(self.batch_size / get_num_workers()).astype(np.int32)
             self._state.accumulation_steps = 0
-            pollux_agent.periodic_bs_sync_enabled = False
         elif not self._state.current_local_bsz:
             suggest_goodput, atomic_bsz, accum_steps = goodput_fn.optimize(
                 self._num_nodes, get_num_workers(),
