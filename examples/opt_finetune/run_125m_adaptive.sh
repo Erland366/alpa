@@ -7,7 +7,7 @@ python3 run_clm_flax_adaptive.py \
     --block_size="1024" \
     --per_device_train_batch_size="20" \
     --per_device_eval_batch_size="20" \
-    --num_micro_batches 1 \
+    --num_micro_batches 2 \
     --operator_parallel 1 \
     --pipeline_parallel 1 \
     --dtype="float16" \
@@ -20,4 +20,5 @@ python3 run_clm_flax_adaptive.py \
     --eval_steps="32" \
     --cache_dir="./cache" \
     --max_train_samples=20000 \
-    --smoothing 0.9
+    --smoothing 0.9 \
+    --scale_lr=False

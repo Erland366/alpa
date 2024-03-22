@@ -148,6 +148,9 @@ class TrainingArguments:
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
+    scale_lr: bool = field(
+        default=False, metadata={"help": "Whether or not to scale the learning rate with batch size."}
+    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -550,6 +553,9 @@ def main():
     scaled_linear_decay_lr_schedule_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
                                                              scaling_rule=scaling_rule)
 
+    if not training_args.scale_lr:
+        scaled_linear_decay_lr_schedule_fn = linear_decay_lr_schedule_fn
+
     # create adam optimizer
     adamw = optax.adamw(
         #learning_rate=linear_decay_lr_schedule_fn,
@@ -653,7 +659,7 @@ def main():
     #method = alpa.PipeshardParallel(stage_option="uniform") 
     # method = alpa.PipeshardParallel() 
     # method = alpa.ShardParallel() 
-    method = alpa.DataParallel()
+    method = alpa.DataParallel(num_micro_batches=training_args.num_micro_batches if training_args.num_micro_batches else None)
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)

@@ -166,6 +166,9 @@ class TrainingArguments:
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
+    scale_lr: bool = field(
+        default=False, metadata={"help": "Whether or not to scale the learning rate with batch size."}
+    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -997,8 +1000,8 @@ def main():
         drop_last=True,
     )
 
-    train_loader.autoscale_batch_size(max_batch_size = 280, 
-                                    local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 70), gradient_accumulation=False)
+    # train_loader.autoscale_batch_size(max_batch_size = 280, 
+                                    # local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 70), gradient_accumulation=False)
 
     # train_loader = DataLoader(train_dataset_pytorch, batch_size=train_batch_size, shuffle=True, drop_last=True)
 
@@ -1054,6 +1057,9 @@ def main():
     scaling_rule = SqrtScale()
     scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=learning_rate_fn, initial_batch_size=train_batch_size,
                                                             scaling_rule=scaling_rule)
+
+    if not training_args.scale_lr:
+        scaled_learning_rate_fn = learning_rate_fn
 
     # state = create_train_state(model, learning_rate_fn, num_labels=max_seq_length, training_args=training_args)
     state = create_train_state(model, scaled_learning_rate_fn, num_labels=max_seq_length, training_args=training_args)
@@ -1133,7 +1139,7 @@ def main():
     # p_train_step = jax.pmap(train_step, axis_name="batch", donate_argnums=(0,))
     # p_train_step = jax.jit(train_step, donate_argnums=(0,))
     # method = alpa.ShardParallel()
-    method = alpa.DataParallel()
+    method = alpa.DataParallel(num_micro_batches=training_args.num_micro_batches if training_args.num_micro_batches else None)
     # method = alpa.PipeshardParallel(num_micro_batches=32, stage_option="auto")
     # p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_train_step = alpa.parallelize(train_step, method=method)
