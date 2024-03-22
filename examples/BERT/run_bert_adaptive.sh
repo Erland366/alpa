@@ -12,4 +12,4 @@ python run_qa_alpa_adaptive.py \
   --eval_steps 1000 \
   --cache_dir ./cache \
   --scale_lr=False \
-  --num_micro_batches 2 \
+  --num_micro_batches 2
