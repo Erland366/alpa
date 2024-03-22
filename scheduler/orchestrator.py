@@ -418,7 +418,7 @@ class Orchestrator:
 
     async def periodically_reallocate_resources(self):
         logger.info(f"Resource reallocation timer started!")
-        await asyncio.sleep(30)
+        await asyncio.sleep(300)
         while True and not self.realloc_requests_once:
             await asyncio.sleep(30)
             try:
