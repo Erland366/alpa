@@ -11,5 +11,4 @@ python run_qa_alpa_adaptive.py \
   --output_dir ./bert-qa-squad \
   --eval_steps 1000 \
   --cache_dir ./cache \
-  --scale_lr=False \
-  --num_micro_batches None
+  --scale_lr=False

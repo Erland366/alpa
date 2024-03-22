@@ -7,7 +7,6 @@ python3 run_clm_flax_adaptive.py \
     --block_size="1024" \
     --per_device_train_batch_size="20" \
     --per_device_eval_batch_size="20" \
-    --num_micro_batches None \
     --operator_parallel 1 \
     --pipeline_parallel 1 \
     --dtype="float16" \
