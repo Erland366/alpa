@@ -659,7 +659,7 @@ def main():
     #method = alpa.PipeshardParallel(stage_option="uniform") 
     # method = alpa.PipeshardParallel() 
     # method = alpa.ShardParallel() 
-    method = alpa.DataParallel(num_micro_batches=training_args.num_micro_batches if training_args.num_micro_batches else None)
+    method = alpa.DataParallel()
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)

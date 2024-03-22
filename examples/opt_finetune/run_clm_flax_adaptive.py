@@ -989,7 +989,7 @@ def main():
     #         operator_parallel=training_args.operator_parallel,
     #         pipeline_parallel=training_args.pipeline_parallel)
 
-    method = alpa.DataParallel(num_micro_batches=training_args.num_micro_batches if training_args.num_micro_batches else None)
+    method = alpa.DataParallel()
 
     p_train_step = alpa.parallelize(train_step,
                                     method=method,

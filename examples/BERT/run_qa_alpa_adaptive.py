@@ -1140,7 +1140,7 @@ def main():
     # p_train_step = jax.pmap(train_step, axis_name="batch", donate_argnums=(0,))
     # p_train_step = jax.jit(train_step, donate_argnums=(0,))
     # method = alpa.ShardParallel()
-    method = alpa.DataParallel(num_micro_batches=training_args.num_micro_batches if training_args.num_micro_batches else None)
+    method = alpa.DataParallel()
     # method = alpa.PipeshardParallel(num_micro_batches=32, stage_option="auto")
     # p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_train_step = alpa.parallelize(train_step, method=method)
