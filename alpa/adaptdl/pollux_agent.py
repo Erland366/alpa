@@ -203,7 +203,8 @@ class PolluxAgent:
 
         if self.grad_norm_sqr is not None and self.grad_variance is not None and self.local_bsz_bounds is not None:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
-            min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
+            # min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
+            min_batch_size = self.init_batch_size # to keep the range same even when # of GPUs increased
             batch_size = jnp.geomspace(min_batch_size, self.max_batch_size)
             eps = 1e-8
             batch_size = jnp.ceil(batch_size - eps)
