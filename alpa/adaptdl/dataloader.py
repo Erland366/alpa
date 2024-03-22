@@ -289,7 +289,7 @@ class AdaptiveDataLoaderHelper(object):
             print(f'Cannot import gns: {e}')
         
         goodput_fn = get_goodput_fn()
-        if self.max_batch_size:
+        if self.max_batch_size is None:
             # If autoscaler is off 
             pollux_agent.periodic_bs_sync_enabled = False
         if self.max_batch_size is None or goodput_fn is None:
