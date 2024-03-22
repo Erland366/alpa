@@ -15,8 +15,9 @@ python3 run_clm_flax_adaptive.py \
     --adam_beta1="0.9" --adam_beta2="0.98" --weight_decay="0.01" \
     --overwrite_output_dir \
     --num_train_epochs="100000" \
-    --logging_steps="16" \
+    --logging_steps="50" \
     --save_steps="32" \
     --eval_steps="32" \
     --cache_dir="./cache" \
-    --max_train_samples=12000
+    --max_train_samples=20000 \
+    --smoothing 0.9
