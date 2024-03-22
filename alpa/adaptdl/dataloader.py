@@ -319,6 +319,18 @@ class AdaptiveDataLoaderHelper(object):
                 atomic_bsz_range=self._local_bsz_bounds,
                 accumulation=self._gradient_accumulation
             )
+
+            ##########
+            min_batch_size = jnp.maximum(pollux_agent.init_batch_size, self._local_bsz_bounds[0] * alpa.get_global_num_devices())
+            batch_size_overflow = jnp.geomspace(min_batch_size, self.max_batch_size)
+            eps = 1e-8
+            batch_size_overflow = jnp.ceil(batch_size_overflow - eps)
+            stat_eff_overflow = goodput_fn.efficiency(batch_size_overflow)
+            if stat_eff_overflow[-1] > 0.9:
+                suggest_goodput *= float(0)
+                print(f"Setting suggested goodput to 0 because of SE overflow (horizontal line).")
+            ##########
+            
             current_goodput= goodput_fn(
                 self._num_nodes, get_num_workers(),
                 self.current_local_bsz,
