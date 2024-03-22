@@ -87,8 +87,8 @@ def reallocate_and_update_state(state):
         dynamic_scale_materialized = DynamicScale(fin_steps=fin_steps, scale=scale)
 
     state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params,
-                    master_copy=unflattened_master_copy if state.master_copy is not None else None,
-                    dynamic_scale=dynamic_scale_materialized if state.dynamic_scale is not None else None)
+                    master_copy=unflattened_master_copy if getattr(state, 'master_copy', None) is not None else None,
+                    dynamic_scale=dynamic_scale_materialized if getattr(state, 'dynamic_scale', None) is not None else None)
     
     alpa.shutdown(is_reallocation=True)
     alpa.clear_executable_cache()
