@@ -70,12 +70,15 @@ def reallocate_and_update_state(state):
             flattened_params[0][i] = leaf._value
     unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
 
+    replacement_attributes = {'step': step_val, 'opt_state': unflattened_opt_state, 'params': unflattened_params}
+
     if getattr(state, 'master_copy', None) is not None:
         flattened_master_copy = tree_flatten(state.master_copy)
         for i, leaf in enumerate(flattened_master_copy[0]):
             if isinstance(leaf, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
                 flattened_master_copy[0][i] = leaf._value
         unflattened_master_copy = tree_unflatten(flattened_master_copy[1], flattened_master_copy[0])
+        replacement_attributes['master_copy'] = unflattened_master_copy
 
     if getattr(state, 'dynamic_scale', None) is not None:
         fin_steps = state.dynamic_scale.fin_steps
@@ -85,10 +88,9 @@ def reallocate_and_update_state(state):
         if isinstance(scale, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
             scale = scale._value
         dynamic_scale_materialized = DynamicScale(fin_steps=fin_steps, scale=scale)
+        replacement_attributes['dynamic_scale'] = dynamic_scale_materialized
 
-    state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params,
-                    master_copy=unflattened_master_copy if getattr(state, 'master_copy', None) is not None else None,
-                    dynamic_scale=dynamic_scale_materialized if getattr(state, 'dynamic_scale', None) is not None else None)
+    state = state.replace(**replacement_attributes) 
     
     alpa.shutdown(is_reallocation=True)
     alpa.clear_executable_cache()
