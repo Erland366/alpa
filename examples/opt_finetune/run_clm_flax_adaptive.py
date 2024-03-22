@@ -125,7 +125,7 @@ class TrainingArguments:
     per_device_eval_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
-    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
+    num_micro_batches: int = field(default=None, metadata={"help": "The number of micro batches for gradient accumulation."})
     operator_parallel: int = field(default=1, metadata={"help": "The degree of operator model parallelism."})
     pipeline_parallel: int = field(default=1, metadata={"help": "The degree of pipeline model parallelism."})
     use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})

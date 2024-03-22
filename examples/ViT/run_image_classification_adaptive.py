@@ -116,7 +116,7 @@ class TrainingArguments:
     )
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
-    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
+    num_micro_batches: int = field(default=None, metadata={"help": "The number of micro batches for gradient accumulation."})
     per_device_train_batch_size: int = field(
         default=4, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )

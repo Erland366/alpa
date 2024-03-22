@@ -163,7 +163,7 @@ class TrainingArguments:
     pretrain: bool = field(
         default=True, metadata={"help": "Whether or not to pretrain."}
     )
-    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
+    num_micro_batches: int = field(default=None, metadata={"help": "The number of micro batches for gradient accumulation."})
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
@@ -1002,7 +1002,7 @@ def main():
     )
 
     train_loader.autoscale_batch_size(max_batch_size = 400, 
-                                    local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 70), gradient_accumulation=False)
+                                    local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 65), gradient_accumulation=False)
 
     # train_loader = DataLoader(train_dataset_pytorch, batch_size=train_batch_size, shuffle=True, drop_last=True)
 
