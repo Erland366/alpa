@@ -10,4 +10,4 @@ python run_image_classification_adaptive.py \
     --overwrite_output_dir \
     --preprocessing_num_workers 32 \
     --pretrain=False \
-    --scale_lr=False
+    --scale_lr=True
