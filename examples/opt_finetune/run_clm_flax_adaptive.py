@@ -89,7 +89,7 @@ import datetime
 import wandb
 
 # alpa.init(cluster="ray")
-# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1, namespace="alpa_default_space_non-adaptive_opt")
+# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1, namespace="alpa_default_space_opt")
 alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 
 from transformers.testing_utils import CaptureLogger

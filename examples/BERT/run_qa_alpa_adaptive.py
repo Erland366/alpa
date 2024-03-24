@@ -102,7 +102,7 @@ class QADataset(Dataset):
         return item
 
 # alpa.init(cluster="ray")
-# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_non-adaptive_bert")
+# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_bert")
 alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1)
 

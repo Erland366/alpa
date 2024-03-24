@@ -5,7 +5,7 @@ python3 run_clm_flax_adaptive.py \
     --dataset_config_name="wikitext-103-raw-v1" \
     --do_train --do_eval \
     --block_size="1024" \
-    --per_device_train_batch_size="5" \
+    --per_device_train_batch_size="20" \
     --per_device_eval_batch_size="20" \
     --operator_parallel 1 \
     --pipeline_parallel 1 \
