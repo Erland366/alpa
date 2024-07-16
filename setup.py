@@ -83,7 +83,7 @@ def get_cuda_version_str(no_dot=False):
 
 install_require_list = [
     "tqdm",
-    "ray",
+    "ray==2.9.0",
     "jax==0.3.22",
     "chex==0.1.5",
     "flax==0.6.2",
@@ -94,10 +94,10 @@ install_require_list = [
 
 dev_require_list = ["yapf==0.32.0", "pylint==2.14.0", "cmake", "pybind11"]
 
-if HAS_CUDA:
-    dev_require_list += [
-        f"cupy-cuda{get_cuda_version_str(no_dot=True)}",
-    ]
+# if HAS_CUDA:
+#     dev_require_list += [
+#         f"cupy-cuda{get_cuda_version_str(no_dot=True)}",
+#     ]
 
 doc_require_list = [
     "sphinx", "sphinx-rtd-theme", "sphinx-gallery", "matplotlib"
