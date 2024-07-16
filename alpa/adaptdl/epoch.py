@@ -158,7 +158,7 @@ def _epoch_state():
     global _EPOCH_STATE
     if _EPOCH_STATE is None:
         _EPOCH_STATE = _EpochState()
-        alpa.adaptdl.checkpoint.load_state(_EPOCH_STATE)
+        # alpa.adaptdl.checkpoint.load_state(_EPOCH_STATE)
     return _EPOCH_STATE
 
 
