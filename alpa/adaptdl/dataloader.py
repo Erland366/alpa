@@ -151,7 +151,7 @@ class AdaptiveDataLoaderHelper(object):
         self._local_bsz_bounds = None
         # Create and load state.
         self._state = _AdaptiveDataLoaderState()
-        alpa.adaptdl.checkpoint.load_state(self._state)
+        # alpa.adaptdl.checkpoint.load_state(self._state)
         self.batch_size = batch_size
         self.future_exit = None
         self._gradient_accumulation = False
