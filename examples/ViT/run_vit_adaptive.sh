@@ -1,7 +1,7 @@
 python run_image_classification_adaptive.py \
     --output_dir ./vit-base-patch16-imagenette \
     --model_name_or_path google/vit-base-patch16-224-in21k \
-    --train_dir /aios-store/akhmed-rampart/imagenet/train \
+    --train_dir imagenette2/train \
     --validation_dir imagenette2/val \
     --num_train_epochs 10000000 \
     --learning_rate 1e-5 \
