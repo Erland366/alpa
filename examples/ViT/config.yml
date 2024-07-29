@@ -1,0 +1,59 @@
+# TODO: wandb configuration
+
+scheduler:
+  enabled: false
+  address: http://127.0.0.1:8000
+
+cluster_config:
+  num_nodes: null
+  num_devices_per_node: null
+  namespace: null # alpa_default_space by default
+
+model_name_or_path: google/vit-base-patch16-224-in21k
+
+paths:
+  output_dir:  ./vit-base-patch16-imagenette
+  train_dir: imagenette2/train
+  validation_dir: imagenette2/val
+
+dataloader:
+  train:
+    adaptive_data_loader:
+      enabled: true
+      autoscaler: 
+        enabled: false
+        max_total_batch_size: 800
+        local_bsz_bounds:
+          min_is_init_bs: true
+          min: 32
+          max: 150
+    init_local_batch_size: 32
+    shuffle: true
+    preprocessing_num_workers: 32
+    persistent_workers: true
+  eval:
+    local_batch_size: 64
+    shuffle: false
+
+
+training:
+  num_train_epochs: 10000000
+  scale_lr:
+    enabled: true
+    type: sqrt # linear, sqrt
+  parallel_method:
+    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
+    parameters:
+      DataParallel:
+      ShardParallel:
+      PipeshardParallel:
+        stage_option: uniform # uniform, auto
+        # num stages?
+      3D:
+        data_parallel: 4
+        operator_parallel: 1
+        pipeline_parallel: 1
+    num_micro_batches: 1
+
+evaluation:
+  enabled: false
