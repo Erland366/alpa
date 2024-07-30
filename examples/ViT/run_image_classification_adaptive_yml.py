@@ -695,12 +695,6 @@ def main():
                                              pipeline_parallel=yml_config['training']['parallel_method']['parameters']['3D']['pipeline_parallel'])
     else:
         method = alpa.DataParallel()
-    
-    # method = alpa.Zero3Parallel() 
-    #method = alpa.PipeshardParallel(stage_option="uniform") 
-    # method = alpa.PipeshardParallel() 
-    # method = alpa.ShardParallel() 
-    method = alpa.DataParallel()
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)
