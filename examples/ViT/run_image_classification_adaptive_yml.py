@@ -454,6 +454,7 @@ def main():
             "training_args": training_args,
         },
         save_code=True,
+        mode=yml_config['wandb']['mode'],
         # settings=wandb.Settings(code_dir=os.path.dirname(os.path.dirname(alpa.__file__)))
     )
     run.log_code(

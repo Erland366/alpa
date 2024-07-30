@@ -1,5 +1,8 @@
 # TODO: wandb configuration
 
+wandb:
+  mode: disabled # online, offline, disabled
+
 scheduler:
   enabled: false
   address: http://127.0.0.1:8000
