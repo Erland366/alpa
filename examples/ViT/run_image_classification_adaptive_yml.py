@@ -487,14 +487,12 @@ def main():
     pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
 
-    # Set regression coefficients
-    for key, values in yml_config.pollux_agent.regression_coefficients.items():
-        pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
-        pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
-
-    # Fix regressors if specified in the config
+    # Set regression coefficients if specified in the config
     if yml_config.pollux_agent.fix_regressors:
-        pollux_agent.fix_regressors()
+        for key, values in yml_config.pollux_agent.regression_coefficients.items():
+            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
+            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
+            pollux_agent.fix_regressors()
 
     # Create data loaders
     if not yml_config.dataloader.train.adaptive_data_loader.enabled:
