@@ -82,18 +82,22 @@ import numpy as np
 import wandb
 import yaml
 from addict import Dict as AddictDict
+import argparse
 
-yaml_config_loaded = False
+def parse_config_arg():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
+    args, remaining = parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + remaining  # Removing --config from sys.argv
+    return args.config
 
-if os.path.isfile("config.yml"):
-    with open('config.yml', 'r') as file:
-        yml_config = yaml.safe_load(file)
-    yaml_config_loaded = True
+config_path = parse_config_arg()
+
+with open(config_path, 'r') as file:
+    yml_config = yaml.safe_load(file)
 yml_config = AddictDict(yml_config)
 
-if not yaml_config_loaded:
-    raise Exception("This Python file is supposed to run with a config.yml file.")
-
+print(yml_config)
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
