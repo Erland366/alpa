@@ -19,6 +19,19 @@ paths:
   train_dir: imagenette2/train
   validation_dir: imagenette2/val
 
+pollux_agent:
+  regression_coefficients:
+    (1, 1):
+      coef: 0.00206749
+      intercept: 0.019354801896649114
+    (2, 1):
+      coef: 0.00108904
+      intercept: 0.027093764782572798
+    (4, 1):
+      coef: 0.00056805
+      intercept: 0.028780623571947224
+  fix_regressors: true
+
 dataloader:
   train:
     adaptive_data_loader:
@@ -52,7 +65,7 @@ training:
       PipeshardParallel:
         stage_option: uniform # uniform, auto
         # num stages?
-      3D:
+      _3D:
         data_parallel: 4
         operator_parallel: 1
         pipeline_parallel: 1

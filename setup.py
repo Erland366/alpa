@@ -90,6 +90,7 @@ install_require_list = [
     "pulp>=2.6.0",
     "numpy>=1.20",
     "numba",
+    "addict",
 ]
 
 dev_require_list = ["yapf==0.32.0", "pylint==2.14.0", "cmake", "pybind11"]

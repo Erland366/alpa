@@ -81,6 +81,7 @@ import datetime
 import numpy as np
 import wandb
 import yaml
+from addict import Dict as AddictDict
 
 yaml_config_loaded = False
 
@@ -88,6 +89,7 @@ if os.path.isfile("config.yml"):
     with open('config.yml', 'r') as file:
         yml_config = yaml.safe_load(file)
     yaml_config_loaded = True
+yml_config = AddictDict(yml_config)
 
 if not yaml_config_loaded:
     raise Exception("This Python file is supposed to run with a config.yml file.")
@@ -99,9 +101,9 @@ def count_params(model):
 # alpa.init(cluster="ray")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_vit")
 # alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
-alpa.init(cluster="ray", scheduler_address=yml_config['scheduler']['address'] if yml_config['scheduler']['enabled'] else None,
-          num_nodes=yml_config['cluster_config']['num_nodes'], num_devices_per_node=yml_config['cluster_config']['num_devices_per_node'],
-          namespace=yml_config['cluster_config']['namespace'])
+alpa.init(cluster="ray", scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
+          num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,
+          namespace=yml_config.cluster_config.namespace)
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +121,7 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 @dataclass
 class TrainingArguments:
     output_dir: str = field(
-        default=yml_config['paths']['output_dir'],
+        default=yml_config.paths.output_dir,
         metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
     )
     overwrite_output_dir: bool = field(
@@ -135,10 +137,10 @@ class TrainingArguments:
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
     num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
     per_device_train_batch_size: int = field(
-        default=yml_config['dataloader']['train']['init_local_batch_size'], metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
+        default=yml_config.dataloader.train.init_local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
-        default=yml_config['dataloader']['eval']['local_batch_size'], metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
+        default=yml_config.dataloader.eval.local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
@@ -146,7 +148,7 @@ class TrainingArguments:
     adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=yml_config['training']['num_train_epochs'], metadata={"help": "Total number of training epochs to perform."})
+    num_train_epochs: float = field(default=yml_config.training.num_train_epochs, metadata={"help": "Total number of training epochs to perform."})
     warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
     logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
     save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
@@ -166,7 +168,7 @@ class TrainingArguments:
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
     scale_lr: bool = field(
-        default=yml_config['training']['scale_lr']['enabled'], metadata={"help": "Whether or not to scale the learning rate with batch size."}
+        default=yml_config.training.scale_lr.enabled, metadata={"help": "Whether or not to scale the learning rate with batch size."}
     )
 
     def __post_init__(self):
@@ -196,7 +198,7 @@ class ModelArguments:
     """
 
     model_name_or_path: Optional[str] = field(
-        default=yml_config['model_name_or_path'],
+        default=yml_config.model_name_or_path,
         metadata={
             "help": (
                 "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
@@ -239,11 +241,11 @@ class DataTrainingArguments:
     """
 
     train_dir: str = field(
-        default=yml_config['paths']['train_dir'],
+        default=yml_config.paths.train_dir,
         metadata={"help": "Path to the root training directory which contains one subdirectory per class."}
     )
     validation_dir: str = field(
-        default=yml_config['paths']['validation_dir'],
+        default=yml_config.paths.validation_dir,
         metadata={"help": "Path to the root validation directory which contains one subdirectory per class."},
     )
     image_size: Optional[int] = field(default=224, metadata={"help": " The size (resolution) of each image."})
@@ -269,7 +271,7 @@ class DataTrainingArguments:
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=yml_config['dataloader']['train']['preprocessing_num_workers'],
+        default=yml_config.dataloader.train.preprocessing_num_workers,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
 
@@ -454,7 +456,7 @@ def main():
             "training_args": training_args,
         },
         save_code=True,
-        mode=yml_config['wandb']['mode'],
+        mode=yml_config.wandb.mode,
         # settings=wandb.Settings(code_dir=os.path.dirname(os.path.dirname(alpa.__file__)))
     )
     run.log_code(
@@ -485,22 +487,23 @@ def main():
     pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
 
-    pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.00206749])
-    pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.019354801896649114
-    pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00108904])
-    pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.027093764782572798
-    pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00056805])
-    pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.028780623571947224
-    pollux_agent.fix_regressors()
+    # Set regression coefficients
+    for key, values in yml_config.pollux_agent.regression_coefficients.items():
+        pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
+        pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
+
+    # Fix regressors if specified in the config
+    if yml_config.pollux_agent.fix_regressors:
+        pollux_agent.fix_regressors()
 
     # Create data loaders
-    if not yml_config['dataloader']['train']['adaptive_data_loader']['enabled']:
+    if not yml_config.dataloader.train.adaptive_data_loader.enabled:
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=train_batch_size,
-            shuffle=yml_config['dataloader']['train']['shuffle'],
+            shuffle=yml_config.dataloader.train.shuffle,
             num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config['dataloader']['train']['persistent_workers'],
+            persistent_workers=yml_config.dataloader.train.persistent_workers,
             drop_last=True,
             collate_fn=collate_fn,
         )
@@ -508,24 +511,24 @@ def main():
         train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
             dataset=train_dataset,
             batch_size=train_batch_size,
-            shuffle=yml_config['dataloader']['train']['shuffle'], # TODO: handle shuffle=True
+            shuffle=yml_config.dataloader.train.shuffle, # TODO: handle shuffle=True
             collate_fn=collate_fn,
             num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config['dataloader']['train']['persistent_workers'],
+            persistent_workers=yml_config.dataloader.train.persistent_workers,
             drop_last=True,
         )
-        if yml_config['dataloader']['train']['adaptive_data_loader']['autoscaler']['enabled']:
-            train_loader.autoscale_batch_size(max_batch_size = yml_config['dataloader']['train']['adaptive_data_loader']['autoscaler']['max_total_batch_size'], 
+        if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
+            train_loader.autoscale_batch_size(max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
                                                 local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices() if 
-                                                                  yml_config['dataloader']['train']['adaptive_data_loader']['autoscaler']['local_bsz_bounds']['min_is_init_bs']
-                                                                  else yml_config['dataloader']['train']['adaptive_data_loader']['autoscaler']['local_bsz_bounds']['min'], 
-                                                                  yml_config['dataloader']['train']['adaptive_data_loader']['autoscaler']['local_bsz_bounds']['max']), 
+                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
+                                                                  else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
+                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max), 
                                                 gradient_accumulation=False)
 
     eval_loader = torch.utils.data.DataLoader(
        eval_dataset,
        batch_size=eval_batch_size,
-       shuffle=yml_config['dataloader']['eval']['shuffle'],
+       shuffle=yml_config.dataloader.eval.shuffle,
        num_workers=data_args.preprocessing_num_workers,
        persistent_workers=True,
        drop_last=True,
@@ -571,7 +574,7 @@ def main():
         training_args.learning_rate,
     )
 
-    if yml_config['training']['scale_lr']['type'] == 'sqrt':
+    if yml_config.training.scale_lr.type == 'sqrt':
         scaling_rule = SqrtScale()
     else:
         scaling_rule = LinearScale()
@@ -682,18 +685,18 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    if yml_config['training']['parallel_method']['method'] == 'ShardParallel':
+    if yml_config.training.parallel_method.method == 'ShardParallel':
         method = alpa.ShardParallel()
-    elif yml_config['training']['parallel_method']['method'] == 'PipeshardParallel':
-        stage_option = yml_config['training']['parallel_method']['parameters']['PipeshardParallel']['stage_option']
+    elif yml_config.training.parallel_method.method == 'PipeshardParallel':
+        stage_option = yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option
         method = alpa.PipeshardParallel(stage_option=stage_option)
-    elif yml_config['training']['parallel_method']['method'] == 'DataParallel':
+    elif yml_config.training.parallel_method.method == 'DataParallel':
         method = alpa.DataParallel()
-    elif yml_config['training']['parallel_method']['method'] == '3D':
-        method = alpa.get_3d_parallel_method(num_micro_batches=yml_config['training']['parallel_method']['num_micro_batches'],
-                                             data_parallel=yml_config['training']['parallel_method']['parameters']['3D']['data_parallel'],
-                                             operator_parallel=yml_config['training']['parallel_method']['parameters']['3D']['operator_parallel'],
-                                             pipeline_parallel=yml_config['training']['parallel_method']['parameters']['3D']['pipeline_parallel'])
+    elif yml_config.training.parallel_method.method == '3D':
+        method = alpa.get_3d_parallel_method(num_micro_batches=yml_config.training.parallel_method.num_micro_batches,
+                                             data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
+                                             operator_parallel=yml_config.training.parallel_method.parameters._3D.operator_parallel,
+                                             pipeline_parallel=yml_config.training.parallel_method.parameters._3D.pipeline_parallel)
     else:
         method = alpa.DataParallel()
 
@@ -840,7 +843,7 @@ def main():
     
 
         # # ======================== Evaluating ==============================
-        if yml_config['evaluation']['enabled']:
+        if yml_config.evaluation.enabled:
             eval_metrics = []
             eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
             eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
