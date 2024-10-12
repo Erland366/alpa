@@ -629,7 +629,7 @@ def main():
         
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grad)                                                                                                theta)
+        new_state = state.apply_gradients(grads=grad)
 
         prev_norm_sq = variables.get('gns_norm_sq', jnp.array(0.))
         prev_var = variables.get('gns_var', jnp.array(0.))
