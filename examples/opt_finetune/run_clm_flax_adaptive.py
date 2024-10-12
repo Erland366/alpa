@@ -77,7 +77,8 @@ from alpa.adaptdl.gns_util import (extract_values_with_key_p,
                                    flatten_gradients, 
                                    running_gradient,
                                    run_grads, 
-                                   init_running_gradients)
+                                   init_running_gradients,
+                                   simple_gns_estimate)
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
@@ -88,9 +89,9 @@ from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 import datetime
 import wandb
 
-# alpa.init(cluster="ray")
+alpa.init(cluster="ray")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1, namespace="alpa_default_space_opt")
-alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
+# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
 
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
@@ -625,14 +626,14 @@ def main():
 
     run = wandb.init(
         # Set the project where this run will be logged
-        project="OPT_adaptive",
+        project="OPT_adaptive_simplegns",
         config={
             "model_name_or_path": model_args.model_name_or_path,
             "model_args": model_args,
             "data_args": data_args,
             "training_args": training_args,
         },
-        save_code=True,
+        save_code=False,
     )
 
     run.log_code(
@@ -804,8 +805,8 @@ def main():
         persistent_workers=False if data_args.preprocessing_num_workers is None else True,
     )
 
-    train_loader.autoscale_batch_size(max_batch_size = 400, 
-                                    local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 78), gradient_accumulation=False)
+    # train_loader.autoscale_batch_size(max_batch_size = 400, 
+                                    # local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 78), gradient_accumulation=False)
 
     eval_loader = DataLoader(
         eval_dataset,
@@ -898,14 +899,6 @@ def main():
             return loss
 
         dropout_rng = variables.get('dropout_rng', None)
-        prev_grads = variables.get('gns_store_grads', None)
-        biased_sqr = variables.get('gns_biased_sqr', None)
-        unbias_sqr = variables.get('gns_unbias_sqr', None)
-        biased_var = variables.get('gns_biased_var', None)
-        unbias_var = variables.get('gns_unbias_var', None)
-        count = variables.get('count', None)
-        scale = variables.get('scale', None)
-        theta = variables.get('theta', None)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -930,40 +923,17 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
-        pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
-        gradients = extract_values_with_key_p(grads)
-        preconditioners = extract_values_with_key_p(pinv)
+        prev_norm_sq = variables.get('gns_norm_sq', jnp.array(0.))
+        prev_var = variables.get('gns_var', jnp.array(0.))
 
-        def condition(prev_grads):
-            return prev_grads is not None
-        
-        prev_grads = jax.lax.cond(
-            condition(prev_grads),
-            lambda x: x,
-            lambda x: jax.tree_util.tree_map(jnp.zeros_like, gradients), 
-            prev_grads
-        )
+        norm_sq, var = simple_gns_estimate(grads, prev_norm_sq, prev_var)
 
-        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
-                                                                                                    preconditioners, 
-                                                                                                    biased_sqr, 
-                                                                                                    unbias_sqr, 
-                                                                                                    biased_var, 
-                                                                                                    unbias_var, 
-                                                                                                    count, 
-                                                                                                    scale, 
-                                                                                                    theta)
-
-        metrics = {"loss": loss, 
-            "learning_rate": scaled_learning_rate_fn(state.step), 
-            "gradients": gradients, 
-            "grad_sqr": grad_sqr, 
-            "grad_var": grad_var, 
-            "biased_sqr": biased_sqr,
-            "unbias_sqr": unbias_sqr, 
-            "biased_var": biased_var, 
-            "unbias_var": unbias_var 
-            }
+        metrics = {
+            "loss": loss,
+            "learning_rate": scaled_learning_rate_fn(state.step),
+            "grad_norm_sq": norm_sq,
+            "grad_var": var,
+        }
 
         return new_state, metrics
 
@@ -1029,9 +999,11 @@ def main():
         for step, batch in enumerate(train_loader):
             batch = process_batch(batch)
 
-            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
-
-            variables_dict = dict(variables_dict)
+            variables_dict = {
+            'dropout_rng': dropout_rng,
+            'gns_norm_sq': jnp.array(0.),
+            'gns_var': jnp.array(0.),
+            }
 
             if pollux_agent.reallocation_approaching:
                 p_train_step.get_last_executable().sync()
@@ -1080,9 +1052,8 @@ def main():
             state, train_metric = p_train_step(state, batch, variables_dict)
             # train_metrics.append(train_metric)
 
-            gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
-                    train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
-            update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
+            gns.update_state(state, train_metric["grad_norm_sq"], train_metric["grad_var"])
+            update_grad_params(train_metric["grad_norm_sq"], train_metric["grad_var"])
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
