@@ -13,6 +13,7 @@ cluster_config:
   namespace: null # alpa_default_space by default
 
 model_name_or_path: google/vit-base-patch16-224-in21k
+# model_name_or_path: google/vit-huge-patch14-224-in21k
 
 paths:
   output_dir:  ./vit-base-patch16-imagenette
@@ -53,6 +54,7 @@ dataloader:
 
 
 training:
+  pretrain: true
   num_train_epochs: 10000000
   scale_lr:
     enabled: true
@@ -66,7 +68,7 @@ training:
         stage_option: uniform # uniform, auto
         # num stages?
       _3D:
-        data_parallel: 4
+        data_parallel: -1
         operator_parallel: 1
         pipeline_parallel: 1
     num_micro_batches: 1

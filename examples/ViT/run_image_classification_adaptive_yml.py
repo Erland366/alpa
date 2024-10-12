@@ -67,7 +67,8 @@ from alpa.adaptdl.gns_util import (extract_values_with_key_p,
                                    flatten_gradients, 
                                    running_gradient,
                                    run_grads, 
-                                   init_running_gradients)
+                                   init_running_gradients,
+                                   simple_gns_estimate)
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
@@ -166,7 +167,7 @@ class TrainingArguments:
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
     pretrain: bool = field(
-        default=True, metadata={"help": "Whether or not to pretrain."}
+        default=yml_config.training.pretrain, metadata={"help": "Whether or not to pretrain."}
     )
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
@@ -625,52 +626,20 @@ def main():
             return loss
         
         dropout_rng = variables.get('dropout_rng', None)
-        prev_grads = variables.get('gns_store_grads', None)
-        biased_sqr = variables.get('gns_biased_sqr', None)
-        unbias_sqr = variables.get('gns_unbias_sqr', None)
-        biased_var = variables.get('gns_biased_var', None)
-        unbias_var = variables.get('gns_unbias_var', None)
-        count = variables.get('count', None)
-        scale = variables.get('scale', None)
-        theta = variables.get('theta', None)
         
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grad)
+        new_state = state.apply_gradients(grads=grad)                                                                                                theta)
 
-        pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
-        gradients = extract_values_with_key_p(grad)
-        preconditioners = extract_values_with_key_p(pinv)
+        prev_norm_sq = variables.get('gns_norm_sq', jnp.array(0.))
+        prev_var = variables.get('gns_var', jnp.array(0.))
 
-        def condition(prev_grads):
-            return prev_grads is not None
-        
-        prev_grads = jax.lax.cond(
-            condition(prev_grads),
-            lambda x: x,
-            lambda x: jax.tree_util.tree_map(jnp.zeros_like, gradients), 
-            prev_grads
-        )
-
-        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
-                                                                                                           preconditioners, 
-                                                                                                           biased_sqr, 
-                                                                                                           unbias_sqr, 
-                                                                                                           biased_var, 
-                                                                                                           unbias_var, 
-                                                                                                           count, 
-                                                                                                           scale, 
-                                                                                                           theta)
+        norm_sq, var = simple_gns_estimate(grad, prev_norm_sq, prev_var)
         
         metrics = {"loss": loss, 
                    "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
-                   "gradients": gradients, 
-                   "grad_sqr": grad_sqr, 
-                   "grad_var": grad_var, 
-                   "biased_sqr": biased_sqr,
-                   "unbias_sqr": unbias_sqr, 
-                   "biased_var": biased_var, 
-                   "unbias_var": unbias_var 
+                    "grad_norm_sq": norm_sq,
+                    "grad_var": var,
                    }
 
         return new_state, metrics
@@ -745,9 +714,12 @@ def main():
             #    state = update_state_on_bs_change(state)
             # exec_time = time.perf_counter()
             
-            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
 
-            variables_dict = dict(variables_dict)
+            variables_dict = {
+            'dropout_rng': dropout_rng,
+            'gns_norm_sq': jnp.array(0.),
+            'gns_var': jnp.array(0.),
+            }
             #state, train_metric = p_train_step(state, batch, dropout_rng, gns.store_grads, 
             #                                    gns.biased_sqr, gns.unbias_sqr, gns.biased_var, gns.unbias_var, count, scale, theta)
 
@@ -802,16 +774,15 @@ def main():
             # gns_update_time = time.perf_counter()
             
             # epoch_losses.append(train_metric['loss']._value)
-            gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
-                             train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
             
                 
             # print(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
             
             # logger.info(f'epoch: {epoch}, step: {step}')
             # logger.info(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
-            # update_grad_params(train_metric["grad_sqr"]._value, train_metric["grad_var"]._value)
-            update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
+
+            gns.update_state(state, train_metric["grad_norm_sq"], train_metric["grad_var"])
+            update_grad_params(train_metric["grad_norm_sq"], train_metric["grad_var"])
             
             #train_metrics.append(train_metric)
         
