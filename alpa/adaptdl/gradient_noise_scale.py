@@ -25,13 +25,20 @@ class GradientNoiseScale():
         self.store_grads = jax.tree_util.tree_map(jnp.zeros_like, state)         #previous Gradient
         #self.running_noise = 0.0
         #self.running_scale = 0.0
-        self.noise = 0.0
-        self.scale = 0.0
-        self.noise_scale = 0.0
-        self.biased_sqr = 0.0 
-        self.unbias_sqr = 0.0 
-        self.biased_var = 0.0 
-        self.unbias_var = 0.0
+        # self.noise = 0.0
+        # self.scale = 0.0
+        # self.noise_scale = 0.0
+        # self.biased_sqr = 0.0 
+        # self.unbias_sqr = 0.0 
+        # self.biased_var = 0.0 
+        # self.unbias_var = 0.0
+        self.noise = jnp.array(0.)
+        self.scale = jnp.array(0.)
+        self.noise_scale = jnp.array(0.)
+        self.biased_sqr = jnp.array(0.)
+        self.unbias_sqr = jnp.array(0.)
+        self.biased_var = jnp.array(0.)
+        self.unbias_var = jnp.array(0.)
     
     def set_preconditioner(self, grads):
         def ones_like(x):
@@ -40,15 +47,20 @@ class GradientNoiseScale():
         pinv = jax.tree_util.tree_map(ones_like, grads._value)
         return pinv
    
-    def update_state(self, state, grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var, gradients):
+    # def update_state(self, state, grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var, gradients):
+    #     self.state          = state
+    #     self.noise          = grad_sqr
+    #     self.scale          = grad_var
+    #     self.biased_sqr     = biased_sqr 
+    #     self.unbias_sqr     = unbias_sqr 
+    #     self.biased_var     = biased_var 
+    #     self.unbias_var     = unbias_var
+    #     self.store_grads    = gradients
+
+    def update_state(self, state, grad_sqr, grad_var):
         self.state          = state
         self.noise          = grad_sqr
         self.scale          = grad_var
-        self.biased_sqr     = biased_sqr 
-        self.unbias_sqr     = unbias_sqr 
-        self.biased_var     = biased_var 
-        self.unbias_var     = unbias_var
-        self.store_grads    = gradients
 
     def initialize_gns(self, state, init_bsz, num_workers, accum_scale):
         self.state = state

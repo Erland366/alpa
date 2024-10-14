@@ -30,6 +30,12 @@ def normsqr_groups(grads, pinvs):
     normsqr_list = [jnp.sum(jnp.square(g/p)) for g, p in zip(grads, pinvs)]
     return jnp.sum(jnp.array(normsqr_list))
 
+# def normsqr_groups(grads, pinvs):
+#     return jax.tree_util.tree_reduce(
+#         jnp.add,
+#         jax.tree_map(lambda g, p: jnp.sum(jnp.square(g/p)), grads, pinvs)
+#     )
+
 def compute_gradient_noise_scale(prev_grads, new_grads,
                                   preconditioner, 
                                   biased_sqr, unbias_sqr, biased_var, unbias_var,
@@ -46,6 +52,56 @@ def compute_gradient_noise_scale(prev_grads, new_grads,
     biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
     biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
     return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+
+
+
+def compute_gradient_noise_scale_nowarning_OOM(prev_grads, new_grads,
+                                 preconditioner, 
+                                 biased_sqr, unbias_sqr, biased_var, unbias_var,
+                                 count, scale, theta):
+    
+    def flatten_and_concat(nested):
+        flat = jax.tree_util.tree_leaves(jax.tree_map(jnp.ravel, nested))
+        return jnp.concatenate(flat)
+    
+    def normsqr_groups(grads, pinvs):
+        flat_grads = flatten_and_concat(grads)
+        flat_pinvs = flatten_and_concat(pinvs)
+        return jnp.sum(jnp.square(flat_grads / flat_pinvs))
+    
+    def average_groups(grads1, grads2):
+        flat_grads1 = flatten_and_concat(grads1)
+        flat_grads2 = flatten_and_concat(grads2)
+        return (flat_grads1 + flat_grads2) / 2
+    
+    grads_normsqr = normsqr_groups(new_grads, preconditioner)
+    local_sqr = (normsqr_groups(prev_grads, preconditioner) + grads_normsqr) / 2
+    
+    avg_grads = average_groups(new_grads, prev_grads)
+    total_sqr = jnp.sum(jnp.square(avg_grads / flatten_and_concat(preconditioner)))
+    
+    grad_sqr = (count * total_sqr - local_sqr) / (count - 1) 
+    grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+    
+    biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
+    biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
+    
+    return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+
+def simple_gns_estimate(grads, prev_norm_sq, prev_var, beta=0.9):
+    flat_grads = jax.tree_util.tree_leaves(grads)
+    flat_grads = [jnp.ravel(g) for g in flat_grads]
+    flat_grads = jnp.concatenate(flat_grads)
+    
+    norm_sq = jnp.sum(flat_grads**2)
+    mean = jnp.mean(flat_grads)
+    var = jnp.mean((flat_grads - mean)**2)
+    
+    norm_sq = beta * prev_norm_sq + (1 - beta) * norm_sq
+    var = beta * prev_var + (1 - beta) * var
+    var *= 1e9
+    
+    return norm_sq, var
 
 def compute_gradient_noise_scale_no_ewma(prev_grads, new_grads,
                                   preconditioner, 
@@ -81,6 +137,9 @@ def average_groups(grads1, grads2):
     for group1, group2 in zip(grads1, grads2):
         ret.append((group1 + group2) / 2)
     return ret
+
+# def average_groups(grads1, grads2):
+    # return jax.tree_map(lambda g1, g2: (g1 + g2) / 2, grads1, grads2)
 
 # def update_avg(value, factor, biased, unbias):
 #     # epsilon = 1e-8
