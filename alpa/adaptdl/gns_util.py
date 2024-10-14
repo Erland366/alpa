@@ -99,7 +99,7 @@ def simple_gns_estimate(grads, prev_norm_sq, prev_var, beta=0.9):
     
     norm_sq = beta * prev_norm_sq + (1 - beta) * norm_sq
     var = beta * prev_var + (1 - beta) * var
-    var *= 1e9
+    var *= 1e9 # var seems to be out of norm_sq's scale by a large margin (1e9 for OPT)
     
     return norm_sq, var
 
