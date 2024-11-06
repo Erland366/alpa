@@ -57,10 +57,15 @@ class GradientNoiseScale():
     #     self.unbias_var     = unbias_var
     #     self.store_grads    = gradients
 
-    def update_state(self, state, grad_sqr, grad_var):
+    def update_state(self, state, grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var, gradients):
         self.state          = state
         self.noise          = grad_sqr
         self.scale          = grad_var
+        self.biased_sqr     = biased_sqr 
+        self.unbias_sqr     = unbias_sqr 
+        self.biased_var     = biased_var 
+        self.unbias_var     = unbias_var
+        self.store_grads    = gradients
 
     def initialize_gns(self, state, init_bsz, num_workers, accum_scale):
         self.state = state

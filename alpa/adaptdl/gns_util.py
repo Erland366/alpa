@@ -1,10 +1,14 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import time
 import alpa
 
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax.lib import xla_bridge
+from alpa.device_mesh import get_global_physical_mesh
+from jax.core import ShapedArray
+from jax.interpreters import pxla
 
 
 def extract_values_with_key_p(structure):
@@ -30,11 +34,6 @@ def normsqr_groups(grads, pinvs):
     normsqr_list = [jnp.sum(jnp.square(g/p)) for g, p in zip(grads, pinvs)]
     return jnp.sum(jnp.array(normsqr_list))
 
-# def normsqr_groups(grads, pinvs):
-#     return jax.tree_util.tree_reduce(
-#         jnp.add,
-#         jax.tree_map(lambda g, p: jnp.sum(jnp.square(g/p)), grads, pinvs)
-#     )
 
 def compute_gradient_noise_scale(prev_grads, new_grads,
                                   preconditioner, 
@@ -53,6 +52,26 @@ def compute_gradient_noise_scale(prev_grads, new_grads,
     biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
     return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
 
+
+# wrong but does not require storing previous iteration's gradients
+def compute_gradient_noise_scale_running(grads, prev_normsqr, preconditioner, biased_sqr, unbias_sqr, 
+                                        biased_var, unbias_var, count, scale, theta):
+    # grads_normsqr = normsqr_groups(grads, preconditioner)
+    flat_grads = jax.tree_util.tree_leaves(grads)
+    flat_grads = [jnp.ravel(g) for g in flat_grads]
+    flat_grads = jnp.concatenate(flat_grads)
+    
+    grads_normsqr = jnp.sum(flat_grads**2)
+    local_sqr = (prev_normsqr + grads_normsqr) / 2
+    # total_sqr = (prev_normsqr + grads_normsqr) / 2
+    total_sqr = 1/4 * prev_normsqr + 3/4 * grads_normsqr
+    # grad_sqr = (count * total_sqr - local_sqr) / (count - 1) 
+    # grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+    grad_sqr = count * total_sqr - local_sqr
+    grad_var = local_sqr - total_sqr
+    # biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
+    # biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
+    return grads_normsqr, grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
 
 
 def compute_gradient_noise_scale_nowarning_OOM(prev_grads, new_grads,
@@ -102,6 +121,34 @@ def simple_gns_estimate(grads, prev_norm_sq, prev_var, beta=0.9):
     var *= 1e9 # var seems to be out of norm_sq's scale by a large margin (1e9 for OPT)
     
     return norm_sq, var
+
+# wrong
+def improved_gns_estimate(grads, prev_mean_grad, prev_norm_sq, prev_var, beta=0.9, epsilon=1e-8):
+    flat_grads = jax.tree_util.tree_leaves(grads)
+    flat_grads = [jnp.ravel(g) for g in flat_grads]
+    flat_grads = jnp.concatenate(flat_grads)
+    
+    # Compute current statistics
+    norm_sq = jnp.sum(flat_grads**2)
+    mean_grad = jnp.mean(flat_grads)
+    
+    # Estimate the "signal" component
+    signal = jnp.sum((mean_grad - prev_mean_grad)**2)
+    
+    # Estimate the "noise" component
+    noise = jnp.mean((flat_grads - mean_grad)**2)
+    
+    # Update running averages
+    norm_sq = beta * prev_norm_sq + (1 - beta) * norm_sq
+    var = beta * prev_var + (1 - beta) * noise
+    mean_grad_new = beta * prev_mean_grad + (1 - beta) * mean_grad
+    
+    # Adjust norm_sq and var to better reflect signal and noise
+    adjusted_norm_sq = norm_sq * (signal / (signal + noise + epsilon))
+    adjusted_var = var * (noise / (signal + noise + epsilon))
+    
+    return adjusted_norm_sq, adjusted_var, mean_grad_new
+
 
 def compute_gradient_noise_scale_no_ewma(prev_grads, new_grads,
                                   preconditioner, 
@@ -246,4 +293,64 @@ def run_grads(shape, store_grads, n_batch, running_noise, running_scale, beta, i
     return noise, scale, noise_scale, running_noise, running_scale
     
 
+def init_distributed_scalar():
+    # Get the physical mesh that Alpa will use
+    physical_mesh = get_global_physical_mesh(create_if_not_exist=True) # TODO: double-check if this is not causing problems with reallocation etc.
+    
+    # Create aval for a scalar
+    aval = ShapedArray((), jnp.float32)
+    
+    # Create a replicated sharding spec for the scalar
+    # This ensures the scalar is replicated across all devices
+    mesh_shape = physical_mesh.shape  # e.g., (num_hosts, num_devices_per_host)
+    sharding_spec = pxla.ShardingSpec(
+        sharding=(),  # empty tuple for scalar
+        mesh_mapping=(pxla.Replicated(np.prod(mesh_shape)),)  # replicate across all devices
+    )
+    
+    # Initialize the scalar value
+    scalar = jnp.array(0., dtype=jnp.float32)
+    
+    # Convert to distributed array
+    distributed_arrays = physical_mesh.shard_args_to_arrays(
+        [aval],  # list of abstract values
+        [pxla.spec_to_indices(aval.shape, sharding_spec)],  # list of indices
+        [sharding_spec],  # list of sharding specs
+        [scalar]  # list of concrete values
+    )
+    
+    return distributed_arrays[0]  # return the first (and only) array
+
+
+def init_distributed_zeros_like(x):
+    physical_mesh = get_global_physical_mesh(create_if_not_exist=True)
+    mesh_shape = physical_mesh.shape
+
+    def to_distributed_array(arr):
+        # Create abstract value matching input array's shape and dtype
+        aval = ShapedArray(arr.shape, arr.dtype)
+        
+        # Create a replicated sharding spec
+        # For arrays (unlike scalars), we need to handle the actual shape
+        sharding = tuple(pxla.NoSharding() for _ in arr.shape)
+        mesh_mapping = (pxla.Replicated(np.prod(mesh_shape)),)
+        sharding_spec = pxla.ShardingSpec(
+            sharding=sharding,
+            mesh_mapping=mesh_mapping
+        )
+        
+        # Create zeros array with matching shape/dtype
+        zeros = jnp.zeros_like(arr)
+        
+        # Convert to distributed array
+        distributed_arrays = physical_mesh.shard_args_to_arrays(
+            [aval],
+            [pxla.spec_to_indices(aval.shape, sharding_spec)],
+            [sharding_spec],
+            [zeros]
+        )
+        return distributed_arrays[0]
+    
+    # Apply the conversion to the entire pytree
+    return jax.tree_util.tree_map(to_distributed_array, x)
 

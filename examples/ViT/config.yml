@@ -16,9 +16,12 @@ model_name_or_path: google/vit-base-patch16-224-in21k
 # model_name_or_path: google/vit-huge-patch14-224-in21k
 
 paths:
-  output_dir:  ./vit-base-patch16-imagenette
-  train_dir: imagenette2/train
-  validation_dir: imagenette2/val
+  # output_dir:  ./vit-base-patch16-imagenette
+  # train_dir: imagenette2/train
+  # validation_dir: imagenette2/val
+  output_dir:  ./vit-base-patch16-imagenet
+  train_dir: imagenet/train
+  validation_dir: imagenet/val
 
 pollux_agent:
   regression_coefficients:

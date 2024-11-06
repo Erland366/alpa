@@ -55,20 +55,9 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 #from alpa.adaptdl.gradient_noise_scale import GradientNoiseScale
 from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
-                                   normsqr_groups,
-                                   average_groups,
-                                   update_avg,
                                    compute_gradient_noise_scale, 
-                                   compute_gradsnorms, 
-                                   update_variance, 
-                                   compute_variance, 
-                                   init_dict, 
-                                   compute_grad_flat_mean, 
-                                   flatten_gradients, 
-                                   running_gradient,
-                                   run_grads, 
-                                   init_running_gradients,
-                                   simple_gns_estimate)
+                                   init_distributed_scalar,
+                                   init_distributed_zeros_like)
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
@@ -85,6 +74,7 @@ import yaml
 from addict import Dict as AddictDict
 import argparse
 
+
 def parse_config_arg():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
@@ -97,8 +87,6 @@ config_path = parse_config_arg()
 with open(config_path, 'r') as file:
     yml_config = yaml.safe_load(file)
 yml_config = AddictDict(yml_config)
-
-print(yml_config)
 
 def count_params(model):
     return sum(x.size for x in jax.tree_leaves(model))
@@ -147,7 +135,7 @@ class TrainingArguments:
     per_device_eval_batch_size: int = field(
         default=yml_config.dataloader.eval.local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
-    learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
+    learning_rate: float = field(default=yml_config.training.learning_rate, metadata={"help": "The initial learning rate for AdamW."})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
     adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
     adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
@@ -460,7 +448,7 @@ def main():
             "data_args": data_args,
             "training_args": training_args,
         },
-        save_code=True,
+        save_code=False,
         mode=yml_config.wandb.mode,
         # settings=wandb.Settings(code_dir=os.path.dirname(os.path.dirname(alpa.__file__)))
     )
@@ -632,17 +620,48 @@ def main():
         grad_fn = alpa.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
-
-        prev_norm_sq = variables.get('gns_norm_sq', jnp.array(0.))
-        prev_var = variables.get('gns_var', jnp.array(0.))
-
-        norm_sq, var = simple_gns_estimate(grad, prev_norm_sq, prev_var)
         
+        prev_grads = variables.get('gns_store_grads', None)
+        biased_sqr = variables.get('gns_biased_sqr', None)
+        unbias_sqr = variables.get('gns_unbias_sqr', None)
+        biased_var = variables.get('gns_biased_var', None)
+        unbias_var = variables.get('gns_unbias_var', None)
+        count = variables.get('count', None)
+        scale = variables.get('scale', None)
+        theta = variables.get('theta', None)
+
+        pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
+        gradients = extract_values_with_key_p(grad)
+        preconditioners = extract_values_with_key_p(pinv)
+        
+        # Basing GNS estimation on the first 10% gradients
+        # –––––––––––––––––––––––––––––––––––––––––––––
+        first_10_percent = max(1, int(0.1 * len(gradients)))
+        gradients = gradients[:first_10_percent]
+        preconditioners = preconditioners[:first_10_percent]
+        prev_grads = prev_grads[:first_10_percent]
+        # –––––––––––––––––––––––––––––––––––––––––––––
+
+        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
+                                                                                                           preconditioners, 
+                                                                                                           biased_sqr, 
+                                                                                                           unbias_sqr, 
+                                                                                                           biased_var, 
+                                                                                                           unbias_var, 
+                                                                                                           count, 
+                                                                                                           scale, 
+                                                                                                           theta)
+
         metrics = {"loss": loss, 
-                   "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
-                    "grad_norm_sq": norm_sq,
-                    "grad_var": var,
-                   }
+            "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
+            "gradients": gradients, 
+            "grad_sqr": grad_sqr, 
+            "grad_var": grad_var, 
+            "biased_sqr": biased_sqr,
+            "unbias_sqr": unbias_sqr, 
+            "biased_var": biased_var, 
+            "unbias_var": unbias_var,
+            }
 
         return new_state, metrics
 
@@ -690,7 +709,15 @@ def main():
     last_time = time.time()
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
 
-    # for epoch in epochs:
+    gns.store_grads = init_distributed_zeros_like(gns.state)
+    gns.biased_sqr = init_distributed_scalar()
+    gns.unbias_sqr = init_distributed_scalar()
+    gns.biased_var = init_distributed_scalar()
+    gns_unbias_var = init_distributed_scalar()
+
+    first_10_percent = max(1, int(0.1 * len(gns.store_grads)))
+    gns.store_grads = gns.store_grads[:first_10_percent]
+
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================
         
@@ -703,7 +730,6 @@ def main():
         steps_list = []
         losses = []
         epoch_losses = []
-        gns.store_grads = []
         eval_losses = []
         eval_acc = []
 
@@ -717,11 +743,7 @@ def main():
             # exec_time = time.perf_counter()
             
 
-            variables_dict = {
-            'dropout_rng': dropout_rng,
-            'gns_norm_sq': jnp.array(0.),
-            'gns_var': jnp.array(0.),
-            }
+            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
             #state, train_metric = p_train_step(state, batch, dropout_rng, gns.store_grads, 
             #                                    gns.biased_sqr, gns.unbias_sqr, gns.biased_var, gns.unbias_var, count, scale, theta)
 
@@ -783,8 +805,10 @@ def main():
             # logger.info(f'epoch: {epoch}, step: {step}')
             # logger.info(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
 
-            gns.update_state(state, train_metric["grad_norm_sq"], train_metric["grad_var"])
-            update_grad_params(train_metric["grad_norm_sq"], train_metric["grad_var"])
+            gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
+                    train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
+
+            update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
             
             #train_metrics.append(train_metric)
         
