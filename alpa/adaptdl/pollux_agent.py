@@ -200,12 +200,14 @@ class PolluxAgent:
         current_stat_eff = None 
         current_throughput = None
         current_goodput = None
+        best_bs = None
 
-        if self.grad_norm_sqr is not None and self.grad_variance is not None and self.local_bsz_bounds is not None:
+        if self.grad_norm_sqr is not None and self.grad_variance is not None:
             goodput_fn = GoodputFunction((self.grad_norm_sqr, self.grad_variance), self.init_batch_size)
             # min_batch_size = jnp.maximum(self.init_batch_size, self.local_bsz_bounds[0] * alpa.get_global_num_devices())
             min_batch_size = self.init_batch_size # to keep the range same even when # of GPUs increased
-            batch_size = jnp.geomspace(min_batch_size, self.max_batch_size)
+            max_bs = self.max_batch_size if self.max_batch_size is not None else 1000
+            batch_size = jnp.geomspace(min_batch_size, max_bs)
             eps = 1e-8
             batch_size = jnp.ceil(batch_size - eps)
             stat_eff = goodput_fn.efficiency(batch_size)
@@ -220,6 +222,8 @@ class PolluxAgent:
             current_stat_eff = goodput_fn.efficiency(self.total_batch_size)
             current_throughput = self.predict_throughput(self.total_batch_size)[0]
             current_goodput = current_stat_eff * current_throughput
+            best_bs = batch_size[jnp.argmax(goodput)]
+
 
         data = {
             "loss": self.train_metric['loss']._value, 
@@ -238,6 +242,7 @@ class PolluxAgent:
             "current_throughput": current_throughput,
             "Goodput_vs_BS": wandb.plot.line(goodput_table, "batch_size", "Goodput", title="Goodput vs. Batch Size Plot") if goodput_table is not None else None,
             "current_goodput": current_goodput,
+            "Best_BS": best_bs,
             }
 
         # Asynchronously logging wandb data so that training is not blocked. Each log otherwise takes ~1s.
