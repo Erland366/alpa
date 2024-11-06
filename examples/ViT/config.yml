@@ -22,13 +22,13 @@ paths:
 
 pollux_agent:
   regression_coefficients:
-    (1, 1):
+    - key: [1, 1]
       coef: 0.00206749
       intercept: 0.019354801896649114
-    (2, 1):
+    - key: [2, 1]
       coef: 0.00108904
       intercept: 0.027093764782572798
-    (4, 1):
+    - key: [4, 1]
       coef: 0.00056805
       intercept: 0.028780623571947224
   fix_regressors: true
@@ -56,6 +56,7 @@ dataloader:
 training:
   pretrain: true
   num_train_epochs: 10000000
+  learning_rate: 1e-5
   scale_lr:
     enabled: true
     type: sqrt # linear, sqrt

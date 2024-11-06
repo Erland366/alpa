@@ -494,10 +494,12 @@ def main():
 
     # Set regression coefficients if specified in the config
     if yml_config.pollux_agent.fix_regressors:
-        for key, values in yml_config.pollux_agent.regression_coefficients.items():
+        for item in yml_config.pollux_agent.regression_coefficients:
+            key = tuple(item.key)  # Convert list in .yml to tuple
+            values = item
             pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
             pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
-            pollux_agent.fix_regressors()
+        pollux_agent.fix_regressors()
 
     # Create data loaders
     if not yml_config.dataloader.train.adaptive_data_loader.enabled:
