@@ -1,7 +1,7 @@
 # TODO: wandb configuration
 
 wandb:
-  mode: disabled # online, offline, disabled
+  mode: online # online, offline, disabled
   project: "ViT_adaptive"
   save_code: false
 
@@ -65,6 +65,7 @@ training:
   pretrain: false
   num_train_epochs: 10000000
   learning_rate: 1e-5
+  copus_enabled: false
   scale_lr:
     enabled: true
     type: sqrt # linear, sqrt
