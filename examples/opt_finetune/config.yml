@@ -2,7 +2,7 @@
 
 wandb:
   mode: online # online, offline, disabled
-  project: "ViT_adaptive"
+  project: "OPT_adaptive"
   save_code: false
 
 scheduler:
@@ -14,30 +14,30 @@ cluster_config:
   num_devices_per_node: null
   namespace: null # alpa_default_space by default
 
-model_name_or_path: google/vit-base-patch16-224-in21k
-# model_name_or_path: google/vit-huge-patch14-224-in21k
+model_name_or_path: facebook/opt-350m
+
+data:
+  dataset_name: wikitext
+  dataset_config_name: wikitext-2-raw-v1
+  block_size: 1024
+  max_train_samples: 20000
+
 
 paths:
-  # output_dir:  ./vit-base-patch16-imagenette
-  # train_dir: imagenette2/train
-  # validation_dir: imagenette2/val
-  output_dir:  ./vit-base-patch16-imagenet
-  # output_dir: ./vit-huge-patch14-imagenet
-  train_dir: imagenet/train
-  validation_dir: imagenet/val
-  cache_dir: cache
+  output_dir: ./output
+  cache_dir: ./cache_350m
 
 pollux_agent:
   regression_coefficients:
     - key: [1, 1]
-      coef: 0.00206749
-      intercept: 0.019354801896649114
+      coef: 0.01244238
+      intercept: 0.04832255037035804
     - key: [2, 1]
-      coef: 0.00108904
-      intercept: 0.027093764782572798
+      coef: 0.00620391
+      intercept: 0.05258383221059515
     - key: [4, 1]
-      coef: 0.00056805
-      intercept: 0.028780623571947224
+      coef: 0.00310928
+      intercept: 0.05187557201965598
   fix_regressors: true
 
 dataloader:
@@ -46,26 +46,34 @@ dataloader:
       enabled: true
       autoscaler: 
         enabled: false
-        max_total_batch_size: 800
+        max_total_batch_size: 400
         local_bsz_bounds:
           min_is_init_bs: true
-          min: 32
-          max: 150
-    init_local_batch_size: 32
+          min: 20
+          max: 78
+    init_local_batch_size: 20
     shuffle: true
-    preprocessing_num_workers: 32
-    persistent_workers: true
+    preprocessing_num_workers: 0
+    persistent_workers: false
   eval:
-    local_batch_size: 64
+    local_batch_size: 20
     shuffle: false
 
 
 training:
-  dtype: "float32"
+  dtype: "float16"
   pretrain: false
   num_train_epochs: 10000000
-  learning_rate: 1e-5
+  learning_rate: 5e-5
+  warmup_steps: 2000
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  weight_decay: 0.01
+  smoothing: 0.9
   copus_enabled: true
+  logging_steps: 50
+  save_steps: 32
+  eval_steps: 32
   scale_lr:
     enabled: true
     type: sqrt # linear, sqrt

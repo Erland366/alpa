@@ -1,0 +1,23 @@
+python3 run_clm_flax_adaptive.py \
+    --output_dir="./output" \
+    --model_name_or_path="facebook/opt-1.3b" \
+    --dataset_name="wikitext" \
+    --dataset_config_name="wikitext-103-raw-v1" \
+    --do_train --do_eval \
+    --block_size="1024" \
+    --per_device_train_batch_size="8" \
+    --per_device_eval_batch_size="8" \
+    --operator_parallel 1 \
+    --pipeline_parallel 1 \
+    --dtype="float16" \
+    --learning_rate="5e-5" --warmup_steps="2000" \
+    --adam_beta1="0.9" --adam_beta2="0.98" --weight_decay="0.01" \
+    --overwrite_output_dir \
+    --num_train_epochs="100000" \
+    --logging_steps="50" \
+    --save_steps="32" \
+    --eval_steps="32" \
+    --cache_dir="./cache" \
+    --max_train_samples=20000 \
+    --smoothing 0.9 \
+    --scale_lr=True

@@ -78,10 +78,27 @@ import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 import datetime
 import wandb
+import argparse
+import yaml
+from addict import Dict as AddictDict
 
-alpa.init(cluster="ray")
-# alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=1, namespace="alpa_default_space_opt")
-# alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
+
+def parse_config_arg():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
+    args, remaining = parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + remaining  # Removing --config from sys.argv
+    return args.config
+
+config_path = parse_config_arg()
+
+with open(config_path, 'r') as file:
+    yml_config = yaml.safe_load(file)
+yml_config = AddictDict(yml_config)
+
+alpa.init(cluster="ray", scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
+          num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,
+          namespace=yml_config.cluster_config.namespace)
 
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
@@ -97,10 +114,11 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 @dataclass
 class TrainingArguments:
     output_dir: str = field(
+        default=yml_config.paths.output_dir,
         metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
     )
     overwrite_output_dir: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
                 "Overwrite the content of the output directory. "
@@ -108,29 +126,29 @@ class TrainingArguments:
             )
         },
     )
-    do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
-    do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
+    do_train: bool = field(default=True, metadata={"help": "Whether to run training."})
+    do_eval: bool = field(default=True, metadata={"help": "Whether to run eval on the dev set."})
     per_device_train_batch_size: int = field(
-        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
+        default=yml_config.dataloader.train.init_local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
-        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
+        default=yml_config.dataloader.eval.local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
     num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
     operator_parallel: int = field(default=1, metadata={"help": "The degree of operator model parallelism."})
     pipeline_parallel: int = field(default=1, metadata={"help": "The degree of pipeline model parallelism."})
     use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})
-    learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
-    weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
-    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
-    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
+    learning_rate: float = field(default=yml_config.training.learning_rate, metadata={"help": "The initial learning rate for AdamW."})
+    weight_decay: float = field(default=yml_config.training.weight_decay, metadata={"help": "Weight decay for AdamW if we apply some."})
+    adam_beta1: float = field(default=yml_config.training.adam_beta1, metadata={"help": "Beta1 for AdamW optimizer"})
+    adam_beta2: float = field(default=yml_config.training.adam_beta2, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
-    warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
-    save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
-    eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
+    num_train_epochs: float = field(default=yml_config.training.num_train_epochs, metadata={"help": "Total number of training epochs to perform."})
+    warmup_steps: int = field(default=yml_config.training.warmup_steps, metadata={"help": "Linear warmup over warmup_steps."})
+    logging_steps: int = field(default=yml_config.training.logging_steps, metadata={"help": "Log every X updates steps."})
+    save_steps: int = field(default=yml_config.training.save_steps, metadata={"help": "Save checkpoint every X updates steps."})
+    eval_steps: int = field(default=yml_config.training.eval_steps, metadata={"help": "Run an evaluation every X steps."})
     seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
     push_to_hub: bool = field(
         default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
@@ -140,13 +158,13 @@ class TrainingArguments:
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
     pretrain: bool = field(
-        default=False, metadata={"help": "Whether or not to pretrain."}
+        default=yml_config.training.pretrain, metadata={"help": "Whether or not to pretrain."}
     )
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
-    smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
+    smoothing: float = field(default=yml_config.training.smoothing, metadata={"help": "Smoothing parameter for PGNS"})
     scale_lr: bool = field(
-        default=False, metadata={"help": "Whether or not to scale the learning rate with batch size."}
+        default=yml_config.training.scale_lr.enabled, metadata={"help": "Whether or not to scale the learning rate with batch size."}
     )
 
     def __post_init__(self):
@@ -176,7 +194,7 @@ class ModelArguments:
     """
 
     model_name_or_path: Optional[str] = field(
-        default=None,
+        default=yml_config.model_name_or_path,
         metadata={
             "help": (
                 "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
@@ -194,14 +212,14 @@ class ModelArguments:
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+        default=yml_config.paths.cache_dir, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
     use_fast_tokenizer: bool = field(
         default=True,
         metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
     )
     dtype: Optional[str] = field(
-        default="float32",
+        default=yml_config.training.dtype,
         metadata={
             "help": (
                 "Floating-point format in which the model weights should be initialized and trained. Choose one of"
@@ -227,10 +245,10 @@ class DataTrainingArguments:
     """
 
     dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=yml_config.data.dataset_name, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
     dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+        default=yml_config.data.dataset_config_name, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
     train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
     validation_file: Optional[str] = field(
@@ -238,7 +256,7 @@ class DataTrainingArguments:
         metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
     )
     max_train_samples: Optional[int] = field(
-        default=None,
+        default=yml_config.data.max_train_samples,
         metadata={
             "help": (
                 "For debugging purposes or quicker training, truncate the number of training examples to this "
@@ -265,7 +283,7 @@ class DataTrainingArguments:
         },
     )
     block_size: Optional[int] = field(
-        default=None,
+        default=yml_config.data.block_size,
         metadata={
             "help": (
                 "Optional input sequence length after tokenization. "
@@ -278,7 +296,7 @@ class DataTrainingArguments:
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=None,
+        default=yml_config.dataloader.train.preprocessing_num_workers,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     keep_linebreaks: bool = field(
@@ -616,14 +634,16 @@ def main():
 
     run = wandb.init(
         # Set the project where this run will be logged
-        project="OPT_adaptive_simplegns",
+        project=yml_config.wandb.project,
         config={
             "model_name_or_path": model_args.model_name_or_path,
             "model_args": model_args,
             "data_args": data_args,
             "training_args": training_args,
+            "yml_config": yml_config,
         },
-        save_code=False,
+        save_code=yml_config.wandb.save_code,
+        mode=yml_config.wandb.mode,
     )
 
     run.log_code(
@@ -657,7 +677,7 @@ def main():
     tokenized_datasets = dataset.map(
         tokenize_function,
         batched=True,
-        num_proc=data_args.preprocessing_num_workers,
+        num_proc=None if data_args.preprocessing_num_workers == 0 else data_args.preprocessing_num_workers,
         remove_columns=column_names,
         load_from_cache_file=not data_args.overwrite_cache,
     )
@@ -706,7 +726,7 @@ def main():
     lm_datasets = tokenized_datasets.map(
         group_texts,
         batched=True,
-        num_proc=data_args.preprocessing_num_workers,
+        num_proc=None if data_args.preprocessing_num_workers == 0 else data_args.preprocessing_num_workers,
         load_from_cache_file=not data_args.overwrite_cache,
     )
 
@@ -777,31 +797,48 @@ def main():
     pollux_agent.last_state_retrieved_batch_size = train_batch_size
     pollux_agent.dataset_size = len(train_dataset)
 
-    pollux_agent.alloc_config_regressor[(1, 1)].coef_ = np.array([0.01244238])
-    pollux_agent.alloc_config_regressor[(1, 1)].intercept_ = 0.04832255037035804
-    pollux_agent.alloc_config_regressor[(2, 1)].coef_ = np.array([0.00620391])
-    pollux_agent.alloc_config_regressor[(2, 1)].intercept_ = 0.05258383221059515
-    pollux_agent.alloc_config_regressor[(4, 1)].coef_ = np.array([0.00310928])
-    pollux_agent.alloc_config_regressor[(4, 1)].intercept_ = 0.05187557201965598
-    pollux_agent.fix_regressors()
+    # Set regression coefficients if specified in the config
+    if yml_config.pollux_agent.fix_regressors:
+        for item in yml_config.pollux_agent.regression_coefficients:
+            key = tuple(item.key)  # Convert list in .yml to tuple
+            values = item
+            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
+            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
+        pollux_agent.fix_regressors()
 
-    train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
-        dataset=train_dataset,
-        batch_size=train_batch_size,
-        shuffle=True, # TODO: handle shuffle=True
-        collate_fn=transformers.default_data_collator, # we don't need any special collator
-        drop_last=True,
-        num_workers=0 if data_args.preprocessing_num_workers is None else data_args.preprocessing_num_workers,
-        persistent_workers=False if data_args.preprocessing_num_workers is None else True,
-    )
-
-    # train_loader.autoscale_batch_size(max_batch_size = 400, 
-                                    # local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices(), 78), gradient_accumulation=False)
+    if not yml_config.dataloader.train.adaptive_data_loader.enabled:
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=train_batch_size,
+            shuffle=yml_config.dataloader.train.shuffle,
+            collate_fn=transformers.default_data_collator, # we don't need any special collator 
+            drop_last=True,
+            num_workers=data_args.preprocessing_num_workers,
+            persistent_workers=yml_config.dataloader.train.persistent_workers,
+        )
+    else:
+        train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+            dataset=train_dataset,
+            batch_size=train_batch_size,
+            shuffle=yml_config.dataloader.train.shuffle,
+            collate_fn=transformers.default_data_collator, # we don't need any special collator
+            drop_last=True,
+            num_workers=data_args.preprocessing_num_workers,
+            persistent_workers=yml_config.dataloader.train.persistent_workers,
+        )
+        if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
+            train_loader.autoscale_batch_size(max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
+                                                local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices() if 
+                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
+                                                                  else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
+                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max), 
+                                                gradient_accumulation=False)
 
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=eval_batch_size,
-        shuffle=False,
+        shuffle=yml_config.dataloader.eval.shuffle,
+        drop_last=True,
         collate_fn=transformers.default_data_collator, # we don't need any special collator 
         )
 
@@ -814,8 +851,10 @@ def main():
         training_args.learning_rate,
     )
 
-    # scaling_rule = LinearScale()
-    scaling_rule = SqrtScale()
+    if yml_config.training.scale_lr.type == 'sqrt':
+        scaling_rule = SqrtScale()
+    else:
+        scaling_rule = LinearScale()
     scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
                                                         scaling_rule=scaling_rule)
     if not training_args.scale_lr:
@@ -890,14 +929,15 @@ def main():
             return loss
 
         dropout_rng = variables.get('dropout_rng', None)
-        prev_grads = variables.get('gns_store_grads', None)
-        biased_sqr = variables.get('gns_biased_sqr', None)
-        unbias_sqr = variables.get('gns_unbias_sqr', None)
-        biased_var = variables.get('gns_biased_var', None)
-        unbias_var = variables.get('gns_unbias_var', None)
-        count = variables.get('count', None)
-        scale = variables.get('scale', None)
-        theta = variables.get('theta', None)
+        if yml_config.training.copus_enabled:
+            prev_grads = variables.get('gns_store_grads', None)
+            biased_sqr = variables.get('gns_biased_sqr', None)
+            unbias_sqr = variables.get('gns_unbias_sqr', None)
+            biased_var = variables.get('gns_biased_var', None)
+            unbias_var = variables.get('gns_unbias_var', None)
+            count = variables.get('count', None)
+            scale = variables.get('scale', None)
+            theta = variables.get('theta', None)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -922,38 +962,44 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
-        pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
-        gradients = flatten_and_concat(extract_values_with_key_p(grads))
-        preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
-        
-        # Basing GNS estimation on the first 10% gradients
-        # –––––––––––––––––––––––––––––––––––––––––––––
-        first_10_percent = int(round(gradients.shape[0] * 10 / 100))
-        gradients = gradients[:first_10_percent]
-        preconditioners = preconditioners[:first_10_percent]
-        # –––––––––––––––––––––––––––––––––––––––––––––
+        if yml_config.training.copus_enabled:
+            pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
+            gradients = flatten_and_concat(extract_values_with_key_p(grads))
+            preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
+            
+            # Basing GNS estimation on the first 10% gradients
+            # –––––––––––––––––––––––––––––––––––––––––––––
+            first_10_percent = int(round(gradients.shape[0] * 10 / 100))
+            gradients = gradients[:first_10_percent]
+            preconditioners = preconditioners[:first_10_percent]
+            # –––––––––––––––––––––––––––––––––––––––––––––
 
-        grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
-                                                                                                    preconditioners, 
-                                                                                                    biased_sqr, 
-                                                                                                    unbias_sqr, 
-                                                                                                    biased_var, 
-                                                                                                    unbias_var, 
-                                                                                                    count, 
-                                                                                                    scale, 
-                                                                                                    theta)
+            grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
+                                                                                                        preconditioners, 
+                                                                                                        biased_sqr, 
+                                                                                                        unbias_sqr, 
+                                                                                                        biased_var, 
+                                                                                                        unbias_var, 
+                                                                                                        count, 
+                                                                                                        scale, 
+                                                                                                        theta)
 
-        metrics = {
-            "loss": loss,
-            "learning_rate": scaled_learning_rate_fn(state.step),
-            "gradients": gradients, 
-            "grad_sqr": grad_sqr, 
-            "grad_var": grad_var, 
-            "biased_sqr": biased_sqr,
-            "unbias_sqr": unbias_sqr, 
-            "biased_var": biased_var, 
-            "unbias_var": unbias_var,
-        }
+            metrics = {
+                "loss": loss,
+                "learning_rate": scaled_learning_rate_fn(state.step),
+                "gradients": gradients, 
+                "grad_sqr": grad_sqr, 
+                "grad_var": grad_var, 
+                "biased_sqr": biased_sqr,
+                "unbias_sqr": unbias_sqr, 
+                "biased_var": biased_var, 
+                "unbias_var": unbias_var,
+            }
+        else:
+            metrics = {
+                "loss": loss,
+                "learning_rate": scaled_learning_rate_fn(state.step),
+            }
 
         return new_state, metrics
 
@@ -973,13 +1019,20 @@ def main():
         return {k: v.numpy() for k, v in batch.items()}
 
     # Create parallel version of the train and eval step
-    # method = alpa.get_3d_parallel_method(
-    #         num_micro_batches=training_args.num_micro_batches,
-    #         data_parallel=-1,
-    #         operator_parallel=training_args.operator_parallel,
-    #         pipeline_parallel=training_args.pipeline_parallel)
-
-    method = alpa.DataParallel()
+    if yml_config.training.parallel_method.method == 'ShardParallel':
+        method = alpa.ShardParallel()
+    elif yml_config.training.parallel_method.method == 'PipeshardParallel':
+        stage_option = yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option
+        method = alpa.PipeshardParallel(stage_option=stage_option)
+    elif yml_config.training.parallel_method.method == 'DataParallel':
+        method = alpa.DataParallel()
+    elif yml_config.training.parallel_method.method == '3D':
+        method = alpa.get_3d_parallel_method(num_micro_batches=yml_config.training.parallel_method.num_micro_batches,
+                                             data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
+                                             operator_parallel=yml_config.training.parallel_method.parameters._3D.operator_parallel,
+                                             pipeline_parallel=yml_config.training.parallel_method.parameters._3D.pipeline_parallel)
+    else:
+        method = alpa.DataParallel()
 
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
@@ -1006,11 +1059,12 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
-    gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10, dtype=jnp.float32 if dynamic_scale else None)
-    gns.biased_sqr = init_distributed_scalar()
-    gns.unbias_sqr = init_distributed_scalar()
-    gns.biased_var = init_distributed_scalar()
-    gns.unbias_var = init_distributed_scalar()
+    if yml_config.training.copus_enabled:
+        gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10, dtype=jnp.float32 if dynamic_scale else None)
+        gns.biased_sqr = init_distributed_scalar()
+        gns.unbias_sqr = init_distributed_scalar()
+        gns.biased_var = init_distributed_scalar()
+        gns.unbias_var = init_distributed_scalar()
 
     # for epoch in epochs:
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
@@ -1074,10 +1128,11 @@ def main():
             state, train_metric = p_train_step(state, batch, variables_dict)
             train_metrics.append(train_metric)
 
-            gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
-                    train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
+            if yml_config.training.copus_enabled:
+                gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
+                        train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
 
-            update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
+                update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
@@ -1122,52 +1177,53 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            # if cur_step % training_args.eval_steps == 0 and cur_step > 0:
-            #     # ======================== Evaluating ==============================
-            #     eval_metrics = []
+            if yml_config.evaluation.enabled:
+                if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+                    # ======================== Evaluating ==============================
+                    eval_metrics = []
 
-            #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-            #     for step, batch in enumerate(eval_loader):
-            #         # Model forward
-            #         batch = process_batch(batch)
+                    eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                    for step, batch in enumerate(eval_loader):
+                        # Model forward
+                        batch = process_batch(batch)
 
-            #         metrics = p_eval_step(state.params, batch)
-            #         eval_metrics.append(metrics)
+                        metrics = p_eval_step(state.params, batch)
+                        eval_metrics.append(metrics)
 
-            #         if dump_debug_info_eval_step:
-            #             dump_debug_info_eval_step = False
-            #             executable = p_eval_step.get_last_executable()
-            #             executable.dump_debug_info("alpa_debug_info")
+                        if dump_debug_info_eval_step:
+                            dump_debug_info_eval_step = False
+                            executable = p_eval_step.get_last_executable()
+                            executable.dump_debug_info("alpa_debug_info")
 
-            #     # normalize eval metrics
-            #     eval_metrics = alpa.util.get_metrics(eval_metrics)
-            #     eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+                    # normalize eval metrics
+                    eval_metrics = alpa.util.get_metrics(eval_metrics)
+                    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-            #     try:
-            #         eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-            #     except OverflowError:
-            #         eval_metrics["perplexity"] = float("inf")
+                    try:
+                        eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+                    except OverflowError:
+                        eval_metrics["perplexity"] = float("inf")
 
-            #     # Print metrics and update progress bar
-            #     desc = (
-            #         f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
-            #         f" {eval_metrics['perplexity']})"
-            #     )
-            #     epochs.write(desc)
+                    # Print metrics and update progress bar
+                    desc = (
+                        f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+                        f" {eval_metrics['perplexity']})"
+                    )
+                    epochs.write(desc)
 
-            #     # Save metrics
-            #     if has_tensorboard:
-            #         write_eval_metric(summary_writer, eval_metrics, cur_step)
+                    # Save metrics
+                    if has_tensorboard:
+                        write_eval_metric(summary_writer, eval_metrics, cur_step)
 
-            # if cur_step % training_args.save_steps == 0 and cur_step > 0:
-            #     # save checkpoint after each epoch and push checkpoint to the hub
-            #     epochs.write("\nSave checkpoint...")
-            #     alpa.prefetch(state.params)
-            #     params = alpa.util.map_to_nparray(state.params)
-            #     model.save_pretrained(training_args.output_dir, params=params)
-            #     tokenizer.save_pretrained(training_args.output_dir)
-            #     if training_args.push_to_hub:
-            #         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                if cur_step % training_args.save_steps == 0 and cur_step > 0:
+                    # save checkpoint after each epoch and push checkpoint to the hub
+                    epochs.write("\nSave checkpoint...")
+                    alpa.prefetch(state.params)
+                    params = alpa.util.map_to_nparray(state.params)
+                    model.save_pretrained(training_args.output_dir, params=params)
+                    tokenizer.save_pretrained(training_args.output_dir)
+                    if training_args.push_to_hub:
+                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
     # # Eval after training
     # if training_args.do_eval:
