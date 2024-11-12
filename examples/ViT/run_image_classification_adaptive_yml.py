@@ -207,10 +207,10 @@ class ModelArguments:
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+        default=yml_config.paths.cache_dir, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
     dtype: Optional[str] = field(
-        default="float32",
+        default=yml_config.training.dtype,
         metadata={
             "help": (
                 "Floating-point format in which the model weights should be initialized and trained. Choose one of"
@@ -442,14 +442,14 @@ def main():
 
     run = wandb.init(
         # Set the project where this run will be logged
-        project="ViT_adaptive",
+        project=yml_config.wandb.project,
         config={
             "model_name_or_path": model_args.model_name_or_path,
             "model_args": model_args,
             "data_args": data_args,
             "training_args": training_args,
         },
-        save_code=False,
+        save_code=yml_config.wandb.save_code,
         mode=yml_config.wandb.mode,
         # settings=wandb.Settings(code_dir=os.path.dirname(os.path.dirname(alpa.__file__)))
     )

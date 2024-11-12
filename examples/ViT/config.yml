@@ -2,6 +2,8 @@
 
 wandb:
   mode: disabled # online, offline, disabled
+  project: "ViT_adaptive"
+  save_code: false
 
 scheduler:
   enabled: false
@@ -20,8 +22,10 @@ paths:
   # train_dir: imagenette2/train
   # validation_dir: imagenette2/val
   output_dir:  ./vit-base-patch16-imagenet
+  # output_dir: ./vit-huge-patch14-imagenet
   train_dir: imagenet/train
   validation_dir: imagenet/val
+  cache_dir: cache
 
 pollux_agent:
   regression_coefficients:
@@ -57,7 +61,8 @@ dataloader:
 
 
 training:
-  pretrain: true
+  dtype: "float32"
+  pretrain: false
   num_train_epochs: 10000000
   learning_rate: 1e-5
   scale_lr:
