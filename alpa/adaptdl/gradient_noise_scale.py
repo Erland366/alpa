@@ -67,11 +67,12 @@ class GradientNoiseScale():
         self.unbias_var     = unbias_var
         self.store_grads    = gradients
 
-    def initialize_gns(self, state, init_bsz, num_workers, accum_scale):
+    def initialize_gns(self, state, init_bsz, num_workers, accum_scale, store_grads):
         self.state = state
         self.init_batch_size = init_bsz
         self.num_workers = num_workers
         self.accum_scale = accum_scale
+        self.store_grads = store_grads
 
 gns = GradientNoiseScale()
    

@@ -57,7 +57,8 @@ from transformers.utils import get_full_repo_name, send_example_telemetry
 from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
                                    compute_gradient_noise_scale, 
                                    init_distributed_scalar,
-                                   init_distributed_zeros_like)
+                                   init_distributed_zeros_like,
+                                   flatten_and_concat)
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
@@ -593,10 +594,11 @@ def main():
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
-    gns.initialize_gns(state=extract_values_with_key_p(state.params), 
+    gns.initialize_gns(state=state, 
                        init_bsz=train_batch_size, 
                        num_workers=alpa.get_global_num_devices(), 
-                       accum_scale=alpa.get_global_num_devices())
+                       accum_scale=alpa.get_global_num_devices(),
+                       store_grads=flatten_and_concat(extract_values_with_key_p(state.params)))
     
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
@@ -616,11 +618,6 @@ def main():
             return loss
         
         dropout_rng = variables.get('dropout_rng', None)
-        
-        grad_fn = alpa.value_and_grad(compute_loss)
-        loss, grad = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grad)
-        
         prev_grads = variables.get('gns_store_grads', None)
         biased_sqr = variables.get('gns_biased_sqr', None)
         unbias_sqr = variables.get('gns_unbias_sqr', None)
@@ -629,17 +626,20 @@ def main():
         count = variables.get('count', None)
         scale = variables.get('scale', None)
         theta = variables.get('theta', None)
+        
+        grad_fn = alpa.value_and_grad(compute_loss)
+        loss, grad = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grad)
 
         pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
-        gradients = extract_values_with_key_p(grad)
-        preconditioners = extract_values_with_key_p(pinv)
+        gradients = flatten_and_concat(extract_values_with_key_p(grad))
+        preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
         
         # Basing GNS estimation on the first 10% gradients
         # –––––––––––––––––––––––––––––––––––––––––––––
-        first_10_percent = max(1, int(0.1 * len(gradients)))
+        first_10_percent = int(round(gradients.shape[0] * 10 / 100))
         gradients = gradients[:first_10_percent]
         preconditioners = preconditioners[:first_10_percent]
-        prev_grads = prev_grads[:first_10_percent]
         # –––––––––––––––––––––––––––––––––––––––––––––
 
         grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
@@ -709,14 +709,12 @@ def main():
     last_time = time.time()
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
 
-    gns.store_grads = init_distributed_zeros_like(gns.state)
+    gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10)
     gns.biased_sqr = init_distributed_scalar()
     gns.unbias_sqr = init_distributed_scalar()
     gns.biased_var = init_distributed_scalar()
-    gns_unbias_var = init_distributed_scalar()
+    gns.unbias_var = init_distributed_scalar()
 
-    first_10_percent = max(1, int(0.1 * len(gns.store_grads)))
-    gns.store_grads = gns.store_grads[:first_10_percent]
 
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================

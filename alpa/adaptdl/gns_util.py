@@ -40,6 +40,11 @@ def compute_gradient_noise_scale(prev_grads, new_grads,
                                   biased_sqr, unbias_sqr, biased_var, unbias_var,
                                   count, scale, theta
                                  ):
+    def normsqr_groups(flat_grads, flat_pinvs):
+        return jnp.sum(jnp.square(flat_grads / flat_pinvs))
+    
+    def average_groups(flat_grads1, flat_grads2):
+        return (flat_grads1 + flat_grads2) / 2
         
     grads_normsqr = normsqr_groups(new_grads, preconditioner)
     local_sqr = (normsqr_groups(prev_grads, preconditioner)
@@ -51,6 +56,11 @@ def compute_gradient_noise_scale(prev_grads, new_grads,
     biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
     biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
     return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+
+
+def flatten_and_concat(nested):
+    flat = jax.tree_util.tree_leaves(jax.tree_map(jnp.ravel, nested))
+    return jnp.concatenate(flat)
 
 
 # wrong but does not require storing previous iteration's gradients
@@ -322,25 +332,58 @@ def init_distributed_scalar():
     return distributed_arrays[0]  # return the first (and only) array
 
 
-def init_distributed_zeros_like(x):
+def init_distributed_zeros_like(x, start=None, end=None, percent=None, dtype=None):
+    """Initialize distributed zeros like input array with optional slicing.
+    
+    Args:
+        x: Input array/tree to match shape and dtype
+        start: Optional start index for first dimension slice
+        end: Optional end index for first dimension slice
+        percent: Optional percentage (0-100) of first dimension to keep
+        dtype: Optional dtype to override the input array's dtype (e.g., jnp.float32)
+        
+    Returns:
+        DistributedArray of zeros with optionally sliced shape
+        
+    Note:
+        Only one slicing method should be used at a time:
+        either (start,end) or percent, but not both.
+    """
+    if percent is not None and (start is not None or end is not None):
+        raise ValueError("Cannot specify both percent and start/end indices")
+        
     physical_mesh = get_global_physical_mesh(create_if_not_exist=True)
     mesh_shape = physical_mesh.shape
 
     def to_distributed_array(arr):
-        # Create abstract value matching input array's shape and dtype
-        aval = ShapedArray(arr.shape, arr.dtype)
+        # Calculate sliced shape
+        shape = list(arr.shape)
+        if percent is not None:
+            if not 0 <= percent <= 100:
+                raise ValueError("Percent must be between 0 and 100")
+            # Calculate number of elements to keep
+            n = int(round(shape[0] * percent / 100))
+            shape[0] = n
+        elif start is not None or end is not None:
+            # Only modify first dimension
+            shape[0] = end - start if end else len(arr) - start if start else end
+        
+        # Use provided dtype if specified, otherwise use input array's dtype
+        arr_dtype = dtype if dtype is not None else arr.dtype
+        
+        # Create abstract value matching sliced shape and dtype
+        aval = ShapedArray(tuple(shape), arr_dtype)
         
         # Create a replicated sharding spec
-        # For arrays (unlike scalars), we need to handle the actual shape
-        sharding = tuple(pxla.NoSharding() for _ in arr.shape)
+        sharding = tuple(pxla.NoSharding() for _ in shape)
         mesh_mapping = (pxla.Replicated(np.prod(mesh_shape)),)
         sharding_spec = pxla.ShardingSpec(
             sharding=sharding,
             mesh_mapping=mesh_mapping
         )
         
-        # Create zeros array with matching shape/dtype
-        zeros = jnp.zeros_like(arr)
+        # Create zeros array with sliced shape and specified dtype
+        zeros = jnp.zeros(shape, dtype=arr_dtype)
         
         # Convert to distributed array
         distributed_arrays = physical_mesh.shard_args_to_arrays(
@@ -351,6 +394,6 @@ def init_distributed_zeros_like(x):
         )
         return distributed_arrays[0]
     
-    # Apply the conversion to the entire pytree
+    # Apply the conversion to the entire pytree 
     return jax.tree_util.tree_map(to_distributed_array, x)
 
