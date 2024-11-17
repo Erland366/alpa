@@ -70,7 +70,7 @@ training:
   adam_beta2: 0.98
   weight_decay: 0.01
   smoothing: 0.9
-  copus_enabled: true
+  gns_enabled: true
   logging_steps: 50
   save_steps: 32
   eval_steps: 32

@@ -619,7 +619,7 @@ def main():
             return loss
         
         dropout_rng = variables.get('dropout_rng', None)
-        if yml_config.training.copus_enabled:
+        if yml_config.training.gns_enabled:
             prev_grads = variables.get('gns_store_grads', None)
             biased_sqr = variables.get('gns_biased_sqr', None)
             unbias_sqr = variables.get('gns_unbias_sqr', None)
@@ -633,7 +633,7 @@ def main():
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
 
-        if yml_config.training.copus_enabled:
+        if yml_config.training.gns_enabled:
             pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
             gradients = flatten_and_concat(extract_values_with_key_p(grad))
             preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
@@ -716,7 +716,7 @@ def main():
     last_time = time.time()
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
 
-    if yml_config.training.copus_enabled:
+    if yml_config.training.gns_enabled:
         gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10)
         gns.biased_sqr = init_distributed_scalar()
         gns.unbias_sqr = init_distributed_scalar()
@@ -811,7 +811,7 @@ def main():
             # logger.info(f'epoch: {epoch}, step: {step}')
             # logger.info(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
 
-            if yml_config.training.copus_enabled:
+            if yml_config.training.gns_enabled:
                 gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
                         train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
 

@@ -65,7 +65,7 @@ training:
   pretrain: false
   num_train_epochs: 10000000
   learning_rate: 1e-5
-  copus_enabled: true
+  gns_enabled: true
   scale_lr:
     enabled: true
     type: sqrt # linear, sqrt

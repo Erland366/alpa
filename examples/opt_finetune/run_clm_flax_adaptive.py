@@ -929,7 +929,7 @@ def main():
             return loss
 
         dropout_rng = variables.get('dropout_rng', None)
-        if yml_config.training.copus_enabled:
+        if yml_config.training.gns_enabled:
             prev_grads = variables.get('gns_store_grads', None)
             biased_sqr = variables.get('gns_biased_sqr', None)
             unbias_sqr = variables.get('gns_unbias_sqr', None)
@@ -962,7 +962,7 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
-        if yml_config.training.copus_enabled:
+        if yml_config.training.gns_enabled:
             pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
             gradients = flatten_and_concat(extract_values_with_key_p(grads))
             preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
@@ -1059,7 +1059,7 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
-    if yml_config.training.copus_enabled:
+    if yml_config.training.gns_enabled:
         gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10, dtype=jnp.float32 if dynamic_scale else None)
         gns.biased_sqr = init_distributed_scalar()
         gns.unbias_sqr = init_distributed_scalar()
@@ -1128,7 +1128,7 @@ def main():
             state, train_metric = p_train_step(state, batch, variables_dict)
             train_metrics.append(train_metric)
 
-            if yml_config.training.copus_enabled:
+            if yml_config.training.gns_enabled:
                 gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
                         train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
 
