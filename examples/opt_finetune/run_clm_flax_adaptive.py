@@ -96,7 +96,7 @@ with open(config_path, 'r') as file:
     yml_config = yaml.safe_load(file)
 yml_config = AddictDict(yml_config)
 
-alpa.init(cluster="ray", scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
+alpa.init(cluster="ray", copus_enabled=True, scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
           num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,
           namespace=yml_config.cluster_config.namespace)
 

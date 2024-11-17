@@ -95,7 +95,7 @@ def count_params(model):
 # alpa.init(cluster="ray")
 # alpa.init(cluster="ray", num_nodes=1, num_devices_per_node=2, namespace="alpa_default_space_vit")
 # alpa.init(cluster="ray", scheduler_address="http://127.0.0.1:8000")
-alpa.init(cluster="ray", scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
+alpa.init(cluster="ray", copus_enabled=True, scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
           num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,
           namespace=yml_config.cluster_config.namespace)
 
