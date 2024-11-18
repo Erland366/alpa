@@ -82,3 +82,5 @@ examples/BERT/cache/
 wandb/
 
 examples/opt_finetune/cache
+examples/ViT/cache
+examples/ViT/outputs

@@ -21,10 +21,10 @@ paths:
   # output_dir:  ./vit-base-patch16-imagenette
   # train_dir: imagenette2/train
   # validation_dir: imagenette2/val
-  output_dir:  ./vit-base-patch16-imagenet
+  output_dir:  ./outputs
   # output_dir: ./vit-huge-patch14-imagenet
-  train_dir: imagenet/train
-  validation_dir: imagenet/val
+  train_dir: ~/imagenet/train
+  validation_dir: ~/imagenet/val
   cache_dir: cache
 
 pollux_agent:
