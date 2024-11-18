@@ -685,12 +685,12 @@ def main():
 
     # Create parallel version of the train and eval step
     if yml_config.training.parallel_method.method == 'ShardParallel':
-        method = alpa.ShardParallel()
+        method = alpa.ShardParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
     elif yml_config.training.parallel_method.method == 'PipeshardParallel':
         stage_option = yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option
-        method = alpa.PipeshardParallel(stage_option=stage_option)
+        method = alpa.PipeshardParallel(stage_option=stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
     elif yml_config.training.parallel_method.method == 'DataParallel':
-        method = alpa.DataParallel()
+        method = alpa.DataParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
     elif yml_config.training.parallel_method.method == '3D':
         method = alpa.get_3d_parallel_method(num_micro_batches=yml_config.training.parallel_method.num_micro_batches,
                                              data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
