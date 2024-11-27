@@ -70,3 +70,8 @@ docs/tutorials
 
 # macOS temp files
 .DS_Store
+
+# datasets
+examples/ViT/imagenette2/*/*/*.JPEG
+examples/ViT/imagenette2/train/n01440764/ILSVRC2012_val_00000293.JPEG
+examples/ViT/imagenette2/train/n01440764/ILSVRC2012_val_00002138.JPEG
