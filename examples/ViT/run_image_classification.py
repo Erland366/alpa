@@ -28,20 +28,18 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
+import jax
+import jax.numpy as jnp
+import optax
+
 # for dataset and preprocessing
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from tqdm import tqdm
-
-import alpa
-from alpa.model.model_util import TrainState
-import jax
-import jax.numpy as jnp
-import optax
 import transformers
 from flax.training.common_utils import onehot
 from huggingface_hub import Repository
+from tqdm import tqdm
 from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING,
@@ -52,6 +50,9 @@ from transformers import (
     set_seed,
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
+
+import alpa
+from alpa.model.model_util import TrainState
 
 alpa.init(cluster="ray")
 logger = logging.getLogger(__name__)
@@ -64,7 +65,9 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 @dataclass
 class TrainingArguments:
     output_dir: str = field(
-        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+        metadata={
+            "help": "The output directory where the model predictions and checkpoints will be written."
+        },
     )
     overwrite_output_dir: bool = field(
         default=False,
@@ -76,33 +79,72 @@ class TrainingArguments:
         },
     )
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
-    do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
-    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
+    do_eval: bool = field(
+        default=False, metadata={"help": "Whether to run eval on the dev set."}
+    )
+    num_micro_batches: int = field(
+        default=1,
+        metadata={"help": "The number of micro batches for gradient accumulation."},
+    )
     per_device_train_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
-    learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
-    weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
-    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
-    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
-    adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
-    adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
-    warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
-    save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
-    eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
-    seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
+    learning_rate: float = field(
+        default=5e-5, metadata={"help": "The initial learning rate for AdamW."}
+    )
+    weight_decay: float = field(
+        default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."}
+    )
+    adam_beta1: float = field(
+        default=0.9, metadata={"help": "Beta1 for AdamW optimizer"}
+    )
+    adam_beta2: float = field(
+        default=0.999, metadata={"help": "Beta2 for AdamW optimizer"}
+    )
+    adam_epsilon: float = field(
+        default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."}
+    )
+    adafactor: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to replace AdamW by Adafactor."},
+    )
+    num_train_epochs: float = field(
+        default=3.0, metadata={"help": "Total number of training epochs to perform."}
+    )
+    warmup_steps: int = field(
+        default=0, metadata={"help": "Linear warmup over warmup_steps."}
+    )
+    logging_steps: int = field(
+        default=500, metadata={"help": "Log every X updates steps."}
+    )
+    save_steps: int = field(
+        default=500, metadata={"help": "Save checkpoint every X updates steps."}
+    )
+    eval_steps: int = field(
+        default=None, metadata={"help": "Run an evaluation every X steps."}
+    )
+    seed: int = field(
+        default=42,
+        metadata={"help": "Random seed that will be set at the beginning of training."},
+    )
     push_to_hub: bool = field(
-        default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
+        default=False,
+        metadata={
+            "help": "Whether or not to upload the trained model to the model hub after training."
+        },
     )
     hub_model_id: str = field(
-        default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
+        default=None,
+        metadata={
+            "help": "The name of the repository to keep in sync with the local `output_dir`."
+        },
     )
-    hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
+    hub_token: str = field(
+        default=None, metadata={"help": "The token to use to push to the Model Hub."}
+    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -140,13 +182,22 @@ class ModelArguments:
     )
     model_type: Optional[str] = field(
         default=None,
-        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
+        metadata={
+            "help": "If training from scratch, pass a model type from the list: "
+            + ", ".join(MODEL_TYPES)
+        },
     )
     config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+        default=None,
+        metadata={
+            "help": "Pretrained config name or path if not the same as model_name"
+        },
     )
     cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+        default=None,
+        metadata={
+            "help": "Where do you want to store the pretrained models downloaded from s3"
+        },
     )
     dtype: Optional[str] = field(
         default="float32",
@@ -167,6 +218,7 @@ class ModelArguments:
         },
     )
 
+
 @dataclass
 class DataTrainingArguments:
     """
@@ -174,12 +226,18 @@ class DataTrainingArguments:
     """
 
     train_dir: str = field(
-        metadata={"help": "Path to the root training directory which contains one subdirectory per class."}
+        metadata={
+            "help": "Path to the root training directory which contains one subdirectory per class."
+        }
     )
     validation_dir: str = field(
-        metadata={"help": "Path to the root validation directory which contains one subdirectory per class."},
+        metadata={
+            "help": "Path to the root validation directory which contains one subdirectory per class."
+        },
     )
-    image_size: Optional[int] = field(default=224, metadata={"help": " The size (resolution) of each image."})
+    image_size: Optional[int] = field(
+        default=224, metadata={"help": " The size (resolution) of each image."}
+    )
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -199,7 +257,8 @@ class DataTrainingArguments:
         },
     )
     overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+        default=False,
+        metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     preprocessing_num_workers: Optional[int] = field(
         default=None,
@@ -221,16 +280,26 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
 
 def create_learning_rate_fn(
-    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
+    train_ds_size: int,
+    train_batch_size: int,
+    num_train_epochs: int,
+    num_warmup_steps: int,
+    learning_rate: float,
 ) -> Callable[[int], jnp.array]:
     """Returns a linear warmup, linear_decay learning rate function."""
     steps_per_epoch = train_ds_size // train_batch_size
     num_train_steps = steps_per_epoch * num_train_epochs
-    warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
-    decay_fn = optax.linear_schedule(
-        init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps
     )
-    schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
+    decay_fn = optax.linear_schedule(
+        init_value=learning_rate,
+        end_value=0,
+        transition_steps=num_train_steps - num_warmup_steps,
+    )
+    schedule_fn = optax.join_schedules(
+        schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps]
+    )
     return schedule_fn
 
 
@@ -239,17 +308,23 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser(
+        (ModelArguments, DataTrainingArguments, TrainingArguments)
+    )
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1])
+        )
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_image_classification", model_args, data_args, framework="flax")
+    send_example_telemetry(
+        "run_image_classification", model_args, data_args, framework="flax"
+    )
 
     if (
         os.path.exists(training_args.output_dir)
@@ -285,7 +360,8 @@ def main():
     if training_args.push_to_hub:
         if training_args.hub_model_id is None:
             repo_name = get_full_repo_name(
-                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
+                Path(training_args.output_dir).absolute().name,
+                token=training_args.hub_token,
             )
         else:
             repo_name = training_args.hub_model_id
@@ -358,8 +434,12 @@ def main():
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
-    eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
+    train_batch_size = (
+        int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
+    )
+    eval_batch_size = (
+        int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
+    )
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
@@ -434,7 +514,9 @@ def main():
     )
 
     # Setup train state
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
+    state = TrainState.create(
+        apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None
+    )
 
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
@@ -442,7 +524,6 @@ def main():
 
     # Define gradient update step fn
     def train_step(state, batch):
-
         def compute_loss(params):
             labels = batch.pop("labels")
             logits = state.apply_fn(**batch, params=params, train=True)[0]
@@ -453,7 +534,10 @@ def main():
         loss, grad = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grad)
 
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        metrics = {
+            "loss": loss,
+            "learning_rate": linear_decay_lr_schedule_fn(state.step),
+        }
 
         return new_state, metrics
 
@@ -470,17 +554,19 @@ def main():
 
     # Create parallel version of the train and eval step
     method = alpa.Zero2Parallel()
-    p_train_step = alpa.parallelize(train_step,
-                                    method=method,
-                                    donate_argnums=(0,))
+    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
+    logger.info(
+        f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}"
+    )
+    logger.info(
+        f"  Total train batch size (w. parallel & distributed) = {train_batch_size}"
+    )
     logger.info(f"  Total optimization steps = {total_train_steps}")
 
     train_time = 0
@@ -496,7 +582,9 @@ def main():
         train_metrics = []
 
         steps_per_epoch = len(train_dataset) // train_batch_size
-        train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
+        train_step_progress_bar = tqdm(
+            total=steps_per_epoch, desc="Training...", position=1, leave=False
+        )
         # train
         for step, batch in enumerate(train_loader):
             state, train_metric = p_train_step(state, batch)
@@ -509,9 +597,11 @@ def main():
                 executable = p_train_step.get_last_executable()
                 executable.sync()
                 executable.dump_debug_info("alpa_debug_info")
-                epochs.write(f"Initial compilation completed. "
-                             f"Time elapsed: {time.time() - train_start:.2f} s")
-                             
+                epochs.write(
+                    f"Initial compilation completed. "
+                    f"Time elapsed: {time.time() - train_start:.2f} s"
+                )
+
             train_step_progress_bar.update(1)
 
         latency = time.time() - last_time
@@ -529,7 +619,9 @@ def main():
         # ======================== Evaluating ==============================
         eval_metrics = []
         eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-        eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
+        eval_step_progress_bar = tqdm(
+            total=eval_steps, desc="Evaluating...", position=2, leave=False
+        )
         for batch in eval_loader:
             # Model forward
             metrics = p_eval_step(state.params, batch)
@@ -558,7 +650,9 @@ def main():
         # Save metrics
         if has_tensorboard and jax.process_index() == 0:
             cur_step = epoch * (len(train_dataset) // train_batch_size)
-            write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+            write_metric(
+                summary_writer, train_metrics, eval_metrics, train_time, cur_step
+            )
 
         # save checkpoint after each epoch and push checkpoint to the hub
         if jax.process_index() == 0:
@@ -566,7 +660,10 @@ def main():
             params = alpa.util.map_to_nparray(state.params)
             model.save_pretrained(training_args.output_dir, params=params)
             if training_args.push_to_hub:
-                repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                repo.push_to_hub(
+                    commit_message=f"Saving weights and logs of step {cur_step}",
+                    blocking=False,
+                )
 
 
 if __name__ == "__main__":
