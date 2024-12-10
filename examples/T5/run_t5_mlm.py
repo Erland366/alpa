@@ -1,19 +1,16 @@
+# You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
+import functools
 import json
 import math
 import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-
-# You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
-import functools
-import wandb
 from enum import Enum
 from itertools import chain
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-import alpa
 import datasets
 import flax
 import jax
@@ -21,8 +18,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tensorflow as tf
-from alpa.model.model_util import DynamicScale, TrainState
-from datasets import load_dataset, DatasetDict
+import wandb
+from datasets import DatasetDict, load_dataset
+from dotenv import load_dotenv
 from flax import jax_utils, traverse_util
 from flax.jax_utils import pad_shard_unpad
 from flax.training import train_state
@@ -43,7 +41,9 @@ from transformers import (
     set_seed,
 )
 from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
-from dotenv import load_dotenv
+
+import alpa
+from alpa.model.model_util import DynamicScale, TrainState
 
 load_dotenv()
 
@@ -58,12 +58,7 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
 def instantiate_wandb(run_name: Optional[str] = None, config: Union[Dict, None] = None):
-    wandb.init(
-        project="alpafelafax",
-        entity=None,
-        name=run_name,
-        config=config
-    )
+    wandb.init(project="alpafelafax", entity=None, name=run_name, config=config)
 
 
 def maybe_stop_wandb():
@@ -139,7 +134,7 @@ class TrainingArguments:
         default=1, metadata={"help": "Log every X updates steps."}
     )
     save_steps: int = field(
-        default=500, metadata={"help": "Save checkpoint every X updates steps."}
+        default=99999, metadata={"help": "Save checkpoint every X updates steps."}
     )
     eval_steps: int = field(
         default=100, metadata={"help": "Run an evaluation every X steps."}
@@ -331,6 +326,10 @@ class DataTrainingArguments:
     mean_noise_span_length: float = field(
         default=3.0,
         metadata={"help": "Mean span length of masked tokens"},
+    )
+    use_data_sample: bool = field(
+        default=False,
+        metadata={"help": "Whether to use a sample of the dataset -> Erland/oscar_sampled_1000."},
     )
 
     def __post_init__(self):
@@ -622,10 +621,15 @@ def generate_batch_splits(
 
 
 def write_train_metric_wandb(train_metrics, train_time, step):
+    train_metrics = alpa.util.get_metrics(train_metrics)
     for key, vals in train_metrics.items():
         tag = f"train_{key}"
-        for i, val in enumerate(vals):
-            wandb.log({tag: val}, step - len(vals) + i + 1)
+        if hasattr(vals, "__iter__"):
+            for i, val in enumerate(vals):
+                wandb.log({tag: val}, step - len(vals) + i + 1)
+        else:
+            wandb.log({tag: val}, step)
+    wandb.log({"train_time": train_time}, step)
 
 
 def write_eval_metric_wandb(eval_metrics, step):
@@ -979,8 +983,8 @@ def main():
                 train_time += time.time() - train_start
                 # if has_tensorboard and jax.process_index() == 0:
                 #     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
-                if jax.process_index() == 0:
-                    write_train_metric_wandb(train_metrics, train_time, cur_step)
+                # if jax.process_index() == 0:
+                #     write_train_metric_wandb(train_metrics, train_time, cur_step)
 
                 epochs.write(
                     f"Step... ({cur_step} | Loss: {train_metric['loss']}, Learning Rate:"
@@ -1039,8 +1043,8 @@ def main():
                 # Save metrics
                 # if has_tensorboard and jax.process_index() == 0:
                 #     write_eval_metric(summary_writer, eval_metrics, cur_step)
-                if jax.process_index() == 0:
-                    write_eval_metric_wandb(eval_metrics, cur_step)
+                # if jax.process_index() == 0:
+                #    write_eval_metric_wandb(eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub

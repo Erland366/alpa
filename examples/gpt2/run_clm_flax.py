@@ -21,6 +21,7 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
+import functools
 import json
 import logging
 import math
@@ -29,27 +30,25 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-import functools
 from itertools import chain
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import datasets
-import numpy as np
-from datasets import Dataset, load_dataset
-from tqdm import tqdm
-
-import alpa
-from alpa.model.model_util import DynamicScale, TrainState
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-import transformers
 import tensorflow as tf
+import transformers
+import wandb
+from datasets import Dataset, load_dataset
+from dotenv import load_dotenv
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import onehot, shard, shard_prng_key
 from huggingface_hub import Repository
+from tqdm import tqdm
 from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_CAUSAL_LM_MAPPING,
@@ -58,24 +57,50 @@ from transformers import (
     FlaxAutoModelForCausalLM,
     HfArgumentParser,
     is_tensorboard_available,
+    is_wandb_available,
     set_seed,
 )
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
+import alpa
+from alpa.model.model_util import DynamicScale, TrainState
+
+load_dotenv()
+
 alpa.init(cluster="ray")
-tf.config.experimental.set_visible_devices([], 'GPU')
+tf.config.experimental.set_visible_devices([], "GPU")
 
 logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+def instantiate_wandb(run_name: Optional[str] = None, config: Union[Dict, None] = None):
+    wandb.init(project="alpafelafax", entity=None, name=run_name, config=config)
+
+
+def maybe_stop_wandb():
+    try:
+        if wandb.run:
+            wandb.finish()
+    except Exception as _:
+        pass
+
+def login_wandb(
+    environ_name: str = "WANDB_API_KEY", token: Optional[str] = None, **kwargs
+):
+    if token is None:
+        token = os.getenv(environ_name)
+        logger.debug(f"Use token from environment variable {environ_name}")
+    wandb.login(key=token, **kwargs)
 
 @dataclass
 class TrainingArguments:
     output_dir: str = field(
-        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+        metadata={
+            "help": "The output directory where the model predictions and checkpoints will be written."
+        },
     )
     overwrite_output_dir: bool = field(
         default=False,
@@ -87,33 +112,72 @@ class TrainingArguments:
         },
     )
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
-    do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
+    do_eval: bool = field(
+        default=False, metadata={"help": "Whether to run eval on the dev set."}
+    )
     per_device_train_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
-    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
-    learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
-    weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
-    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
-    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
-    adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
-    adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
-    warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
-    save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
-    eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
-    seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
+    num_micro_batches: int = field(
+        default=1,
+        metadata={"help": "The number of micro batches for gradient accumulation."},
+    )
+    learning_rate: float = field(
+        default=5e-5, metadata={"help": "The initial learning rate for AdamW."}
+    )
+    weight_decay: float = field(
+        default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."}
+    )
+    adam_beta1: float = field(
+        default=0.9, metadata={"help": "Beta1 for AdamW optimizer"}
+    )
+    adam_beta2: float = field(
+        default=0.999, metadata={"help": "Beta2 for AdamW optimizer"}
+    )
+    adam_epsilon: float = field(
+        default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."}
+    )
+    adafactor: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to replace AdamW by Adafactor."},
+    )
+    num_train_epochs: float = field(
+        default=3.0, metadata={"help": "Total number of training epochs to perform."}
+    )
+    warmup_steps: int = field(
+        default=0, metadata={"help": "Linear warmup over warmup_steps."}
+    )
+    logging_steps: int = field(
+        default=500, metadata={"help": "Log every X updates steps."}
+    )
+    save_steps: int = field(
+        default=500, metadata={"help": "Save checkpoint every X updates steps."}
+    )
+    eval_steps: int = field(
+        default=None, metadata={"help": "Run an evaluation every X steps."}
+    )
+    seed: int = field(
+        default=42,
+        metadata={"help": "Random seed that will be set at the beginning of training."},
+    )
     push_to_hub: bool = field(
-        default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
+        default=False,
+        metadata={
+            "help": "Whether or not to upload the trained model to the model hub after training."
+        },
     )
     hub_model_id: str = field(
-        default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
+        default=None,
+        metadata={
+            "help": "The name of the repository to keep in sync with the local `output_dir`."
+        },
     )
-    hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
+    hub_token: str = field(
+        default=None, metadata={"help": "The token to use to push to the Model Hub."}
+    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -151,20 +215,34 @@ class ModelArguments:
     )
     model_type: Optional[str] = field(
         default=None,
-        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
+        metadata={
+            "help": "If training from scratch, pass a model type from the list: "
+            + ", ".join(MODEL_TYPES)
+        },
     )
     config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+        default=None,
+        metadata={
+            "help": "Pretrained config name or path if not the same as model_name"
+        },
     )
     tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+        default=None,
+        metadata={
+            "help": "Pretrained tokenizer name or path if not the same as model_name"
+        },
     )
     cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+        default=None,
+        metadata={
+            "help": "Where do you want to store the pretrained models downloaded from s3"
+        },
     )
     use_fast_tokenizer: bool = field(
         default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+        metadata={
+            "help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."
+        },
     )
     dtype: Optional[str] = field(
         default="float32",
@@ -193,15 +271,23 @@ class DataTrainingArguments:
     """
 
     dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=None,
+        metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
     dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+        default=None,
+        metadata={
+            "help": "The configuration name of the dataset to use (via the datasets library)."
+        },
     )
-    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
+    train_file: Optional[str] = field(
+        default=None, metadata={"help": "The input training data file (a text file)."}
+    )
     validation_file: Optional[str] = field(
         default=None,
-        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
+        metadata={
+            "help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."
+        },
     )
     max_train_samples: Optional[int] = field(
         default=None,
@@ -222,7 +308,8 @@ class DataTrainingArguments:
         },
     )
     overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+        default=False,
+        metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     validation_split_percentage: Optional[int] = field(
         default=5,
@@ -241,30 +328,65 @@ class DataTrainingArguments:
         },
     )
     overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+        default=False,
+        metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     preprocessing_num_workers: Optional[int] = field(
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     keep_linebreaks: bool = field(
-        default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
+        default=True,
+        metadata={"help": "Whether to keep line breaks when using TXT files or not."},
+    )
+    use_data_sample: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use a sample of the dataset -> Erland/oscar_sampled_1000."
+        },
     )
 
     def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
+        if self.use_data_sample:
+            self.dataset_name = "Erland/oscar_sampled_1000"
+            logger.info(
+                "Using a sample of the dataset -> Erland/oscar_sampled_1000. This is useful for debugging."
+            )
+            delattr(self, "use_data_sample")
+            delattr(self, "dataset_config_name")
+
+        if (
+            self.dataset_name is None
+            and self.train_file is None
+            and self.validation_file is None
+        ):
+            raise ValueError(
+                "Need either a dataset name or a training/validation file."
+            )
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
+                assert extension in [
+                    "csv",
+                    "json",
+                    "txt",
+                ], "`train_file` should be a csv, a json or a txt file."
             if self.validation_file is not None:
                 extension = self.validation_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
+                assert extension in [
+                    "csv",
+                    "json",
+                    "txt",
+                ], "`validation_file` should be a csv, a json or a txt file."
 
 
-def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
-                min_batch_size: int, shuffle: bool = False):
+def data_loader(
+    rng: jax.random.PRNGKey,
+    dataset: Dataset,
+    batch_size: int,
+    min_batch_size: int,
+    shuffle: bool = False,
+):
     """
     Returns batches of size `batch_size` from truncated `dataset`, sharded over all local devices.
     Shuffle batches if `shuffle` is `True`.
@@ -274,15 +396,69 @@ def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
         batch_size = len(dataset) // min_batch_size * min_batch_size
 
     data_collator = transformers.DefaultDataCollator("np")
-    tf_dataset = dataset.to_tf_dataset(batch_size=batch_size,
-                                       columns=dataset.column_names,
-                                       collate_fn=data_collator,
-                                       shuffle=shuffle,
-                                       drop_remainder=True)
+    tf_dataset = dataset.to_tf_dataset(
+        batch_size=batch_size,
+        columns=dataset.column_names,
+        collate_fn=data_collator,
+        shuffle=shuffle,
+        drop_remainder=True,
+    )
 
     for batch in tf_dataset:
         batch = {k: v._numpy() for k, v in batch.items()}
         yield batch
+
+
+def write_train_metric_wandb(train_metrics, train_time, step):
+    """
+    Write training metrics to W&B ensuring steps are monotonically increasing.
+    
+    Args:
+        train_metrics: Dictionary of metrics from training
+        train_time: Time taken for training
+        step: Current global step
+    """
+    train_metrics = alpa.util.get_metrics(train_metrics)
+    
+    # Handle metrics that are arrays/iterables
+    max_len = 1
+    for vals in train_metrics.values():
+        if hasattr(vals, "__iter__"):
+            max_len = max(max_len, len(vals))
+    
+    # Create a dictionary to accumulate metrics for each step
+    step_metrics = {i: {} for i in range(step - max_len + 1, step + 1)}
+    
+    # Organize metrics by step
+    for key, vals in train_metrics.items():
+        tag = f"train_{key}"
+        if hasattr(vals, "__iter__"):
+            for i, val in enumerate(vals):
+                current_step = step - len(vals) + i + 1
+                if current_step <= step:  # Only log if step is valid
+                    step_metrics[current_step][tag] = val
+        else:
+            step_metrics[step][tag] = vals
+    
+    # Log accumulated metrics for each step in order
+    for current_step in sorted(step_metrics.keys()):
+        if step_metrics[current_step]:  # Only log if there are metrics
+            wandb.log(step_metrics[current_step], step=current_step)
+    
+    # Log training time at the current step
+    wandb.log({"train_time": train_time}, step=step)
+
+def write_eval_metric_wandb(eval_metrics, step):
+    """
+    Write evaluation metrics to W&B.
+    
+    Args:
+        eval_metrics: Dictionary of evaluation metrics
+        step: Current global step
+    """
+    eval_dict = {f"eval_{metric_name}": value 
+                 for metric_name, value in eval_metrics.items()}
+    wandb.log(eval_dict, step=step)
 
 
 def write_train_metric(summary_writer, train_metrics, train_time, step):
@@ -301,16 +477,26 @@ def write_eval_metric(summary_writer, eval_metrics, step):
 
 
 def create_learning_rate_fn(
-    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
+    train_ds_size: int,
+    train_batch_size: int,
+    num_train_epochs: int,
+    num_warmup_steps: int,
+    learning_rate: float,
 ) -> Callable[[int], jnp.array]:
     """Returns a linear warmup, linear_decay learning rate function."""
     steps_per_epoch = train_ds_size // train_batch_size
     num_train_steps = steps_per_epoch * num_train_epochs
-    warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
-    decay_fn = optax.linear_schedule(
-        init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps
     )
-    schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
+    decay_fn = optax.linear_schedule(
+        init_value=learning_rate,
+        end_value=0,
+        transition_steps=num_train_steps - num_warmup_steps,
+    )
+    schedule_fn = optax.join_schedules(
+        schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps]
+    )
     return schedule_fn
 
 
@@ -319,11 +505,20 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser(
+        (ModelArguments, DataTrainingArguments, TrainingArguments)
+    )
+
+    parser_dict = vars(parser)
+    login_wandb()
+    instantiate_wandb(config=parser_dict)
+    logger.info("Logged in to wandb")
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1])
+        )
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -363,7 +558,8 @@ def main():
     if training_args.push_to_hub:
         if training_args.hub_model_id is None:
             repo_name = get_full_repo_name(
-                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
+                Path(training_args.output_dir).absolute().name,
+                token=training_args.hub_token,
             )
         else:
             repo_name = training_args.hub_model_id
@@ -507,7 +703,9 @@ def main():
     text_column_name = "text" if "text" in column_names else column_names[0]
 
     # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
-    tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+    tok_logger = transformers.utils.logging.get_logger(
+        "transformers.tokenization_utils_base"
+    )
 
     def tokenize_function(examples):
         with CaptureLogger(tok_logger) as cl:
@@ -617,8 +815,12 @@ def main():
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
-    eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
+    train_batch_size = (
+        int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
+    )
+    eval_batch_size = (
+        int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
+    )
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
@@ -641,7 +843,11 @@ def main():
     def decay_mask_fn(params):
         flat_params = traverse_util.flatten_dict(params)
         flat_mask = {
-            path: (path[-1] != "bias" and path[-2:] not in [("ln_1", "scale"), ("ln_2", "scale"), ("ln_f", "scale")])
+            path: (
+                path[-1] != "bias"
+                and path[-2:]
+                not in [("ln_1", "scale"), ("ln_2", "scale"), ("ln_f", "scale")]
+            )
             for path in flat_params
         }
         return traverse_util.unflatten_dict(flat_mask)
@@ -662,7 +868,8 @@ def main():
                 b2=training_args.adam_beta2,
                 eps=training_args.adam_epsilon,
                 weight_decay=training_args.weight_decay,
-                mask=decay_mask_fn)
+                mask=decay_mask_fn,
+            ),
         )
 
     # Setup train state
@@ -673,21 +880,31 @@ def main():
         alpa.global_config.flax_always_use_fp16_embedding = True
     else:
         use_master_copy = dynamic_scale = None
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
-                              dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
+    state = TrainState.create(
+        apply_fn=model.__call__,
+        params=model.params,
+        tx=optimizer,
+        dynamic_scale=dynamic_scale,
+        use_master_copy=use_master_copy,
+    )
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
-        loss = optax.softmax_cross_entropy(shift_logits, onehot(shift_labels, shift_logits.shape[-1]))
+        loss = optax.softmax_cross_entropy(
+            shift_logits, onehot(shift_labels, shift_logits.shape[-1])
+        )
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, batch):
+    def train_step(state, batch, dropout_rng):
+        dropout_rng = jax.random.fold_in(dropout_rng, state.step)
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, train=True)[0]
+            logits = state.apply_fn(
+                **batch, params=params, train=True, dropout_rng=dropout_rng
+            )[0]
             loss = loss_fn(logits, labels)
             return loss
 
@@ -705,18 +922,26 @@ def main():
             new_state = new_state.replace(
                 opt_state=jax.tree_map(
                     functools.partial(jnp.where, is_fin),
-                    new_state.opt_state, state.opt_state),
+                    new_state.opt_state,
+                    state.opt_state,
+                ),
                 params=jax.tree_map(
-                    functools.partial(jnp.where, is_fin),
-                    new_state.params, state.params),
+                    functools.partial(jnp.where, is_fin), new_state.params, state.params
+                ),
                 master_copy=jax.tree_map(
                     functools.partial(jnp.where, is_fin),
-                    new_state.master_copy, state.master_copy),
-                dynamic_scale=dynamic_scale)
+                    new_state.master_copy,
+                    state.master_copy,
+                ),
+                dynamic_scale=dynamic_scale,
+            )
 
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        metrics = {
+            "loss": loss,
+            "learning_rate": linear_decay_lr_schedule_fn(state.step),
+        }
 
-        return new_state, metrics
+        return new_state, metrics, dropout_rng
 
     # Define eval fn
     def eval_step(params, batch):
@@ -730,9 +955,7 @@ def main():
 
     # Create parallel version of the train and eval step
     method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
-    p_train_step = alpa.parallelize(train_step,
-                                    method=method,
-                                    donate_argnums=(0,))
+    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)
 
     min_batch_size = alpa.get_global_num_devices() * training_args.num_micro_batches
@@ -741,8 +964,12 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
-    logger.info(f"  Batch size per device (w. accumulation) = {training_args.per_device_train_batch_size}")
-    logger.info(f"  Global train batch size (w. parallel & distributed) = {train_batch_size}")
+    logger.info(
+        f"  Batch size per device (w. accumulation) = {training_args.per_device_train_batch_size}"
+    )
+    logger.info(
+        f"  Global train batch size (w. parallel & distributed) = {train_batch_size}"
+    )
     logger.info(f"  Total optimization steps = {total_train_steps}")
 
     train_time = 0
@@ -762,12 +989,16 @@ def main():
         rng, input_rng = jax.random.split(rng)
 
         # Generate an epoch by shuffling sampling indices from the train dataset
-        train_loader = data_loader(input_rng, train_dataset, train_batch_size, min_batch_size, shuffle=True)
+        train_loader = data_loader(
+            input_rng, train_dataset, train_batch_size, min_batch_size, shuffle=True
+        )
         steps_per_epoch = len(train_dataset) // train_batch_size
         # train
-        for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
+        for step in tqdm(
+            range(steps_per_epoch), desc="Training...", position=1, leave=False
+        ):
             batch = next(train_loader)
-            state, train_metric = p_train_step(state, batch)
+            state, train_metric, dropout_rng = p_train_step(state, batch, dropout_rng)
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
@@ -777,8 +1008,10 @@ def main():
                 executable = p_train_step.get_last_executable()
                 executable.sync()
                 executable.dump_debug_info("alpa_debug_info")
-                epochs.write(f"Initial compilation completed. "
-                             f"Time elapsed: {time.time() - train_start:.2f} s")
+                epochs.write(
+                    f"Initial compilation completed. "
+                    f"Time elapsed: {time.time() - train_start:.2f} s"
+                )
 
             step_ct += 1
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
@@ -792,16 +1025,21 @@ def main():
                     hidden_size=config.hidden_size,
                     vocab_size=config.vocab_size,
                     num_gpus=alpa.get_global_num_devices(),
-                    latency=latency)
+                    latency=latency,
+                )
                 step_ct = 0
 
-                #print(f"driver latency: {latency:.2f}, "
+                # print(f"driver latency: {latency:.2f}, "
                 #      f"worker latency: {executable.get_execution_time_costs()[-1]:.2f}")
 
                 # Save metrics
                 train_time += time.time() - train_start
                 if has_tensorboard:
-                    write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+                    write_train_metric(
+                        summary_writer, train_metrics, train_time, cur_step
+                    )
+                if is_wandb_available():
+                    write_train_metric_wandb(train_metrics, train_time, cur_step)
 
                 train_metric = jax.tree_map(np.mean, train_metric)
 
@@ -819,9 +1057,13 @@ def main():
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
                 # ======================== Evaluating ==============================
                 eval_metrics = []
-                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size, min_batch_size)
+                eval_loader = data_loader(
+                    input_rng, eval_dataset, eval_batch_size, min_batch_size
+                )
                 eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+                for _ in tqdm(
+                    range(eval_steps), desc="Evaluating...", position=2, leave=False
+                ):
                     # Model forward
                     batch = next(eval_loader)
                     metrics = p_eval_step(state.params, batch)
@@ -852,6 +1094,8 @@ def main():
                 # Save metrics
                 if has_tensorboard:
                     write_eval_metric(summary_writer, eval_metrics, cur_step)
+                if is_wandb_available():
+                    write_eval_metric_wandb(eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -860,12 +1104,17 @@ def main():
                 model.save_pretrained(training_args.output_dir, params=params)
                 tokenizer.save_pretrained(training_args.output_dir)
                 if training_args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                    repo.push_to_hub(
+                        commit_message=f"Saving weights and logs of step {cur_step}",
+                        blocking=False,
+                    )
 
     # Eval after training
     if training_args.do_eval:
         eval_metrics = []
-        eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size, min_batch_size)
+        eval_loader = data_loader(
+            input_rng, eval_dataset, eval_batch_size, min_batch_size
+        )
         eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
         for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
             # Model forward
@@ -882,7 +1131,9 @@ def main():
         except OverflowError:
             eval_metrics["perplexity"] = float("inf")
 
-        eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
+        eval_metrics = {
+            f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()
+        }
         path = os.path.join(training_args.output_dir, "eval_results.json")
         with open(path, "w") as f:
             json.dump(eval_metrics, f, indent=4, sort_keys=True)

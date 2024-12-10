@@ -1,0 +1,4 @@
+from transformers import FLAX_MODEL_FOR_CAUSAL_LM_MAPPING
+
+
+print(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING)
