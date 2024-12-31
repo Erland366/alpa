@@ -1037,9 +1037,7 @@ def main():
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step,
-                                   method=alpa.FollowParallel(
-                                       p_train_step, num_micro_batches=eval_num_micro_batches))
+    p_eval_step = alpa.parallelize(eval_step)
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -1079,7 +1077,9 @@ def main():
         for step, batch in enumerate(train_loader):
             batch = process_batch(batch)
 
-            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
+            variables_dict = {'dropout_rng': dropout_rng}
+            if yml_config.training.gns_enabled:
+                variables_dict.update({'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta})
 
             if pollux_agent.reallocation_approaching:
                 p_train_step.get_last_executable().sync()
@@ -1178,6 +1178,7 @@ def main():
                 last_time = time.time()
 
             if yml_config.evaluation.enabled:
+                pollux_agent.is_evaluating = True
                 if cur_step % training_args.eval_steps == 0 and cur_step > 0:
                     # ======================== Evaluating ==============================
                     eval_metrics = []
@@ -1193,7 +1194,7 @@ def main():
                         if dump_debug_info_eval_step:
                             dump_debug_info_eval_step = False
                             executable = p_eval_step.get_last_executable()
-                            executable.dump_debug_info("alpa_debug_info")
+                            executable.dump_debug_info("alpa_debug_info_eval")
 
                     # normalize eval metrics
                     eval_metrics = alpa.util.get_metrics(eval_metrics)
@@ -1210,6 +1211,12 @@ def main():
                         f" {eval_metrics['perplexity']})"
                     )
                     epochs.write(desc)
+                    
+                    wandb.log({
+                        "eval_loss": eval_metrics['loss'],
+                        "eval_acc": eval_metrics['perplexity'],
+                        "epoch": cur_step / steps_per_epoch
+                                })
 
                     # Save metrics
                     if has_tensorboard:
@@ -1224,6 +1231,7 @@ def main():
                     tokenizer.save_pretrained(training_args.output_dir)
                     if training_args.push_to_hub:
                         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                pollux_agent.is_evaluating = False
 
     # # Eval after training
     # if training_args.do_eval:

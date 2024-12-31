@@ -749,7 +749,9 @@ def main():
             # exec_time = time.perf_counter()
             
 
-            variables_dict = {'dropout_rng': dropout_rng, 'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta}
+            variables_dict = {'dropout_rng': dropout_rng}
+            if yml_config.training.gns_enabled:
+                variables_dict.update({'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta})
             #state, train_metric = p_train_step(state, batch, dropout_rng, gns.store_grads, 
             #                                    gns.biased_sqr, gns.unbias_sqr, gns.biased_var, gns.unbias_var, count, scale, theta)
 
@@ -850,6 +852,7 @@ def main():
 
         # # ======================== Evaluating ==============================
         if yml_config.evaluation.enabled:
+            pollux_agent.is_evaluating = True
             eval_metrics = []
             eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
             eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
@@ -861,7 +864,7 @@ def main():
                 if dump_debug_info_eval_step:
                     dump_debug_info_eval_step = False
                     executable = p_eval_step.get_last_executable()
-                    executable.dump_debug_info("alpa_debug_info")
+                    executable.dump_debug_info("alpa_debug_info_eval")
 
                 eval_step_progress_bar.update(1)
 
@@ -871,6 +874,12 @@ def main():
 
             logger.info(f"eval_loss: {eval_metrics['loss'].item()}")
             logger.info(f"eval_acc: {eval_metrics['accuracy'].item()}")
+            
+            wandb.log({
+                "eval_loss": eval_metrics['loss'].item(),
+                "eval_acc": eval_metrics['accuracy'].item(),
+                "epoch": epoch
+                       })
 
             # Print metrics and update progress bar
             eval_step_progress_bar.close()
@@ -893,6 +902,7 @@ def main():
                 model.save_pretrained(training_args.output_dir, params=params)
                 if training_args.push_to_hub:
                     repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+            pollux_agent.is_evaluating = False
 
     
 

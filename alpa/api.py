@@ -145,14 +145,14 @@ class ParallelizedFunc:
     def __call__(self, *args):
         """Launch the computation on the driver."""
         # if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
-        if pollux_agent.enabled:
+        if pollux_agent.enabled and not pollux_agent.is_evaluating:
             compil_start = time.perf_counter()
 
         # compilation usually ends after the below line, but the first iteration (executable.launch_on_driver) takes long
         executable, _, out_tree, args_flat = (
             self._decode_args_and_get_executable(*args))
 
-        if pollux_agent.enabled:
+        if pollux_agent.enabled and not pollux_agent.is_evaluating:
             was_recompilation_of_seen_config = False
             
             if pollux_agent.get_current_config() in pollux_agent.t_compilation.keys():
@@ -168,7 +168,7 @@ class ParallelizedFunc:
 
         unflattened_out_tree = tree_unflatten(out_tree(), out)
 
-        if pollux_agent.enabled:
+        if pollux_agent.enabled and not pollux_agent.is_evaluating:
             if was_recompilation_of_seen_config:
                 executable.sync()
                 compil_time = time.perf_counter() - compil_start
