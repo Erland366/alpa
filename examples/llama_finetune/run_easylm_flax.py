@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import os
+import typing
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -45,8 +46,11 @@ import datasets
 import numpy as np
 from datasets import Dataset
 from tqdm import tqdm
+from datasets import load_dataset
+from transformers.testing_utils import CaptureLogger
 
 import alpa
+from itertools import chain
 from alpa.model.model_util import DynamicScale, TrainState
 from alpa import ManualShardingOption
 import jax
@@ -57,7 +61,7 @@ import transformers
 from transformers.utils import get_full_repo_name, send_example_telemetry
 import tensorflow as tf
 from flax import traverse_util
-from optax import tree_map_params
+# from optax import tree_map_params
 from huggingface_hub import Repository
 from transformers import (
     FLAX_MODEL_FOR_CAUSAL_LM_MAPPING,
@@ -65,8 +69,10 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
+from dotenv import load_dotenv
 
 alpa.init(cluster="ray")
+load_dotenv()
 
 tf.config.experimental.set_visible_devices([], 'GPU')
 
@@ -84,6 +90,178 @@ MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 IGNORE_TOKEN_ID = -100
 
+
+import jax
+from optax._src import base
+import numpy as np
+
+# def tree_map_params(
+#     tx, fn, tree, maybe_tree_pspec, transform_non_params
+# ):
+#     """
+#     Replacement for optax.tree_map_params for optax 0.1.4.
+
+#     Applies `fn` to leaves of `tree` based on `maybe_tree_pspec`. If a
+#     corresponding path exists in `maybe_tree_pspec`, the `PartitionSpec` from
+#     it is passed as the second argument to `fn`. Otherwise,
+#     `transform_non_params` is used if a value in `maybe_tree_pspec` is not
+#     a PyTree.
+
+#     Args:
+#       tx: Optax GradientTransformation (used to detect parameter structures).
+#       fn: A function taking two arguments, a leaf from `tree` and optionally
+#           a `PartitionSpec` or None.
+#       tree: The PyTree to traverse.
+#       maybe_tree_pspec: A PyTree with a structure compatible with `tree`. Each
+#           leaf can be a `PartitionSpec` or None. If `maybe_tree_pspec` is None,
+#           it defaults to a tree of `None` values with the same structure as `tree`.
+#       transform_non_params: A function to apply when a leaf in
+#           `maybe_tree_pspec` is not a PartitionSpec and not a PyTree.
+
+#     Returns:
+#       A new PyTree with the same structure as `tree`, where leaves are replaced
+#       by the results of applying `fn`.
+#     """
+
+#     def _is_param(value):
+#         """Checks if a value is a likely parameter (array or scalar)."""
+#         return isinstance(value, (np.ndarray, jax.Array, float, int, complex))
+
+#     def _inner_map(subtree, maybe_subtree_pspec, path):
+#       """Recursive helper function for tree_map_params_optax_0_1_4."""
+#       if maybe_subtree_pspec is None:
+#           maybe_subtree_pspec = jax.tree_util.tree_map(lambda _: None, subtree)
+
+#       # Base case: leaf node
+#       if not isinstance(subtree, (tuple, list, dict)):
+#           if isinstance(maybe_subtree_pspec, base.PartitionSpec):
+#               return fn(subtree, maybe_subtree_pspec)
+#           elif maybe_subtree_pspec is None and _is_param(subtree):
+#               return fn(subtree, None)
+#           else:
+#               return transform_non_params(subtree)
+
+#       # Recursive case: nested structure
+#       if isinstance(subtree, tuple):
+#           return tuple(
+#               _inner_map(child, maybe_subtree_pspec[i], path + (i,))
+#               for i, child in enumerate(subtree)
+#           )
+#       elif isinstance(subtree, list):
+#           return list(
+#               _inner_map(child, maybe_subtree_pspec[i], path + (i,))
+#               for i, child in enumerate(subtree)
+#           )
+#       elif isinstance(subtree, dict):
+#           return {
+#               key: _inner_map(
+#                   subtree[key],
+#                   maybe_subtree_pspec.get(key, None),
+#                   path + (key,),
+#               )
+#               for key in subtree
+#           }
+#       else:
+#           raise ValueError(
+#               f"Unexpected subtree type: {type(subtree)} at path {path}"
+#           )
+
+#     return _inner_map(tree, maybe_tree_pspec, ())
+
+from typing import Any, Optional, Protocol, Tuple, Union, cast
+
+
+@jax.tree_util.register_pytree_node_class
+class _ParamsPlaceholder:
+
+  def tree_flatten(self):
+    return ((), None)
+
+  @classmethod
+  def tree_unflatten(cls, aux, children):
+    del aux, children
+    return cls()
+
+@typing.runtime_checkable
+class Initable(Protocol):
+  """An object with an init function."""
+
+  def init(self, params):
+    """Calling the init for given parameters returns a fresh opt state."""
+
+def tree_map_params(
+    initable,
+    f,
+    state,
+    /,
+    *rest,
+    transform_non_params = None,
+    is_leaf = None,
+):
+  """Apply a callable over all params in the given optimizer state.
+
+  This function exists to help construct partition specs over optimizer
+  states, in the case that a partition spec is already known for the parameters.
+
+  For example, the following will replace all optimizer state parameter trees
+  with copies of the given partition spec instead. The argument
+  `transform_non_params` can be used to replace any remaining fields as
+  required, in this case, we replace those fields by None.
+
+  >>> params, specs = jnp.array(0.), jnp.array(0.)  # Trees with the same shape
+  >>> opt = optax.sgd(1e-3)
+  >>> state = opt.init(params)
+  >>> opt_specs = optax.tree_map_params(
+  ...     opt,
+  ...     lambda _, spec: spec,
+  ...     state,
+  ...     specs,
+  ...     transform_non_params=lambda _: None,
+  ...     )
+
+  Args:
+    initable: A callable taking parameters and returning an optimizer state, or
+      an object with an `init` attribute having the same function.
+    f: A callable that will be applied for all copies of the parameter tree
+      within this optimizer state.
+    state: The optimizer state to map over.
+    *rest: Additional arguments, having the same shape as the parameter tree,
+      that will be passed to f.
+    transform_non_params: An optional function that will be called on all
+      non-parameter fields within the optimizer state.
+    is_leaf: Passed through to `jax.tree.map`. This makes it possible to ignore
+      parts of the parameter tree e.g. when the gradient transformations modify
+      the shape of the original pytree, such as for ``optax.masked``.
+
+  Returns:
+    The result of applying the function f on all trees in the optimizer's state
+    that have the same shape as the parameter tree, along with the given
+    optional extra arguments.
+  """
+
+  # Cast for pytype checks (no-op for other usages).
+  placeholder = cast(base.chex.ArrayTree, _ParamsPlaceholder())
+
+  if isinstance(initable, Initable):
+    initable = cast(Initable, initable)  # for pytype checks
+    state_with_placeholders = initable.init(placeholder)
+  else:
+    state_with_placeholders = initable(placeholder)
+
+  def map_params(maybe_placeholder_value, value):
+    if isinstance(maybe_placeholder_value, _ParamsPlaceholder):
+      return jax.tree_util.tree_map(f, value, *rest, is_leaf=is_leaf)
+    elif transform_non_params is not None:
+      return transform_non_params(value)
+    else:
+      return value
+
+  return jax.tree_util.tree_map(
+      map_params,
+      state_with_placeholders,
+      state,
+      is_leaf=lambda v: isinstance(v, _ParamsPlaceholder),
+  )
 
 @dataclass
 class TrainingArguments:
@@ -201,6 +379,10 @@ class ModelArguments:
             )
         },
     )
+    architecture: typing.Literal["llama1", "llama2", "llama3", "llama3.2_3b"] = field(
+        default="llama_7b",
+    )
+
 
 
 @dataclass
@@ -267,8 +449,16 @@ class DataTrainingArguments:
     keep_linebreaks: bool = field(
         default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
     )
+    use_data_sample: bool = field(default=False, metadata={
+        "help" : "Whether to use data sample or not which consists only 1000 data rows"
+    })
 
     def __post_init__(self):
+        if self.use_data_sample:
+            self.dataset_name = "Erland/oscar_sampled_1000"
+            self.dataset_config_name = "default"
+            delattr(self, "use_data_sample")
+
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
@@ -459,7 +649,7 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = LLaMAConfig.load_config('7b')
+    config = LLaMAConfig.get_standard_llama_config(model_args.architecture)
     if model_args.dtype == "float16":
         dtype = jnp.float16
     elif model_args.dtype == "float32":
@@ -472,9 +662,10 @@ def main():
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        model_max_length=config.max_sequence_length,
+        model_max_length=config.get("max_sequence_length", 2048),
         padding_side="right",
         use_fast=False,
+        token=os.getenv("HUGGINGFACE_API_KEY", )
     )
     tokenizer.pad_token = tokenizer.unk_token
     config.update(dict(
@@ -483,12 +674,14 @@ def main():
     ))
 
     # TODO(yonghao): don't init weight when loaded somewhere
-    dummy_input_shape = (4, config.max_sequence_length)
+    dummy_input_shape = (4, config.get("max_sequence_length", 2048))
     # Monkey patch the model's init to init_dummy
     do_monkey_patch()
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    config = LlamaConfig(**dict(config))
     model = FlaxLLaMAForCausalLM(config, dummy_input_shape, dtype=dtype)
     hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
+        model_args.model_name_or_path, token=os.getenv("HUGGINGFACE_API_KEY", None)
     )
     loaded_params = hf_to_jax_weight(hf_model)
 
@@ -501,7 +694,97 @@ def main():
     #
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    data_module = make_supervised_data_module(tokenizer, data_args.dataset_name, IGNORE_TOKEN_ID)
+
+    # Below is a script from zigzagcai
+    # data_module = make_supervised_data_module(tokenizer, data_args.dataset_name, IGNORE_TOKEN_ID)
+    if data_args.dataset_name is not None:
+        dataset = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=model_args.cache_dir,
+            streaming=True,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+        if "validation" not in dataset.keys():
+            dataset["validation"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[:{data_args.validation_split_percentage}%]",
+                cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+            dataset["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+    else:
+        data_files = {}
+        dataset_args = {}
+        if data_args.train_file is not None:
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+        extension = data_args.train_file.split(".")[-1]
+        if extension == "txt":
+            extension = "text"
+            dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
+        dataset = load_dataset(
+            extension,
+            data_files=data_files,
+            cache_dir=model_args.cache_dir,
+            **dataset_args,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+        if "validation" not in dataset.keys():
+            dataset["validation"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[:{data_args.validation_split_percentage}%]",
+                cache_dir=model_args.cache_dir,
+                **dataset_args,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+            dataset["train"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                **dataset_args,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+    if training_args.do_train:
+        column_names = dataset["train"].column_names
+    else:
+        column_names = dataset["validation"].column_names
+    text_column_name = "text" if "text" in column_names else column_names[0]
+
+    # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
+    tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+
+    def tokenize_function(examples):
+        with CaptureLogger(tok_logger) as cl:
+            output = tokenizer(examples[text_column_name])
+        # clm input could be much much longer than block_size
+        if "Token indices sequence length is longer than the" in cl.out:
+            tok_logger.warning(
+                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
+                " before being passed to the model."
+            )
+        return output
+
+    logger.info("***** Tokenize dataset *****")
+    tokenized_datasets = dataset.map(
+        tokenize_function,
+        batched=True,
+        num_proc=data_args.preprocessing_num_workers,
+        remove_columns=column_names,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
 
 
     if data_args.block_size is None:
@@ -520,6 +803,37 @@ def main():
             )
         block_size = min(data_args.block_size, tokenizer.model_max_length)
 
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
+    # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
+    # to preprocess.
+    #
+    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
+
+    logger.info("***** Build dataset *****")
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        num_proc=data_args.preprocessing_num_workers,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
+
     # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
     # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
     # to preprocess.
@@ -530,17 +844,17 @@ def main():
     logger.info("***** Build dataset *****")
 
     if training_args.do_train:
-        if "train_dataset" not in data_module:
+        if "train" not in lm_datasets:
             raise ValueError("--do_train requires a train dataset")
-        train_dataset = data_module["train_dataset"]
+        train_dataset = lm_datasets["train"]
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
-            train_dataset = train_dataset.select(range(max_train_samples))
+            train_dataset = lm_datasets.select(range(max_train_samples))
 
     if training_args.do_eval:
-        if "eval_dataset" not in data_module:
+        if "validation" not in lm_datasets:
             raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = data_module["eval_dataset"]
+        eval_dataset = data_module["validation"]
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
@@ -700,20 +1014,25 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    method = alpa.get_3d_parallel_method(
-            num_micro_batches=training_args.num_micro_batches,
-            data_parallel=-1,
-            operator_parallel=training_args.operator_parallel,
-            pipeline_parallel=training_args.pipeline_parallel,
-            manual_layer_num=config.num_hidden_layers,
-            manual_sharding_option=ms_option)
+    # method = alpa.get_3d_parallel_method(
+    #         num_micro_batches=training_args.num_micro_batches,
+    #         data_parallel=1,
+    #         operator_parallel=training_args.operator_parallel,
+    #         pipeline_parallel=training_args.pipeline_parallel,
+    #         manual_layer_num=config.num_hidden_layers,
+    #         manual_sharding_option=ms_option)
+
+    print(f"Before alpa stuff")
+
+    method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
 
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step,
-                                   method=alpa.FollowParallel(
-                                       p_train_step, num_micro_batches=eval_num_micro_batches))
+    # p_eval_step = alpa.parallelize(eval_step,
+    #                                method=alpa.FollowParallel(
+    #                                    p_train_step, num_micro_batches=eval_num_micro_batches))
+    p_eval_step = alpa.parallelize(eval_step)
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 

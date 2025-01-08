@@ -5,12 +5,12 @@ from datasets import Dataset
 import numpy as np
 import transformers
 
-from fastchat.conversation import get_default_conv_template, SeparatorStyle
+from fastchat.conversation import get_conv_template, SeparatorStyle
 
 
 def preprocess(sources, tokenizer: transformers.PreTrainedTokenizer,
                ignore_token_id) -> Dict:
-    conv = get_default_conv_template("vicuna").copy()
+    conv = get_conv_template("vicuna").copy()
     roles = {"human": conv.roles[0], "user": conv.roles[0], "gpt": conv.roles[1], "chatgpt": conv.roles[1], "bing": conv.roles[1], "bard": conv.roles[1]}
 
     # Apply prompt templates

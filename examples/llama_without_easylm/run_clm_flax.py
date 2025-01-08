@@ -41,6 +41,7 @@ from tqdm import tqdm
 
 import alpa
 from alpa.model.model_util import DynamicScale, TrainState
+from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption
 import jax
 import jax.numpy as jnp
 import optax
@@ -60,10 +61,12 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
+
+alpa.init(cluster="ray")
+
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
-alpa.init(cluster="ray")
 tf.config.experimental.set_visible_devices([], 'GPU')
 
 logger = logging.getLogger(__name__)
@@ -95,6 +98,9 @@ class TrainingArguments:
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
     num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
+    operator_parallel: int = field(default=1, metadata={"help": "The degree of operator model parallelism."})
+    pipeline_parallel: int = field(default=1, metadata={"help": "The degree of pipeline model parallelism."})
+    use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
     adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
@@ -250,15 +256,8 @@ class DataTrainingArguments:
     keep_linebreaks: bool = field(
         default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
     )
-    use_data_sample: bool = field(default=False, metadata={
-        "help" : "Whether to use data sample or not which consists only 1000 data rows"
-    })
 
     def __post_init__(self):
-        if self.use_data_sample:
-            self.dataset_name = "Erland/oscar_sampled_1000"
-            self.dataset_config_name = "default"
-
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
@@ -319,6 +318,58 @@ def create_learning_rate_fn(
     )
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
+
+
+def monkey_patch_remat():
+    # Use monkey patch to add remat for all transformer layers.
+    from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
+    from flax.linen.partitioning import remat
+    from flax.linen.module import wrap_method_once
+    import flax.linen as nn
+
+    @wrap_method_once
+    def setup(self):
+        self.layers = [
+            remat(FlaxOPTDecoderLayer, static_argnums=(2, 3, 4))(
+                self.config, name=str(i), dtype=self.dtype)
+            for i in range(self.config.num_hidden_layers)
+        ]
+        self.layerdrop = self.config.layerdrop
+
+    def call(
+        self,
+        hidden_states,
+        attention_mask,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ):
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask,
+                init_cache,
+                output_attentions,
+                deterministic,
+            )
+
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        outputs = [hidden_states, all_hidden_states, all_self_attns]
+        return outputs
+
+    setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
+    setattr(FlaxOPTDecoderLayerCollection, "__call__", call)
 
 
 def main():
@@ -470,6 +521,9 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
+    if training_args.use_remat:
+        monkey_patch_remat()
+
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.tokenizer_name,
@@ -481,8 +535,9 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
+            #use_fast=model_args.use_fast_tokenizer,
             use_auth_token=True if model_args.use_auth_token else None,
+            use_fast=False,
         )
     else:
         raise ValueError(
@@ -498,6 +553,13 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
         )
+        #from transformers import FlaxOPTForCausalLM
+        #config.num_hidden_layers = 2
+        #model = FlaxOPTForCausalLM(
+        #    config=config,
+        #    seed=training_args.seed,
+        #    dtype=getattr(jnp, model_args.dtype),
+        #)
     else:
         model = FlaxAutoModelForCausalLM.from_config(
             config,
@@ -600,6 +662,18 @@ def main():
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
+    # Adjust batch size and num_micro_batches for small datasets
+    num_devices = alpa.get_global_num_devices()
+    train_min_batch_size = (num_devices // training_args.operator_parallel //
+                            training_args.pipeline_parallel * training_args.num_micro_batches)
+    eval_num_micro_batches = training_args.num_micro_batches
+    eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                           training_args.pipeline_parallel * eval_num_micro_batches)
+    while len(eval_dataset) < eval_min_batch_size:
+        eval_num_micro_batches //= 2
+        eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                               training_args.pipeline_parallel * eval_num_micro_batches)
+
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
     if has_tensorboard:
@@ -624,8 +698,8 @@ def main():
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
-    eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
+    train_batch_size = int(training_args.per_device_train_batch_size) * num_devices
+    eval_batch_size = int(training_args.per_device_eval_batch_size) * num_devices
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
@@ -686,16 +760,18 @@ def main():
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
-        loss = optax.softmax_cross_entropy(shift_logits, onehot(shift_labels, shift_logits.shape[-1]))
+        loss = optax.softmax_cross_entropy(
+            shift_logits,
+            jax.nn.one_hot(shift_labels, logits.shape[-1]))
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, batch, dropout_rng):
-        dropout_rng = jax.random.fold_in(dropout_rng, state.step)
+    def train_step(state, batch):
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)[0]
+            # logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
+            logits = state.apply_fn(**batch, params=params)[0]
             loss = loss_fn(logits, labels)
             return loss
 
@@ -724,12 +800,13 @@ def main():
 
         metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
 
-        return new_state, metrics, dropout_rng
+        return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-        logits = model(**batch, params=params, train=False)[0]
+        # logits = model(**batch, params=params, deterministic=True)[0]
+        logits = model(**batch, params=params)[0]
         loss = loss_fn(logits, labels)
 
         # summarize metrics
@@ -737,13 +814,19 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
+    method = alpa.get_3d_parallel_method(
+            num_micro_batches=training_args.num_micro_batches,
+            data_parallel=-1,
+            operator_parallel=training_args.operator_parallel,
+            pipeline_parallel=training_args.pipeline_parallel)
+
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step)
+    p_eval_step = alpa.parallelize(eval_step,
+                                   method=alpa.FollowParallel(
+                                       p_train_step, num_micro_batches=eval_num_micro_batches))
 
-    min_batch_size = alpa.get_global_num_devices() * training_args.num_micro_batches
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
     logger.info("***** Running training *****")
@@ -770,12 +853,15 @@ def main():
         rng, input_rng = jax.random.split(rng)
 
         # Generate an epoch by shuffling sampling indices from the train dataset
-        train_loader = data_loader(input_rng, train_dataset, train_batch_size, min_batch_size, shuffle=True)
+        train_loader = data_loader(input_rng, train_dataset, train_batch_size,
+                                   train_min_batch_size, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
         # train
         for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
             batch = next(train_loader)
-            state, train_metric, dropout_rng = p_train_step(state, batch, dropout_rng)
+            batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                     batch["attention_mask"]) - 1
+            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
@@ -803,9 +889,6 @@ def main():
                     latency=latency)
                 step_ct = 0
 
-                #print(f"driver latency: {latency:.2f}, "
-                #      f"worker latency: {executable.get_execution_time_costs()[-1]:.2f}")
-
                 # Save metrics
                 train_time += time.time() - train_start
                 if has_tensorboard:
@@ -827,11 +910,14 @@ def main():
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
                 # ======================== Evaluating ==============================
                 eval_metrics = []
-                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size, min_batch_size)
+                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                          eval_min_batch_size)
                 eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
                 for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
                     # Model forward
                     batch = next(eval_loader)
+                    batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                             batch["attention_mask"]) - 1
                     metrics = p_eval_step(state.params, batch)
                     eval_metrics.append(metrics)
 
@@ -855,7 +941,6 @@ def main():
                     f" {eval_metrics['perplexity']})"
                 )
                 epochs.write(desc)
-                epochs.desc = desc
 
                 # Save metrics
                 if has_tensorboard:
@@ -863,6 +948,7 @@ def main():
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
+                epochs.write("\nSave checkpoint...")
                 alpa.prefetch(state.params)
                 params = alpa.util.map_to_nparray(state.params)
                 model.save_pretrained(training_args.output_dir, params=params)
@@ -873,11 +959,14 @@ def main():
     # Eval after training
     if training_args.do_eval:
         eval_metrics = []
-        eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size, min_batch_size)
+        eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                  eval_min_batch_size)
         eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
         for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
             # Model forward
             batch = next(eval_loader)
+            batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                     batch["attention_mask"]) - 1
             metrics = p_eval_step(state.params, batch)
             eval_metrics.append(metrics)
 
@@ -894,6 +983,13 @@ def main():
         path = os.path.join(training_args.output_dir, "eval_results.json")
         with open(path, "w") as f:
             json.dump(eval_metrics, f, indent=4, sort_keys=True)
+
+    # Save the final model
+    epochs.write("\nSave the final model...")
+    alpa.prefetch(state.params)
+    params = alpa.util.map_to_nparray(state.params)
+    model.save_pretrained(training_args.output_dir, params=params)
+    tokenizer.save_pretrained(training_args.output_dir)
 
 
 if __name__ == "__main__":
