@@ -35,16 +35,17 @@ def get_config():
   config = ml_collections.ConfigDict()
 
   # As defined in the `models` module.
-  config.model = 'ResNet50'
+  config.model = 'ResNet18'
   # `name` argument of tensorflow_datasets.builder()
-  config.dataset = 'imagenet2012:5.*.*'
+  # config.dataset = 'imagenet2012:5.*.*'
+  config.dataset = 'imagenette'
 
   config.learning_rate = 0.1
   config.warmup_epochs = 5.0
   config.momentum = 0.9
-  config.batch_size = 128
+  config.batch_size = 1024
 
-  config.num_epochs = 100.0
+  config.num_epochs = 10000.0
   config.log_every_steps = 50
 
   config.cache = True

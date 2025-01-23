@@ -18,6 +18,7 @@ from . import timer
 from . import util
 from . import version
 from . import wrapped_hlo
+from . import adaptdl
 
 # Short cuts
 from alpa.api import (init, shutdown, parallelize, grad, value_and_grad,

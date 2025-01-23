@@ -18,8 +18,6 @@ This script trains a ResNet-50 on the ImageNet dataset.
 The data is loaded using tensorflow_datasets.
 """
 
-import torch
-
 import functools
 import os
 import time
@@ -43,16 +41,11 @@ import optax
 import ray
 import tensorflow as tf
 import tensorflow_datasets as tfds
-from tensorflow_datasets.core.utils import gcs_utils
 
 import input_pipeline
 import models
 
 from alpa.adaptdl import pollux_agent
-# import torch
-import torchvision
-import torchvision.transforms as transforms
-from tqdm import tqdm
 
 
 NUM_CLASSES = 1000
@@ -257,10 +250,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   Returns:
     Final TrainState.
   """
-  
-  gcs_utils._is_gcs_disabled = True
-  ds_builder = tfds.builder('imagenet2012')
-  ds_builder.download_and_prepare()
   # Initialize ray.
   # The `runtime_env` argument is used to upload local python scripts to
   # remote workers while excluding checkpoints, profiling events, etc.
@@ -324,8 +313,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   # step_offset > 0 if restarting from checkpoint
   step_offset = int(state.step)
 
-  # method = alpa.PipeshardParallel(stage_option="uniform")
-  method = alpa.ShardParallel()
+  method = alpa.PipeshardParallel(stage_option="uniform")
+  # method = alpa.ShardParallel()
   p_train_step = alpa.parallelize(
       functools.partial(train_step, learning_rate_fn=learning_rate_fn), method=method)
   p_eval_step = alpa.parallelize(eval_step, donate_argnums=())
@@ -356,109 +345,42 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   if jax.process_index() == 0:
     hooks += [periodic_actions.Profile(num_profile_steps=5, logdir=workdir)]
   train_metrics_last_t = time.time()
-  
-  # Initialize datasets and pre-processing transforms
-  # We use torchvision here for faster pre-processing
-  # Note that here we are using some default pre-processing, for maximum accuray
-  # one should tune this part and carefully select what transformations to use.
-  normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-  train_dataset = torchvision.datasets.ImageFolder(
-    "/home/akhmed.sakip/alpa-adaptdl/examples/ViT/imagenette2/train",
-    transforms.Compose(
-        [
-            transforms.RandomResizedCrop(image_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    ),
-)
+  for step, batch in zip(range(step_offset, num_steps), train_iter):
+    state, metrics = p_train_step(state, batch)
+    for h in hooks:
+      h(step)
 
-  eval_dataset = torchvision.datasets.ImageFolder(
-      "/home/akhmed.sakip/alpa-adaptdl/examples/ViT/imagenette2/val",
-      transforms.Compose(
-          [
-              transforms.Resize(image_size),
-              transforms.CenterCrop(image_size),
-              transforms.ToTensor(),
-              normalize,
-          ]
-      ),
-  )
-  
-  def collate_fn(examples):
-    pixel_values = torch.stack([example[0] for example in examples])
-    labels = torch.tensor([example[1] for example in examples])
+    if config.get('log_every_steps'):
+      train_metrics.append(metrics)
+      if (step + 1) % config.log_every_steps == 0:
+        train_metrics = alpa.util.get_metrics(train_metrics)
+        summary = {
+            f'train_{k}': v
+            for k, v in jax.tree_map(lambda x: x.mean(), train_metrics).items()
+        }
+        summary['ips'] = config.batch_size * config.log_every_steps / (
+            time.time() - train_metrics_last_t)
+        writer.write_scalars(step + 1, summary)
+        train_metrics = []
+        train_metrics_last_t = time.time()
 
-    batch = {"pixel_values": pixel_values, "labels": labels}
-    batch = {k: v.numpy() for k, v in batch.items()}
+    if (step + 1) % steps_per_epoch == 0:
+      epoch = step // steps_per_epoch
+      eval_metrics = []
 
-    return batch
-  
-  # Create data loaders
-  train_loader = torch.utils.data.DataLoader(
-      train_dataset,
-      batch_size=config.batch_size,
-      shuffle=True,
-      num_workers=32,
-      persistent_workers=True,
-      drop_last=True,
-      collate_fn=collate_fn,
-  )
-
-  eval_loader = torch.utils.data.DataLoader(
-      eval_dataset,
-      batch_size=config.batch_size,
-      shuffle=False,
-      num_workers=32,
-      persistent_workers=True,
-      drop_last=False,
-      collate_fn=collate_fn,
-  )
-  
-  epochs = tqdm(range(int(config.num_epochs)), desc=f"Epoch ... (1/{config.num_epochs})", position=0)
-  
-  for epoch in epochs:
-    for step, batch in enumerate(train_loader):
-      # print(f"Step #{step}, batch type - {type(batch)}.")
-      continue
-  
-  # for step, batch in zip(range(step_offset, num_steps), train_iter):
-  #   state, metrics = p_train_step(state, batch)
-  #   for h in hooks:
-  #     h(step)
-
-  #   if config.get('log_every_steps'):
-  #     train_metrics.append(metrics)
-  #     if (step + 1) % config.log_every_steps == 0:
-  #       train_metrics = alpa.util.get_metrics(train_metrics)
-  #       summary = {
-  #           f'train_{k}': v
-  #           for k, v in jax.tree_map(lambda x: x.mean(), train_metrics).items()
-  #       }
-  #       summary['ips'] = config.batch_size * config.log_every_steps / (
-  #           time.time() - train_metrics_last_t)
-  #       writer.write_scalars(step + 1, summary)
-  #       train_metrics = []
-  #       train_metrics_last_t = time.time()
-
-  #   if (step + 1) % steps_per_epoch == 0:
-  #     epoch = step // steps_per_epoch
-  #     eval_metrics = []
-
-  #     for _ in range(steps_per_eval):
-  #       eval_batch = next(eval_iter)
-  #       metrics = p_eval_step(state, eval_batch)
-  #       eval_metrics.append(metrics)
-  #     eval_metrics = alpa.util.get_metrics(eval_metrics)
-  #     summary = jax.tree_map(lambda x: x.mean(), eval_metrics)
-  #     logging.info('eval epoch: %d, loss: %.4f, accuracy: %.2f',
-  #                  epoch, summary['loss'], summary['accuracy'] * 100)
-  #     writer.write_scalars(
-  #         step + 1, {f'eval_{key}': val for key, val in summary.items()})
-  #     writer.flush()
-  #   if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
-  #     save_checkpoint(state, workdir)
+      for _ in range(steps_per_eval):
+        eval_batch = next(eval_iter)
+        metrics = p_eval_step(state, eval_batch)
+        eval_metrics.append(metrics)
+      eval_metrics = alpa.util.get_metrics(eval_metrics)
+      summary = jax.tree_map(lambda x: x.mean(), eval_metrics)
+      logging.info('eval epoch: %d, loss: %.4f, accuracy: %.2f',
+                   epoch, summary['loss'], summary['accuracy'] * 100)
+      writer.write_scalars(
+          step + 1, {f'eval_{key}': val for key, val in summary.items()})
+      writer.flush()
+    if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
+      save_checkpoint(state, workdir)
 
   # Wait until computations are done before exiting
   executable.sync()

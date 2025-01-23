@@ -82,23 +82,25 @@ def get_cuda_version_str(no_dot=False):
 
 
 install_require_list = [
-    "tqdm",
+    "tqdm==4.66.5",
     "ray==2.9.0",
     "jax==0.3.22",
     "chex==0.1.5",
     "flax==0.6.2",
     "pulp>=2.6.0",
-    "numpy==1.23.1",
-    "grpcio==1.43.0",
-    "numba",
+    "numpy>=1.20",
+    "numba==0.58.1",
+    "addict==2.4.0",
+    "datasets==3.0.1",
+    "scikit-learn==1.3.2",
 ]
 
 dev_require_list = ["yapf==0.32.0", "pylint==2.14.0", "cmake", "pybind11"]
 
-if HAS_CUDA:
-    dev_require_list += [
-        f"cupy-cuda11x",
-    ]
+# if HAS_CUDA:
+#     dev_require_list += [
+#         f"cupy-cuda{get_cuda_version_str(no_dot=True)}",
+#     ]
 
 doc_require_list = [
     "sphinx", "sphinx-rtd-theme", "sphinx-gallery", "matplotlib"

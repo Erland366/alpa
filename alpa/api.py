@@ -10,12 +10,17 @@ from jax.core import AbstractValue
 from jax.experimental.maps import FrozenDict
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 
-from alpa.device_mesh import init_global_cluster, shutdown_global_cluster
+from alpa.device_mesh import init_global_cluster, shutdown_global_cluster, get_global_physical_mesh
 from alpa.parallel_method import ParallelMethod, ShardParallel
 from alpa.pipeline_parallel.primitive_def import mark_gradient
 from alpa.util import (auto_donate_argnums, auto_static_argnums,
                        abstractify_with_aval, GradFuncTransformContext)
 from alpa.version import check_alpa_jaxlib_version
+
+from alpa.adaptdl.pollux_agent import pollux_agent
+from flax.training import train_state
+import time
+from alpa.adaptdl.sched_requests import register_job
 
 traceback_util.register_exclusion(__file__)
 
@@ -26,7 +31,10 @@ def init(cluster: str = "ray",
          cluster_address: Optional[str] = None,
          num_nodes: Optional[int] = None,
          num_devices_per_node: Optional[int] = None,
-         namespace: Optional[str] = "alpa_default_space"):
+         namespace: Optional[str] = "alpa_default_space",
+         copus_enabled: Optional[bool] = False,
+         scheduler_address: Optional[str] = None,
+         is_reallocation: Optional[bool] = False):
     """Initialize the global environment.
 
     `devices_per_node, num_nodes` are used to specify the number of devices.
@@ -50,6 +58,17 @@ def init(cluster: str = "ray",
       num_nodes: The number of nodes.
       num_devices_per_node: The number of devices per node.
     """
+    if scheduler_address is not None:
+        pollux_agent.scheduler_enabled = True
+        pollux_agent.scheduler_address = scheduler_address
+        namespace = pollux_agent.namespace
+        if not is_reallocation:
+            register_job()
+            pollux_agent.init_sched_utils()
+    
+    if copus_enabled:
+        pollux_agent.enabled = True
+        
     global is_initialized
 
     if is_initialized:
@@ -57,15 +76,15 @@ def init(cluster: str = "ray",
     is_initialized = True
 
     init_global_cluster(cluster, cluster_address, num_nodes,
-                        num_devices_per_node, namespace)
+                        num_devices_per_node, namespace, is_reallocation)
 
 
-def shutdown():
+def shutdown(is_reallocation = False):
     """Shutdown the global environment."""
     global is_initialized
     assert is_initialized is True
     is_initialized = False
-    shutdown_global_cluster()
+    shutdown_global_cluster(is_reallocation)
 
 
 def parallelize(fun: Optional[Callable] = None,
@@ -125,10 +144,59 @@ class ParallelizedFunc:
     @traceback_util.api_boundary
     def __call__(self, *args):
         """Launch the computation on the driver."""
+        # if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
+        if pollux_agent.enabled and not pollux_agent.is_evaluating:
+            compil_start = time.perf_counter()
+
+        # compilation usually ends after the below line, but the first iteration (executable.launch_on_driver) takes long
         executable, _, out_tree, args_flat = (
             self._decode_args_and_get_executable(*args))
+
+        if pollux_agent.enabled and not pollux_agent.is_evaluating:
+            was_recompilation_of_seen_config = False
+            
+            if pollux_agent.get_current_config() in pollux_agent.t_compilation.keys():
+                compil_time = time.perf_counter() - compil_start
+                if compil_time > 1:
+                    was_recompilation_of_seen_config = True
+
+            if len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
+                executable.sync()
+                iter_start = time.perf_counter()
+
         out = executable.launch_on_driver(*args_flat)
-        return tree_unflatten(out_tree(), out)
+
+        unflattened_out_tree = tree_unflatten(out_tree(), out)
+
+        if pollux_agent.enabled and not pollux_agent.is_evaluating:
+            if was_recompilation_of_seen_config:
+                executable.sync()
+                compil_time = time.perf_counter() - compil_start
+                pollux_agent.total_overhead_time += compil_time
+                pollux_agent.overhead_time_list.append(compil_time)
+                print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
+                was_recompilation_of_seen_config = False
+            
+            if pollux_agent.get_current_config() not in pollux_agent.t_compilation.keys():
+                compil_time = time.perf_counter() - compil_start
+                pollux_agent.t_compilation[pollux_agent.get_current_config()] = compil_time
+                pollux_agent.total_overhead_time += compil_time
+                pollux_agent.overhead_time_list.append(compil_time)
+                print(f"TOTAL OVERHEAD - {pollux_agent.total_overhead_time}")
+                # below assumes that the first argument to __call__ is a TrainState
+                pollux_agent.report_iteration(unflattened_out_tree[0] if isinstance(unflattened_out_tree[0], train_state.TrainState) else pollux_agent.state, 
+                                            unflattened_out_tree[1] if isinstance(unflattened_out_tree[1], dict) else pollux_agent.train_metric)
+            elif len(pollux_agent.config_t_iter[pollux_agent.get_current_config()]) < pollux_agent.NUM_SYNC_PER_CONFIG:
+                executable.sync()
+                t_iter = time.perf_counter() - iter_start
+                pollux_agent.report_iteration(unflattened_out_tree[0] if isinstance(unflattened_out_tree[0], train_state.TrainState) else pollux_agent.state, 
+                                            unflattened_out_tree[1] if isinstance(unflattened_out_tree[1], dict) else pollux_agent.train_metric,
+                                            t_iter=t_iter)
+            else:
+                pollux_agent.report_iteration(unflattened_out_tree[0] if isinstance(unflattened_out_tree[0], train_state.TrainState) else pollux_agent.state, 
+                                            unflattened_out_tree[1] if isinstance(unflattened_out_tree[1], dict) else pollux_agent.train_metric)
+
+        return unflattened_out_tree
 
     def get_executable(self, *args):
         """Get the compiled exectuable."""
@@ -200,6 +268,9 @@ class ParallelizedFunc:
                                                   static_argnums,
                                                   donated_invars, batch_invars,
                                                   self.method, *abstract_args)
+
+        # if executable.physical_mesh is not get_global_physical_mesh(create_if_not_exist=False):
+            # executable.physical_mesh = get_global_physical_mesh(create_if_not_exist=False)
 
         self.last_executable = executable
         return executable, in_tree, out_tree, args_flat

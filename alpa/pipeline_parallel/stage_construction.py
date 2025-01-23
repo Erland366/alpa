@@ -20,6 +20,9 @@ from alpa.shard_parallel.auto_sharding import AutoShardingOption
 from alpa.timer import timers
 from alpa.util import OrderedSet, maybe_numba_jit, jaxpr_to_hlo
 
+from alpa.adaptdl.pollux_agent import pollux_agent
+import time
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -635,12 +638,13 @@ def cluster_layers_and_slice_mesh(
             accumulator_mapping, acc_grad_invars, acc_grad_outvars,
             jax_apply_layers, apply_grad_global_info, num_micro_batches,
             default_as_option, stage_option, inference_mode)
+        
         if inference_mode:
             _, solution = inference_dp(num_layers, virtual_mesh.num_devices,
                                        submesh_choices,
                                        num_autosharding_configs, compute_cost)
         else:
-            _, solution = training_dp(num_layers, virtual_mesh.num_devices,
+            training_dp_cost, solution = training_dp(num_layers, virtual_mesh.num_devices,
                                       num_micro_batches, submesh_choices,
                                       num_autosharding_configs, compute_cost,
                                       max_n_succ_stages)

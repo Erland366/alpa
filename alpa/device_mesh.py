@@ -63,6 +63,9 @@ ray_worker = try_import_ray_worker()
 if global_config.backend == "gpu" and global_config.has_cuda:
     from alpa.collective import worker_nccl_util
 
+from alpa.adaptdl.pollux_agent import pollux_agent
+from alpa.adaptdl.sched_requests import register_placement_group, initial_request_placement_group, reallocation_request_placement_group
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -867,6 +870,7 @@ class LocalPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.devices = devices if devices is not None else xb.local_devices()
         self.num_hosts = 1
         self.num_devices_per_host = len(self.devices)
+        pollux_agent.alloc_vector = [self.num_devices_per_host]
         self.mesh_id = -1
         self.device_strs = []
         self.operation_executables = {}
@@ -1044,7 +1048,10 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
 
     def get_host_worker_name(self, host_id):
         if self.namespace:
-            return f"mesh_{self.mesh_id}_host_{host_id}"
+            if pollux_agent.scheduler_address is None:
+                return f"mesh_{self.mesh_id}_host_{host_id}"
+            else:
+                return f"mesh_{self.mesh_id}_host_{host_id}_job_{pollux_agent.job_id}"
         else:
             return None
 
@@ -1382,8 +1389,9 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
         try:
             for w in self.workers:
                 w.delete_executable.remote(exec_uuid)
-        except AttributeError:
-            pass
+        except AttributeError as e:
+            print(f'error is: {e}')
+            #pass
 
     def set_runtime_random_seed(self, seed: int):
         for w in self.workers:
@@ -2138,7 +2146,8 @@ class DeviceCluster:
     def __init__(self,
                  num_nodes: int = None,
                  num_devices_per_node: int = None,
-                 namespace: Optional[str] = None):
+                 namespace: Optional[str] = None,
+                 is_reallocation: Optional[bool] = False):
         # pylint: disable=import-outside-toplevel
         ray_global_node = ray_worker._global_node
         try:
@@ -2166,6 +2175,8 @@ class DeviceCluster:
             number = host_info["Resources"][global_config.ray_accelerator_name]
             assert number.is_integer()
             all_host_num_devices.append(int(number))
+        
+        # pollux_agent.alloc_vector = all_host_num_devices
 
         # adjust the resource allocations
         # if `num_nodes` is set, use it.
@@ -2192,8 +2203,25 @@ class DeviceCluster:
         self.namespace = namespace
         if namespace:
             pg_name = namespace + "_pg"
+            if pollux_agent.scheduler_enabled: 
+                pg_name += "_" + pollux_agent.job_id
+                if num_hosts and num_devices_per_node:
+                    register_placement_group(num_hosts, self.host_num_devices, pg_name)
+                else:
+                    if not is_reallocation:
+                        initial_request_placement_group(pg_name)
+                    else:
+                        reallocation_request_placement_group(pg_name)
+
+                # Below is just to request a placement group for all the devices from the scheduler, only for testing
+                # register_placement_group(num_hosts, self.host_num_devices, pg_name)
             try:
                 pg = ray.util.get_placement_group(pg_name)
+                # The below code sets self.host_num_devices to whatever the scheduler allocated
+                if pollux_agent.scheduler_enabled:
+                    pg_table = ray.util.placement_group_table(pg)
+                    self.host_num_devices = [int(v['GPU']) for k, v in pg_table['bundles'].items()]
+                    # print(f"host_num_devices: {self.host_num_devices}")
             except ValueError:
                 pg = None
         else:
@@ -2206,7 +2234,7 @@ class DeviceCluster:
                 num_hosts, self.host_num_devices, pg_name)
 
         # Update the Device Cluster info from placement group
-        if num_devices_per_node or num_nodes:
+        if num_devices_per_node or num_nodes or pollux_agent.scheduler_enabled:
             # map: host ip to host info
             host_ip2info = dict(zip(all_host_ips, all_host_info))
 
@@ -2225,9 +2253,12 @@ class DeviceCluster:
             self.host_ips = [
                 ips[bundle_idx] for bundle_idx in device_bundle_idx_list
             ]
+            # print(f"host_info: {self.host_info}")
+            # print(f"host_ips: {self.host_ips}")
         else:
             self.host_info = all_host_info
             self.host_ips = all_host_ips
+        pollux_agent.alloc_vector = self.host_num_devices
 
     def delete_placement_group(self):
         """remove the placement group for the current device cluster."""
@@ -2315,7 +2346,8 @@ def init_global_cluster(cluster: str,
                         cluster_address: Optional[str] = None,
                         num_nodes: Optional[int] = None,
                         num_devices_per_node: Optional[int] = None,
-                        namespace: Optional[str] = None):
+                        namespace: Optional[str] = None,
+                        is_reallocation: Optional[bool] = False):
     global global_cluster, global_physical_mesh, global_virtual_physical_mesh
 
     if cluster == "local":
@@ -2327,12 +2359,12 @@ def init_global_cluster(cluster: str,
                      ignore_reinit_error=True,
                      namespace=namespace)
         update_jax_platform("cpu")
-        global_cluster = DeviceCluster(num_nodes, num_devices_per_node)
+        global_cluster = DeviceCluster(num_nodes, num_devices_per_node, namespace, is_reallocation)
         global_virtual_physical_mesh = (
             global_cluster.get_virtual_physical_mesh())
 
 
-def shutdown_global_cluster():
+def shutdown_global_cluster(is_reallocation = False):
     global global_cluster, global_physical_mesh, global_virtual_physical_mesh
 
     if global_physical_mesh:
@@ -2344,7 +2376,11 @@ def shutdown_global_cluster():
             global_virtual_physical_mesh.launched_physical_mesh_group.shutdown()
         global_virtual_physical_mesh = None
 
-    global_cluster.delete_placement_group()
+    if not pollux_agent.scheduler_enabled:
+        global_cluster.delete_placement_group()
+    else:
+        from alpa.adaptdl.sched_requests import release_resources
+        release_resources(is_reallocation)
     global_cluster = None
     update_jax_platform("gpu")
 

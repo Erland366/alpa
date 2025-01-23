@@ -1,0 +1,95 @@
+# TODO: wandb configuration
+
+wandb:
+  mode: online # online, offline, disabled
+  project: "OPT_adaptive"
+  save_code: false
+
+scheduler:
+  enabled: false
+  address: http://127.0.0.1:8000
+
+cluster_config:
+  num_nodes: null
+  num_devices_per_node: null
+  namespace: null # alpa_default_space by default
+
+model_name_or_path: facebook/opt-350m
+
+data:
+  dataset_name: wikitext
+  dataset_config_name: wikitext-2-raw-v1
+  block_size: 1024
+  max_train_samples: 20000
+
+
+paths:
+  output_dir: ./output
+  cache_dir: ./cache_350m
+
+pollux_agent:
+  regression_coefficients:
+    - key: [1, 1]
+      coef: 0.01244238
+      intercept: 0.04832255037035804
+    - key: [2, 1]
+      coef: 0.00620391
+      intercept: 0.05258383221059515
+    - key: [4, 1]
+      coef: 0.00310928
+      intercept: 0.05187557201965598
+  fix_regressors: true
+
+dataloader:
+  train:
+    adaptive_data_loader:
+      enabled: true
+      autoscaler: 
+        enabled: false
+        max_total_batch_size: 400
+        local_bsz_bounds:
+          min_is_init_bs: true
+          min: 20
+          max: 78
+    init_local_batch_size: 20
+    shuffle: true
+    preprocessing_num_workers: 0
+    persistent_workers: false
+  eval:
+    local_batch_size: 20
+    shuffle: false
+
+
+training:
+  dtype: "float16"
+  pretrain: false
+  num_train_epochs: 10000000
+  learning_rate: 5e-5
+  warmup_steps: 2000
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  weight_decay: 0.01
+  smoothing: 0.9
+  gns_enabled: true
+  logging_steps: 50
+  save_steps: 32
+  eval_steps: 32
+  scale_lr:
+    enabled: true
+    type: sqrt # linear, sqrt
+  parallel_method:
+    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
+    parameters:
+      DataParallel:
+      ShardParallel:
+      PipeshardParallel:
+        stage_option: uniform # uniform, auto
+        # num stages?
+      _3D:
+        data_parallel: -1
+        operator_parallel: 1
+        pipeline_parallel: 1
+    num_micro_batches: 1
+
+evaluation:
+  enabled: false

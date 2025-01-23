@@ -74,3 +74,17 @@ docs/tutorials
 
 # macOS temp files
 .DS_Store
+
+examples/ViT/imagenette2
+examples/ViT/vit-base-patch16-imagenette/
+*.tgz
+*.ipynb_checkpoints
+alpa_debug_info*
+pickle_objects*
+examples/BERT/bert-qa-squad/
+examples/BERT/cache/
+wandb/
+
+examples/opt_finetune/cache
+examples/ViT/cache
+examples/ViT/outputs

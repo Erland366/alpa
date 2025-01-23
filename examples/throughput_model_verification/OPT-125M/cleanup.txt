@@ -1,0 +1,6 @@
+to_delete = [(76, 1, 1),
+ (152, 2, 1),
+ (304, 4, 1)]
+
+for alloc in to_delete:
+    del objects.config_t_iter[alloc]

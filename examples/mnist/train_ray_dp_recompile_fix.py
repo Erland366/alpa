@@ -45,26 +45,15 @@ class CNN(nn.Module):
   def __call__(self, x):
     x = nn.Conv(features=32, kernel_size=(3, 3))(x)
     x = nn.relu(x)
-    #x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+    x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
     x = nn.Conv(features=64, kernel_size=(3, 3))(x)
     x = nn.relu(x)
-    x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
-    ##x = nn.Dropout(0.25)(x, deterministic=False)
-    #x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+    x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
     x = x.reshape((x.shape[0], -1))  # flatten
-    
-    ###################
-    x = nn.Dense(128)(x)
+    x = nn.Dense(features=256)(x)
     x = nn.relu(x)
-    ##x = nn.Dropout(0.5)(x, deterministic=False)
-    x = nn.Dense(10)(x)
-    output = nn.log_softmax(x)
-    
-    #x = nn.Dense(features=256)(x)
-    #x = nn.relu(x)
-    #x = nn.Dense(features=10)(x)
-    #return x
-    return output
+    x = nn.Dense(features=10)(x)
+    return x
 
 
 def train_step(state, images, labels):
@@ -183,7 +172,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     tic = time.time()
     state, train_loss, train_accuracy = train_epoch(state, train_data_loader,
                                                     steps_per_epoch, p_train_step)
-    print(f"GLOBAL PHYSICAL MESH - {alpa.get_global_physical_mesh()}")
     # flattened_opt_state = tree_flatten(state.opt_state)
     # flattened_opt_state[0][0] = flattened_opt_state[0][0]._value
     # for i, leaf in enumerate(flattened_opt_state[0]):
@@ -205,7 +193,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     summary_writer.scalar('test_accuracy', test_accuracy, epoch)
     
     if epoch == 10:
-      step_val = state.step._value
+      step_backup = state.step._value
       
       flattened_opt_state = tree_flatten(state.opt_state)
       for i, leaf in enumerate(flattened_opt_state[0]):
@@ -219,7 +207,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
           flattened_params[0][i] = leaf._value
       unflattened_params = tree_unflatten(flattened_params[1], flattened_params[0])
       
-      state = state.replace(step=step_val, opt_state=unflattened_opt_state, params=unflattened_params)
+      state = state.replace(step=step_backup, opt_state=unflattened_opt_state, params=unflattened_params)
       print(f"GLOBAL PHYSICAL MESH before shutdown - {alpa.get_global_physical_mesh()}")
       # print(f"MESH WORKERS before shutdown - {alpa.get_global_physical_mesh().workers}")
       # print(f"PHYSICAL MESH FROM CLUSTER before shutdown - {alpa.get_global_cluster().get_physical_mesh()}")

@@ -66,6 +66,7 @@ alpa.init(cluster="ray")
 
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
+from alpa.adaptdl.pollux_agent import pollux_agent
 
 tf.config.experimental.set_visible_devices([], 'GPU')
 
@@ -711,6 +712,8 @@ def main():
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
+    pollux_agent.total_batch_size = train_batch_size
+
     # Create learning rate schedule
     linear_decay_lr_schedule_fn = create_learning_rate_fn(
         len(train_dataset),
@@ -914,82 +917,82 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            if cur_step % training_args.eval_steps == 0 and cur_step > 0:
-                # ======================== Evaluating ==============================
-                eval_metrics = []
-                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-                                          eval_min_batch_size)
-                eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
-                    # Model forward
-                    batch = next(eval_loader)
-                    batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                                             batch["attention_mask"]) - 1
-                    metrics = p_eval_step(state.params, batch)
-                    eval_metrics.append(metrics)
+            # if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+            #     # ======================== Evaluating ==============================
+            #     eval_metrics = []
+            #     eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+            #                               eval_min_batch_size)
+            #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+            #     for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+            #         # Model forward
+            #         batch = next(eval_loader)
+            #         batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+            #                                  batch["attention_mask"]) - 1
+            #         metrics = p_eval_step(state.params, batch)
+            #         eval_metrics.append(metrics)
 
-                    if dump_debug_info_eval_step:
-                        dump_debug_info_eval_step = False
-                        executable = p_eval_step.get_last_executable()
-                        executable.dump_debug_info("alpa_debug_info")
+            #         if dump_debug_info_eval_step:
+            #             dump_debug_info_eval_step = False
+            #             executable = p_eval_step.get_last_executable()
+            #             executable.dump_debug_info("alpa_debug_info")
 
-                # normalize eval metrics
-                eval_metrics = alpa.util.get_metrics(eval_metrics)
-                eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+            #     # normalize eval metrics
+            #     eval_metrics = alpa.util.get_metrics(eval_metrics)
+            #     eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                try:
-                    eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-                except OverflowError:
-                    eval_metrics["perplexity"] = float("inf")
+            #     try:
+            #         eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+            #     except OverflowError:
+            #         eval_metrics["perplexity"] = float("inf")
 
-                # Print metrics and update progress bar
-                desc = (
-                    f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
-                    f" {eval_metrics['perplexity']})"
-                )
-                epochs.write(desc)
+            #     # Print metrics and update progress bar
+            #     desc = (
+            #         f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+            #         f" {eval_metrics['perplexity']})"
+            #     )
+            #     epochs.write(desc)
 
-                # Save metrics
-                if has_tensorboard:
-                    write_eval_metric(summary_writer, eval_metrics, cur_step)
+            #     # Save metrics
+            #     if has_tensorboard:
+            #         write_eval_metric(summary_writer, eval_metrics, cur_step)
 
-            if cur_step % training_args.save_steps == 0 and cur_step > 0:
-                # save checkpoint after each epoch and push checkpoint to the hub
-                epochs.write("\nSave checkpoint...")
-                alpa.prefetch(state.params)
-                params = alpa.util.map_to_nparray(state.params)
-                model.save_pretrained(training_args.output_dir, params=params)
-                tokenizer.save_pretrained(training_args.output_dir)
-                if training_args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+            # if cur_step % training_args.save_steps == 0 and cur_step > 0:
+            #     # save checkpoint after each epoch and push checkpoint to the hub
+            #     epochs.write("\nSave checkpoint...")
+            #     alpa.prefetch(state.params)
+            #     params = alpa.util.map_to_nparray(state.params)
+            #     model.save_pretrained(training_args.output_dir, params=params)
+            #     tokenizer.save_pretrained(training_args.output_dir)
+            #     if training_args.push_to_hub:
+            #         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
     # Eval after training
-    if training_args.do_eval:
-        eval_metrics = []
-        eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-                                  eval_min_batch_size)
-        eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-        for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
-            # Model forward
-            batch = next(eval_loader)
-            batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                                     batch["attention_mask"]) - 1
-            metrics = p_eval_step(state.params, batch)
-            eval_metrics.append(metrics)
+    # if training_args.do_eval:
+    #     eval_metrics = []
+    #     eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+    #                               eval_min_batch_size)
+    #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+    #     for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+    #         # Model forward
+    #         batch = next(eval_loader)
+    #         batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+    #                                  batch["attention_mask"]) - 1
+    #         metrics = p_eval_step(state.params, batch)
+    #         eval_metrics.append(metrics)
 
-        # normalize eval metrics
-        eval_metrics = alpa.util.get_metrics(eval_metrics)
-        eval_metrics = jax.tree_map(lambda x: jnp.mean(x).item(), eval_metrics)
+    #     # normalize eval metrics
+    #     eval_metrics = alpa.util.get_metrics(eval_metrics)
+    #     eval_metrics = jax.tree_map(lambda x: jnp.mean(x).item(), eval_metrics)
 
-        try:
-            eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-        except OverflowError:
-            eval_metrics["perplexity"] = float("inf")
+    #     try:
+    #         eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+    #     except OverflowError:
+    #         eval_metrics["perplexity"] = float("inf")
 
-        eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
-        path = os.path.join(training_args.output_dir, "eval_results.json")
-        with open(path, "w") as f:
-            json.dump(eval_metrics, f, indent=4, sort_keys=True)
+    #     eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
+    #     path = os.path.join(training_args.output_dir, "eval_results.json")
+    #     with open(path, "w") as f:
+    #         json.dump(eval_metrics, f, indent=4, sort_keys=True)
 
     # Save the final model
     epochs.write("\nSave the final model...")
