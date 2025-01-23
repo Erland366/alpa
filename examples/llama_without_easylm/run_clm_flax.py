@@ -256,8 +256,17 @@ class DataTrainingArguments:
     keep_linebreaks: bool = field(
         default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
     )
+    use_data_sample: bool = field(default=False, metadata={
+        "help" : "Whether to use data sample or not which consists only 1000 data rows"
+    })
+
 
     def __post_init__(self):
+        if self.use_data_sample:
+            self.dataset_name = "Erland/oscar_sampled_1000"
+            self.dataset_config_name = "default"
+            delattr(self, "use_data_sample")
+
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
@@ -545,6 +554,7 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+
     if model_args.model_name_or_path:
         model = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -553,6 +563,7 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
         )
+
         #from transformers import FlaxOPTForCausalLM
         #config.num_hidden_layers = 2
         #model = FlaxOPTForCausalLM(
@@ -666,13 +677,15 @@ def main():
     num_devices = alpa.get_global_num_devices()
     train_min_batch_size = (num_devices // training_args.operator_parallel //
                             training_args.pipeline_parallel * training_args.num_micro_batches)
-    eval_num_micro_batches = training_args.num_micro_batches
-    eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                           training_args.pipeline_parallel * eval_num_micro_batches)
-    while len(eval_dataset) < eval_min_batch_size:
-        eval_num_micro_batches //= 2
+                        
+    if training_args.do_eval:
+        eval_num_micro_batches = training_args.num_micro_batches
         eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                               training_args.pipeline_parallel * eval_num_micro_batches)
+                            training_args.pipeline_parallel * eval_num_micro_batches)
+        while len(eval_dataset) < eval_min_batch_size:
+            eval_num_micro_batches //= 2
+            eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                                training_args.pipeline_parallel * eval_num_micro_batches)
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
@@ -814,18 +827,21 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    method = alpa.get_3d_parallel_method(
-            num_micro_batches=training_args.num_micro_batches,
-            data_parallel=-1,
-            operator_parallel=training_args.operator_parallel,
-            pipeline_parallel=training_args.pipeline_parallel)
+    # method = alpa.get_3d_parallel_method(
+    #         num_micro_batches=training_args.num_micro_batches,
+    #         data_parallel=-1,
+    #         operator_parallel=training_args.operator_parallel,
+    #         pipeline_parallel=training_args.pipeline_parallel)
+
+    method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
 
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step,
-                                   method=alpa.FollowParallel(
-                                       p_train_step, num_micro_batches=eval_num_micro_batches))
+    if training_args.do_eval:
+        p_eval_step = alpa.parallelize(eval_step,
+                                    method=alpa.FollowParallel(
+                                        p_train_step, num_micro_batches=eval_num_micro_batches))
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
@@ -859,6 +875,7 @@ def main():
         # train
         for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
             batch = next(train_loader)
+            print("Input IDs shape (inside train_step):", batch["input_ids"].shape)
             batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
                                      batch["attention_mask"]) - 1
             state, train_metric = p_train_step(state, batch)
@@ -907,44 +924,45 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            if cur_step % training_args.eval_steps == 0 and cur_step > 0:
-                # ======================== Evaluating ==============================
-                eval_metrics = []
-                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-                                          eval_min_batch_size)
-                eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
-                    # Model forward
-                    batch = next(eval_loader)
-                    batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                                             batch["attention_mask"]) - 1
-                    metrics = p_eval_step(state.params, batch)
-                    eval_metrics.append(metrics)
+            if training_args.do_eval:
+                if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+                    # ======================== Evaluating ==============================
+                    eval_metrics = []
+                    eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                            eval_min_batch_size)
+                    eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                    for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+                        # Model forward
+                        batch = next(eval_loader)
+                        batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                                batch["attention_mask"]) - 1
+                        metrics = p_eval_step(state.params, batch)
+                        eval_metrics.append(metrics)
 
-                    if dump_debug_info_eval_step:
-                        dump_debug_info_eval_step = False
-                        executable = p_eval_step.get_last_executable()
-                        executable.dump_debug_info("alpa_debug_info")
+                        if dump_debug_info_eval_step:
+                            dump_debug_info_eval_step = False
+                            executable = p_eval_step.get_last_executable()
+                            executable.dump_debug_info("alpa_debug_info")
 
-                # normalize eval metrics
-                eval_metrics = alpa.util.get_metrics(eval_metrics)
-                eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+                    # normalize eval metrics
+                    eval_metrics = alpa.util.get_metrics(eval_metrics)
+                    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                try:
-                    eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-                except OverflowError:
-                    eval_metrics["perplexity"] = float("inf")
+                    try:
+                        eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+                    except OverflowError:
+                        eval_metrics["perplexity"] = float("inf")
 
-                # Print metrics and update progress bar
-                desc = (
-                    f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
-                    f" {eval_metrics['perplexity']})"
-                )
-                epochs.write(desc)
+                    # Print metrics and update progress bar
+                    desc = (
+                        f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+                        f" {eval_metrics['perplexity']})"
+                    )
+                    epochs.write(desc)
 
-                # Save metrics
-                if has_tensorboard:
-                    write_eval_metric(summary_writer, eval_metrics, cur_step)
+                    # Save metrics
+                    if has_tensorboard:
+                        write_eval_metric(summary_writer, eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub

@@ -67,8 +67,8 @@ Finally, we can run the example script to pretrain the model:
 python run_image_classification.py \
     --output_dir ./vit-base-patch16-imagenette \
     --model_name_or_path google/vit-base-patch16-224-in21k \
-    --train_dir="imagenette2/train" \
-    --validation_dir="imagenette2/val" \
+    --train_dir="testing_chamber/imagenette2/train" \
+    --validation_dir="testing_chamber/imagenette2/val" \
     --num_train_epochs 5 \
     --num_micro_batches 2 \
     --learning_rate 1e-3 \

@@ -1,38 +1,23 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2021 The HuggingFace Team All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Pre-training/Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...) on a text file or a dataset.
+import sys
 
-Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
-https://huggingface.co/models?filter=text-generation
-"""
-# You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+sys.path.append(".")
+
+from examples.utils import *
 
 import json
 import logging
 import math
 import os
-import sys
+import typing
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from functools import partial
 import functools
 from itertools import chain
 from pathlib import Path
 from typing import Callable, Optional
+from jax.experimental.pjit import PartitionSpec
 
 import datasets
 import numpy as np
@@ -41,10 +26,11 @@ from tqdm import tqdm
 
 import alpa
 from alpa.model.model_util import DynamicScale, TrainState
-from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption
+from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption, ManualShardingOption
 import jax
 import jax.numpy as jnp
 import optax
+from optax._src import base
 import transformers
 import tensorflow as tf
 from flax import jax_utils, traverse_util
@@ -57,15 +43,123 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     FlaxAutoModelForCausalLM,
+    FlaxLlamaForCausalLM,
     HfArgumentParser,
     is_tensorboard_available,
     set_seed,
 )
+from transformers.models.llama.modeling_flax_llama import FlaxLlamaForCausalLMModule
+from typing import Any, Optional, Protocol, Tuple, Union, cast
+from transformers.testing_utils import CaptureLogger
+from transformers.utils import get_full_repo_name, send_example_telemetry
+
+IGNORE_TOKEN_ID = -100
+
+def do_monkey_patch():
+    # TODO: jax 0.3.22 does not support eval shape with static args well. Remove
+    # after rebasing to jax 0.4, use the model's _do_init=False then.
+    def init_dummy(self, *args, **kwargs):
+        avals = jax.eval_shape(partial(self._backup_init, **kwargs), *args)
+        return jax.tree_util.tree_map(lambda x: jnp.full(x.shape, 1e-8, x.dtype),
+                                    avals)
+    if not hasattr(FlaxLlamaForCausalLMModule, "_backup_init"):
+        FlaxLlamaForCausalLMModule._backup_init = FlaxLlamaForCausalLMModule.init
+    FlaxLlamaForCausalLMModule.init = init_dummy
+
+@jax.tree_util.register_pytree_node_class
+class _ParamsPlaceholder:
+
+    def tree_flatten(self):
+        return ((), None)
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        del aux, children
+        return cls()
+
+@typing.runtime_checkable
+class Initable(Protocol):
+    """An object with an init function."""
+
+    def init(self, params):
+        """Calling the init for given parameters returns a fresh opt state."""
+
+def tree_map_params(
+    initable,
+    f,
+    state,
+    /,
+    *rest,
+    transform_non_params = None,
+    is_leaf = None,
+):
+    """Apply a callable over all params in the given optimizer state.
+
+    This function exists to help construct partition specs over optimizer
+    states, in the case that a partition spec is already known for the parameters.
+
+    For example, the following will replace all optimizer state parameter trees
+    with copies of the given partition spec instead. The argument
+    `transform_non_params` can be used to replace any remaining fields as
+    required, in this case, we replace those fields by None.
+
+    >>> params, specs = jnp.array(0.), jnp.array(0.)  # Trees with the same shape
+    >>> opt = optax.sgd(1e-3)
+    >>> state = opt.init(params)
+    >>> opt_specs = optax.tree_map_params(
+    ...     opt,
+    ...     lambda _, spec: spec,
+    ...     state,
+    ...     specs,
+    ...     transform_non_params=lambda _: None,
+    ...     )
+
+    Args:
+    initable: A callable taking parameters and returning an optimizer state, or
+        an object with an `init` attribute having the same function.
+    f: A callable that will be applied for all copies of the parameter tree
+        within this optimizer state.
+    state: The optimizer state to map over.
+    *rest: Additional arguments, having the same shape as the parameter tree,
+        that will be passed to f.
+    transform_non_params: An optional function that will be called on all
+        non-parameter fields within the optimizer state.
+    is_leaf: Passed through to `jax.tree.map`. This makes it possible to ignore
+        parts of the parameter tree e.g. when the gradient transformations modify
+        the shape of the original pytree, such as for ``optax.masked``.
+
+    Returns:
+    The result of applying the function f on all trees in the optimizer's state
+    that have the same shape as the parameter tree, along with the given
+    optional extra arguments.
+    """
+
+    # Cast for pytype checks (no-op for other usages).
+    placeholder = cast(base.chex.ArrayTree, _ParamsPlaceholder())
+
+    if isinstance(initable, Initable):
+        initable = cast(Initable, initable)  # for pytype checks
+        state_with_placeholders = initable.init(placeholder)
+    else:
+        state_with_placeholders = initable(placeholder)
+
+    def map_params(maybe_placeholder_value, value):
+        if isinstance(maybe_placeholder_value, _ParamsPlaceholder):
+            return jax.tree_util.tree_map(f, value, *rest, is_leaf=is_leaf)
+        elif transform_non_params is not None:
+            return transform_non_params(value)
+        else:
+            return value
+
+    return jax.tree_util.tree_map(
+        map_params,
+        state_with_placeholders,
+        state,
+        is_leaf=lambda v: isinstance(v, _ParamsPlaceholder),
+    )
 
 alpa.init(cluster="ray")
 
-from transformers.testing_utils import CaptureLogger
-from transformers.utils import get_full_repo_name, send_example_telemetry
 
 tf.config.experimental.set_visible_devices([], 'GPU')
 
@@ -75,206 +169,180 @@ MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+@jax.tree_util.register_pytree_node_class
+class _ParamsPlaceholder:
+
+  def tree_flatten(self):
+    return ((), None)
+
+  @classmethod
+  def tree_unflatten(cls, aux, children):
+    del aux, children
+    return cls()
+
+@typing.runtime_checkable
+class Initable(Protocol):
+  """An object with an init function."""
+
+  def init(self, params):
+    """Calling the init for given parameters returns a fresh opt state."""
+
+def tree_map_params(
+    initable,
+    f,
+    state,
+    /,
+    *rest,
+    transform_non_params = None,
+    is_leaf = None,
+):
+  """Apply a callable over all params in the given optimizer state.
+
+  This function exists to help construct partition specs over optimizer
+  states, in the case that a partition spec is already known for the parameters.
+
+  For example, the following will replace all optimizer state parameter trees
+  with copies of the given partition spec instead. The argument
+  `transform_non_params` can be used to replace any remaining fields as
+  required, in this case, we replace those fields by None.
+
+  >>> params, specs = jnp.array(0.), jnp.array(0.)  # Trees with the same shape
+  >>> opt = optax.sgd(1e-3)
+  >>> state = opt.init(params)
+  >>> opt_specs = optax.tree_map_params(
+  ...     opt,
+  ...     lambda _, spec: spec,
+  ...     state,
+  ...     specs,
+  ...     transform_non_params=lambda _: None,
+  ...     )
+
+  Args:
+    initable: A callable taking parameters and returning an optimizer state, or
+      an object with an `init` attribute having the same function.
+    f: A callable that will be applied for all copies of the parameter tree
+      within this optimizer state.
+    state: The optimizer state to map over.
+    *rest: Additional arguments, having the same shape as the parameter tree,
+      that will be passed to f.
+    transform_non_params: An optional function that will be called on all
+      non-parameter fields within the optimizer state.
+    is_leaf: Passed through to `jax.tree.map`. This makes it possible to ignore
+      parts of the parameter tree e.g. when the gradient transformations modify
+      the shape of the original pytree, such as for ``optax.masked``.
+
+  Returns:
+    The result of applying the function f on all trees in the optimizer's state
+    that have the same shape as the parameter tree, along with the given
+    optional extra arguments.
+  """
+
+  # Cast for pytype checks (no-op for other usages).
+  placeholder = cast(base.chex.ArrayTree, _ParamsPlaceholder())
+
+  if isinstance(initable, Initable):
+    initable = cast(Initable, initable)  # for pytype checks
+    state_with_placeholders = initable.init(placeholder)
+  else:
+    state_with_placeholders = initable(placeholder)
+
+  def map_params(maybe_placeholder_value, value):
+    if isinstance(maybe_placeholder_value, _ParamsPlaceholder):
+      return jax.tree_util.tree_map(f, value, *rest, is_leaf=is_leaf)
+    elif transform_non_params is not None:
+      return transform_non_params(value)
+    else:
+      return value
+
+  return jax.tree_util.tree_map(
+      map_params,
+      state_with_placeholders,
+      state,
+      is_leaf=lambda v: isinstance(v, _ParamsPlaceholder),
+  )
+
+def llama_manual_sharding(num_layers, state: TrainState):
+    param_partition = {
+        'lm_head': {
+            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension (hidden), NOT the vocabulary dimension
+        },
+        'model': {
+            'embed_tokens': {
+                'embedding': PartitionSpec("mp", None),  # Shard along the first dimension (hidden), NOT the vocabulary dimension
+            },
+            'layers': {
+                '%d' % (layer): {
+                    'input_layernorm': {
+                        'weight': PartitionSpec(None),  # Replicate layer norm weights
+                    },
+                    'mlp': {
+                        'down_proj': {
+                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
+                        },
+                        'gate_proj': {
+                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
+                        },
+                        'up_proj': {
+                            'kernel': PartitionSpec("mp", None),  # Shard along the first dimension
+                        },
+                    },
+                    'post_attention_layernorm': {
+                        'weight': PartitionSpec(None),  # Replicate layer norm weights
+                    },
+                    'self_attn': {
+                        'k_proj': {
+                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
+                        },
+                        'o_proj': {
+                            'kernel': PartitionSpec("mp", None),  # Shard along the first dimension
+                        },
+                        'q_proj': {
+                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
+                        },
+                        'v_proj': {
+                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
+                        },
+                    },
+                }
+                for layer in range(num_layers)
+            },
+            'norm': {
+                'weight': PartitionSpec(None),  # Replicate final layer norm weight
+            },
+        },
+    }
+
+    # Use tree_map_params with the correct structure
+
+    replicate = lambda x : jax.tree_util.tree_map(lambda _: PartitionSpec(None), x)
+    opt_state = tree_map_params(state.tx, lambda _, spec: spec, state.opt_state,
+                                param_partition, transform_non_params=lambda _: PartitionSpec(None))
+    manual_partition = TrainState(
+        step=PartitionSpec(None),
+        params=param_partition,
+        master_copy=param_partition if state.master_copy else None,
+        dynamic_scale=replicate(state.dynamic_scale),
+        tx=state.tx,
+        apply_fn=state.apply_fn,
+        opt_state=opt_state
+    )
+    return manual_partition
+
+
 @dataclass
-class TrainingArguments:
-    output_dir: str = field(
-        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
-    )
-    overwrite_output_dir: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Overwrite the content of the output directory. "
-                "Use this to continue training if output_dir points to a checkpoint directory."
-            )
-        },
-    )
-    do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
-    do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
-    per_device_train_batch_size: int = field(
-        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
-    )
-    per_device_eval_batch_size: int = field(
-        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
-    )
-    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
-    operator_parallel: int = field(default=1, metadata={"help": "The degree of operator model parallelism."})
-    pipeline_parallel: int = field(default=1, metadata={"help": "The degree of pipeline model parallelism."})
-    use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})
-    learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
-    weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
-    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
-    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
-    adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
-    adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
-    warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
-    save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
-    eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
-    seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
-    push_to_hub: bool = field(
-        default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
-    )
-    hub_model_id: str = field(
-        default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
-    )
-    hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
-
-    def __post_init__(self):
-        if self.output_dir is not None:
-            self.output_dir = os.path.expanduser(self.output_dir)
-
-    def to_dict(self):
-        """
-        Serializes this instance while replace `Enum` by their values (for JSON serialization support). It obfuscates
-        the token values by removing their value.
-        """
-        d = asdict(self)
-        for k, v in d.items():
-            if isinstance(v, Enum):
-                d[k] = v.value
-            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], Enum):
-                d[k] = [x.value for x in v]
-            if k.endswith("_token"):
-                d[k] = f"<{k.upper()}>"
-        return d
-
+class ModelArguments(ModelArguments):
+    pass
 
 @dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
-    """
-
-    model_name_or_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
-            )
-        },
-    )
-    model_type: Optional[str] = field(
-        default=None,
-        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
-    )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    dtype: Optional[str] = field(
-        default="float32",
-        metadata={
-            "help": (
-                "Floating-point format in which the model weights should be initialized and trained. Choose one of"
-                " `[float32, float16, bfloat16]`."
-            )
-        },
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-                "with private models)."
-            )
-        },
-    )
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
-
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
-    validation_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of training examples to this "
-                "value if set."
-            )
-        },
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-                "value if set."
-            )
-        },
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    validation_split_percentage: Optional[int] = field(
-        default=5,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
-    )
-    block_size: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional input sequence length after tokenization. "
-                "The training dataset will be truncated in block of this size for training. "
-                "Default to the model max input length for single sentence inputs (take into account special tokens)."
-            )
-        },
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    keep_linebreaks: bool = field(
-        default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
-    )
-    use_data_sample: bool = field(default=False, metadata={
-        "help" : "Whether to use data sample or not which consists only 1000 data rows"
-    })
-
+class DataTrainingArguments(DataTrainingArguments):
     def __post_init__(self):
         if self.use_data_sample:
             self.dataset_name = "Erland/oscar_sampled_1000"
             self.dataset_config_name = "default"
             delattr(self, "use_data_sample")
 
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
-            if self.validation_file is not None:
-                extension = self.validation_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
+        super().__post_init__()
+
 
 
 def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
@@ -326,58 +394,6 @@ def create_learning_rate_fn(
     )
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
-
-
-def monkey_patch_remat():
-    # Use monkey patch to add remat for all transformer layers.
-    from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
-    from flax.linen.partitioning import remat
-    from flax.linen.module import wrap_method_once
-    import flax.linen as nn
-
-    @wrap_method_once
-    def setup(self):
-        self.layers = [
-            remat(FlaxOPTDecoderLayer, static_argnums=(2, 3, 4))(
-                self.config, name=str(i), dtype=self.dtype)
-            for i in range(self.config.num_hidden_layers)
-        ]
-        self.layerdrop = self.config.layerdrop
-
-    def call(
-        self,
-        hidden_states,
-        attention_mask,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-
-        for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask,
-                init_cache,
-                output_attentions,
-                deterministic,
-            )
-
-            hidden_states = layer_outputs[0]
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        outputs = [hidden_states, all_hidden_states, all_self_attns]
-        return outputs
-
-    setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
-    setattr(FlaxOPTDecoderLayerCollection, "__call__", call)
 
 
 def main():
@@ -529,9 +545,6 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if training_args.use_remat:
-        monkey_patch_remat()
-
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.tokenizer_name,
@@ -553,6 +566,9 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    do_monkey_patch()
+
+
     if model_args.model_name_or_path:
         model = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -560,7 +576,9 @@ def main():
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
+            from_pt=False
         )
+
         #from transformers import FlaxOPTForCausalLM
         #config.num_hidden_layers = 2
         #model = FlaxOPTForCausalLM(
@@ -674,13 +692,15 @@ def main():
     num_devices = alpa.get_global_num_devices()
     train_min_batch_size = (num_devices // training_args.operator_parallel //
                             training_args.pipeline_parallel * training_args.num_micro_batches)
-    eval_num_micro_batches = training_args.num_micro_batches
-    eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                           training_args.pipeline_parallel * eval_num_micro_batches)
-    while len(eval_dataset) < eval_min_batch_size:
-        eval_num_micro_batches //= 2
+                        
+    if training_args.do_eval:
+        eval_num_micro_batches = training_args.num_micro_batches
         eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                               training_args.pipeline_parallel * eval_num_micro_batches)
+                            training_args.pipeline_parallel * eval_num_micro_batches)
+        while len(eval_dataset) < eval_min_batch_size:
+            eval_num_micro_batches //= 2
+            eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                                training_args.pipeline_parallel * eval_num_micro_batches)
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
@@ -730,7 +750,7 @@ def main():
     def decay_mask_fn(params):
         flat_params = traverse_util.flatten_dict(params)
         flat_mask = {
-            path: (path[-1] != "bias" and path[-2:] not in [("ln_1", "scale"), ("ln_2", "scale"), ("ln_f", "scale")])
+            path: (path[-1] != "bias" and path[-2:] not in [("input_layernorm", "weight"), ("post_attention_layernorm", "weight")])
             for path in flat_params
         }
         return traverse_util.unflatten_dict(flat_mask)
@@ -743,6 +763,8 @@ def main():
             learning_rate=linear_decay_lr_schedule_fn,
         )
     else:
+        if training_args.weight_decay == 0.0:
+            decay_mask_fn = None
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(
@@ -751,8 +773,12 @@ def main():
                 b2=training_args.adam_beta2,
                 eps=training_args.adam_epsilon,
                 weight_decay=training_args.weight_decay,
-                mask=decay_mask_fn)
+                mask=decay_mask_fn
+            )
         )
+    if training_args.gradient_accumulation_steps > 1:
+        optimizer = optax.MultiSteps(optimizer, training_args.gradient_accumulation_steps)
+    grad_accum_steps = training_args.gradient_accumulation_steps
 
     # Setup train state
     if model_args.dtype == "float16":
@@ -762,16 +788,43 @@ def main():
         alpa.global_config.flax_always_use_fp16_embedding = True
     else:
         use_master_copy = dynamic_scale = None
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
-                              dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
-    def loss_fn(logits, labels):
+    state = TrainState.create(
+        apply_fn=model.__call__, 
+        params=model.params, 
+        tx=optimizer, 
+        dynamic_scale=dynamic_scale,
+        use_master_copy=use_master_copy
+    )
+
+    dump_debug_info_train_step = dump_debug_info_eval_step = True
+
+    # Manual partition spec
+    state_manual_sharding = llama_manual_sharding(config.num_hidden_layers, state)
+    ms_option = ManualShardingOption(
+        ("dp", "mp"), in_axis_resources=(state_manual_sharding, PartitionSpec("dp", None)))
+    ignore_ids = (IGNORE_TOKEN_ID, )
+
+    def loss_fn(logits, labels, ignore_indices):
+        # Shift logits
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
-        loss = optax.softmax_cross_entropy(
-            shift_logits,
-            jax.nn.one_hot(shift_labels, logits.shape[-1]))
-        return loss.mean()
+        # Handle the ignore index: compute the valid first
+        valid = jnp.full(shift_labels.shape, True)
+        for ignore_index in ignore_indices:
+            new_valid = jnp.not_equal(shift_labels, ignore_index)
+            valid = jnp.logical_and(valid, new_valid)
+        valid = jnp.asarray(valid, dtype=jnp.float32)
+        valid_len = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
+        # OneHot and mask the ignore index. For ignore_index(-100), the whole line
+        # in the output would be 0.
+        one_hot_labels = jax.nn.one_hot(shift_labels, shift_logits.shape[-1])
+        # Compute the softmax loss
+        log_p = jax.nn.log_softmax(shift_logits, axis=-1)
+        # (bs, seq_len, vocab) -> (bs, seq_len)
+        cross_entropy = jnp.sum(one_hot_labels * log_p, axis=-1)
+        loss = -jnp.mean(jnp.sum(cross_entropy * valid, axis=-1) / valid_len)
+        return loss
 
     # Define gradient update step fn
     def train_step(state, batch):
@@ -779,7 +832,7 @@ def main():
         def compute_loss(params):
             labels = batch.pop("labels")
             logits = state.apply_fn(**batch, params=params)[0]
-            loss = loss_fn(logits, labels)
+            loss = loss_fn(logits, labels, ignore_ids)
             return loss
 
         dynamic_scale = state.dynamic_scale
@@ -809,32 +862,39 @@ def main():
 
         return new_state, metrics
 
-    # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
         logits = model(**batch, params=params)[0]
-        loss = loss_fn(logits, labels)
-
-        # summarize metrics
+        loss = loss_fn(logits, labels, ignore_ids)
         metrics = {"loss": loss}
         return metrics
 
     # Create parallel version of the train and eval step
     method = alpa.get_3d_parallel_method(
-            num_micro_batches=training_args.num_micro_batches,
-            data_parallel=-1,
-            operator_parallel=training_args.operator_parallel,
-            pipeline_parallel=training_args.pipeline_parallel
+        num_micro_batches=training_args.per_device_train_batch_size,
+        data_parallel=-1,
+        operator_parallel=training_args.operator_parallel,
+        pipeline_parallel=training_args.pipeline_parallel,
+        manual_layer_num=config.num_hidden_layers,
+        manual_sharding_option=ms_option
     )
 
-    p_train_step = alpa.parallelize(train_step,
-                                    method=method,
-                                    donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step,
-                                   method=alpa.FollowParallel(
-                                       p_train_step, num_micro_batches=eval_num_micro_batches))
 
-    dump_debug_info_train_step = dump_debug_info_eval_step = True
+    p_train_step = alpa.parallelize(
+        train_step,
+        method=method,
+        donate_argnums=(0,)
+    )
+
+    if training_args.do_eval:
+        p_eval_step = alpa.parallelize(
+            eval_step,
+            method=alpa.FollowParallel(
+                p_train_step, 
+                num_micro_batches=training_args.per_device_eval_batch_size
+            )
+        )                             
+                             
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -863,15 +923,26 @@ def main():
         train_loader = data_loader(input_rng, train_dataset, train_batch_size,
                                    train_min_batch_size, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
-        # train
-        for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
+
+        steps_trained_progress_bar = tqdm(
+            range(steps_per_epoch),
+            desc="Training...",
+            position=1,
+            leave=False
+        )
+        for step in range(steps_per_epoch):
+            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+
             batch = next(train_loader)
+            print("Input IDs shape (inside train_step):", batch["input_ids"].shape)
             batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
                                      batch["attention_mask"]) - 1
+
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
-            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+            if step % grad_accum_steps == 0:
+                steps_trained_progress_bar.update(1)
 
             if dump_debug_info_train_step:
                 dump_debug_info_train_step = False
@@ -914,44 +985,48 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            if cur_step % training_args.eval_steps == 0 and cur_step > 0:
-                # ======================== Evaluating ==============================
-                eval_metrics = []
-                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-                                          eval_min_batch_size)
-                eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
-                    # Model forward
-                    batch = next(eval_loader)
-                    batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                                             batch["attention_mask"]) - 1
-                    metrics = p_eval_step(state.params, batch)
-                    eval_metrics.append(metrics)
+            if training_args.do_eval:
+                # Only support steps
+                if ( cur_step % (training_args.eval_steps * grad_accum_steps) == 0 and
+                    cur_step > 0 and 
+                    model_args.eval_strategy == "steps"):
+                    # ======================== Evaluating ==============================
+                    eval_metrics = []
+                    eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                            eval_min_batch_size)
+                    eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                    for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+                        # Model forward
+                        batch = next(eval_loader)
+                        batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                                batch["attention_mask"]) - 1
+                        metrics = p_eval_step(state.params, batch)
+                        eval_metrics.append(metrics)
 
-                    if dump_debug_info_eval_step:
-                        dump_debug_info_eval_step = False
-                        executable = p_eval_step.get_last_executable()
-                        executable.dump_debug_info("alpa_debug_info")
+                        if dump_debug_info_eval_step:
+                            dump_debug_info_eval_step = False
+                            executable = p_eval_step.get_last_executable()
+                            executable.dump_debug_info("alpa_debug_info")
 
-                # normalize eval metrics
-                eval_metrics = alpa.util.get_metrics(eval_metrics)
-                eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+                    # normalize eval metrics
+                    eval_metrics = alpa.util.get_metrics(eval_metrics)
+                    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                try:
-                    eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-                except OverflowError:
-                    eval_metrics["perplexity"] = float("inf")
+                    try:
+                        eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+                    except OverflowError:
+                        eval_metrics["perplexity"] = float("inf")
 
-                # Print metrics and update progress bar
-                desc = (
-                    f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
-                    f" {eval_metrics['perplexity']})"
-                )
-                epochs.write(desc)
+                    # Print metrics and update progress bar
+                    desc = (
+                        f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+                        f" {eval_metrics['perplexity']})"
+                    )
+                    epochs.write(desc)
 
-                # Save metrics
-                if has_tensorboard:
-                    write_eval_metric(summary_writer, eval_metrics, cur_step)
+                    # Save metrics
+                    if has_tensorboard:
+                        write_eval_metric(summary_writer, eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
