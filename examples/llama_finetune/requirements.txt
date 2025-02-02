@@ -1,0 +1,10 @@
+transformers
+datasets
+sentencepiece
+tensorflow==2.11.0
+ml_collections
+mlxu==0.1.9
+fschat==0.2.5
+pydantic<2
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==1.13.1
