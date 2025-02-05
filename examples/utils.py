@@ -1,16 +1,18 @@
+import jax
 import os
+import logging
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Callable
+from typing import Optional, Callable, Union, Dict
 from enum import Enum
 
 import optax
 import jax.numpy as jnp
 from flax import traverse_util
-from flax.training.common_utils import get_metrics
 from transformers import (
     is_wandb_available,
     is_tensorboard_available,
-    TrainingArguments
+    TrainingArguments,
+    FLAX_MODEL_FOR_MASKED_LM_MAPPING
 )
 
 HAS_WANDB = is_wandb_available()
@@ -34,8 +36,21 @@ __all__ = [
     "mb_item",
     "make_batch",
     "create_learning_rate_fn",
-    "decay_mask_fn"
+    "decay_mask_fn",
+    "init_alpa",
+    "maybe_stop_wandb",
+    "login_wandb",
+    "instantiate_wandb",
+    "setup_logging"
 ]
+
+MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
+MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+def init_alpa(cluster: str = "ray", normalize_embedding_shape: bool = True):
+    import alpa 
+    alpa.init(cluster=cluster)
+    alpa.global_config.force_normalize_embedding_shapes = normalize_embedding_shape
 
 @dataclass
 class ModelArguments:
@@ -48,6 +63,13 @@ class ModelArguments:
         metadata={
             "help": "The model checkpoint for weights initialization."
             "Don't set if you want to train a model from scratch."
+        },
+    )
+    model_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "If training from scratch, pass a model type from the list: "
+            + ", ".join(MODEL_TYPES)
         },
     )
     config_name: Optional[str] = field(
@@ -253,19 +275,57 @@ class TrainingArguments(TrainingArguments):
         return d
 
 
-def write_train_metric(summary_writer, train_metrics, train_time, step):
-    summary_writer.scalar("train_time", train_time, step)
+def write_eval_metric_wandb(eval_metrics, step):
+    import wandb
 
-    train_metrics = get_metrics(train_metrics)
-    for key, vals in train_metrics.items():
-        tag = f"train_{key}"
-        for i, val in enumerate(vals):
-            summary_writer.scalar(tag, val, step - len(vals) + i + 1)
-
-
-def write_eval_metric(summary_writer, eval_metrics, step):
     for metric_name, value in eval_metrics.items():
-        summary_writer.scalar(f"eval_{metric_name}", value, step)
+        wandb.log({f"eval_{metric_name}": value}, step)
+
+
+def write_train_metric(train_metrics, train_time, step, summary_writer=None):
+    if jax.process_index() == 0:
+        import wandb
+        import alpa
+
+        try:
+            train_metrics = alpa.util.get_metrics(train_metrics)
+        except Exception as _:
+            pass
+
+        if wandb.run:
+            for key, vals in train_metrics.items():
+                tag = f"train_{key}"
+                if hasattr(vals, "__iter__"):
+                    for i, val in enumerate(vals):
+                        wandb.log({tag: val}, step - len(vals) + i + 1)
+                else:
+                    wandb.log({tag: val}, step)
+            wandb.log({"train_time": train_time}, step)
+
+        
+        if summary_writer:
+            summary_writer.scalar("train_time", train_time, step)
+
+            train_metrics = alpa.util.get_metrics(train_metrics)
+            for key, vals in train_metrics.items():
+                tag = f"train_{key}"
+                for i, val in enumerate(vals):
+                    summary_writer.scalar(tag, val, step - len(vals) + i + 1)
+
+
+def write_eval_metric(eval_metrics, step, summary_writer=None):
+    if jax.process_index() == 0:
+        import wandb
+        import alpa
+
+        try:
+            eval_metrics = alpa.util.get_metrics(eval_metrics)
+        except Exception as _:
+            pass
+
+        if wandb.run:
+            for metric_name, value in eval_metrics.items():
+                summary_writer.scalar(f"eval_{metric_name}", value, step)
 
 def create_learning_rate_fn(
     train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
@@ -295,3 +355,49 @@ def decay_mask_fn(params, flatten_layers):
         for path in flat_params
     }
     return traverse_util.unflatten_dict(flat_mask)
+
+def maybe_stop_wandb():
+    import wandb
+
+    try:
+        if wandb.run:
+            wandb.finish()
+    except Exception as _:
+        pass
+
+def login_wandb(
+    environ_name: str = "WANDB_API_KEY", token: Optional[str] = None, **kwargs
+):
+    import wandb
+
+    if token is None:
+        token = os.getenv(environ_name)
+        print(f"Use token from environment variable {environ_name}")
+    wandb.login(key=token, **kwargs)
+
+def instantiate_wandb(
+    run_name: Optional[str] = None, 
+    config: Union[Dict, None] = None,
+    project: str = "copus"
+):
+    import wandb
+    wandb.init(project=project, entity=None, name=run_name, config=config)
+
+def setup_logging(name, level: str="DEBUG"):
+    import datasets
+    import transformers
+
+    logger = logging.getLogger(name)
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=getattr(logging, level)
+    )
+
+    if jax.process_index() == 0:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        transformers.utils.logging.set_verbosity_error()
+    return logger

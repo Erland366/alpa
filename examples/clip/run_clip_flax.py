@@ -6,7 +6,6 @@ from examples.utils import *
 
 import alpa
 import logging
-import os
 import sys
 import time
 import functools
@@ -59,16 +58,14 @@ from transformers import (
     CLIPProcessor,
     HfArgumentParser,
     is_tensorboard_available,
-    IntervalStrategy
-    
+    IntervalStrategy,
+    set_seed
 )
 from transformers.testing_utils import CaptureLogger
 
-from importlib.util import find_spec
+init_alpa(normalize_embedding_shape=False)
 
-alpa.init(cluster="ray")
-
-logger = logging.getLogger(__name__)
+logger = setup_logging(__name__)
 
 disable_log = True
 if disable_log:
@@ -121,6 +118,7 @@ class TrainingArguments(TrainingArguments):
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, ImageAugmentationArguments))
+
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
@@ -139,27 +137,11 @@ def main():
             "Use --overwrite_output_dir to overcome."
         )
 
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    # Setup logging, we only want one process per machine to log things on the screen.
-    logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
-    if jax.process_index() == 0:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
+    login_wandb()
+    instantiate_wandb()
+    set_seed(getattr(training_args, "seed", 3407))
 
     logger.info(f"Training/evaluation parameters {training_args}")
-
-    # Load pretrained model and tokenizer
-
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
 
     if data_args.dataset_name is not None:
         dataset = load_dataset(
@@ -211,6 +193,8 @@ def main():
         model = FlaxCLIPModel(
             config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype)
         )
+
+    breakpoint()
 
     config = model.config
     if training_args.do_train:
@@ -348,6 +332,7 @@ def main():
             logger.warning(
                 f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
             )
+            summary_writer = None
     else:
         logger.warning(
             "Unable to display metrics through TensorBoard because the package is not installed: "
@@ -469,21 +454,28 @@ def main():
 
     # Check whether this is correct
     def cross_entropy(logits, axis):
-        logprobs = jax.nn.log_softmax(logits, axis=axis)
-        nll = jnp.diag(logprobs)
-        ce = -jnp.mean(nll)
-        return ce
+        """copied from https://github.com/huggingface/transformers/blob/main/examples/flax/text-retrieval/run_clip.py#L488"""
+        labels = jnp.arange(logits.shape[0])
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits, labels=labels
+        ).mean()
+        return loss
 
-    def clip_loss(similarity):
-        loss = (cross_entropy(similarity, axis=0) + cross_entropy(similarity, axis=1)) / 2
+    def clip_loss(logits_per_image, logits_per_text):
+        """modified clip loss to accept both logits"""
+        loss_img = cross_entropy(logits_per_image, axis=0)
+        loss_txt = cross_entropy(logits_per_text, axis=1)
+        loss = (loss_img + loss_txt) / 2
         return loss
 
     # Define gradient update step fn
     def train_step(state, batch):
-
         def compute_loss(params):
-            logits = state.apply_fn(**batch, params=params)[0]
-            loss = clip_loss(logits)
+            outputs = state.apply_fn(**batch, params=params) # Model forward pass
+            logits_per_image = outputs.logits_per_image
+            logits_per_text = outputs.logits_per_text
+            loss = clip_loss(logits_per_image, logits_per_text)
+            # loss = jnp.array(0.0) # Dummy Loss
             return loss
 
         dynamic_scale = state.dynamic_scale
@@ -521,11 +513,15 @@ def main():
         metrics = {"loss": loss}
         return metrics
 
-    method = alpa.get_3d_parallel_method(
-            num_micro_batches=training_args.per_device_train_batch_size,
-            data_parallel=-1,
-            operator_parallel=training_args.operator_parallel,
-            pipeline_parallel=training_args.pipeline_parallel
+    # method = alpa.get_3d_parallel_method(
+    #         num_micro_batches=training_args.per_device_train_batch_size,
+    #         data_parallel=-1,
+    #         operator_parallel=training_args.operator_parallel,
+    #         pipeline_parallel=training_args.pipeline_parallel
+    # )
+    from alpa import AutoShardingOption
+    method = alpa.ShardParallel(
+        auto_sharding_option=AutoShardingOption(allow_mixed_mesh_shape=True)
     )
 
     p_train_step = alpa.parallelize(
@@ -580,7 +576,12 @@ def main():
 
             batch = make_batch(batch) # Since output of torch.DataLoader is `torch.Tensor`, we need to convert it into `jnp.array`
 
-            state, train_metric = p_train_step(state, make_batch(batch))
+            print("Input batch shapes:")
+            print("pixel_values:", batch["pixel_values"].shape)
+            print("input_ids:", batch["input_ids"].shape)
+            print("attention_mask:", batch["attention_mask"].shape)
+
+            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
             if step % grad_accum_steps == 0:
@@ -612,7 +613,7 @@ def main():
                 # Save metrics
                 train_time += time.time() - train_start
                 if has_tensorboard:
-                    write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+                    write_train_metric(train_metrics, train_time, cur_step, summary_writer)
 
                 train_metric = jax.tree_map(np.mean, train_metric)
 
@@ -658,7 +659,7 @@ def main():
                     # Save metrics
                     if has_tensorboard and jax.process_index() == 0:
                         # cur_step = epoch * (len(train_dataset) // train_batch_size)
-                        write_eval_metric(summary_writer, eval_metrics, cur_step)
+                        write_eval_metric(eval_metrics, cur_step, summary_writer)
                     if has_wandb and jax.process_index() == 0 and ("wandb" in training_args.report_to):
                         _metrics = {f"eval_{k}":mb_item(v) for k, v in eval_metrics.items()}
                         wandb.log({"eval_step":cur_step, **_metrics})
@@ -696,7 +697,7 @@ def main():
         # Save metrics
         if has_tensorboard and jax.process_index() == 0:
             # cur_step = epoch * (len(train_dataset) // train_batch_size)
-            write_eval_metric(summary_writer, eval_metrics, cur_step)
+            write_eval_metric(eval_metrics, cur_step, summary_writer)
         if has_wandb and jax.process_index() == 0 and ("wandb" in training_args.report_to):
             _metrics = {f"eval_{k}":mb_item(v) for k, v in eval_metrics.items()}
             wandb.log({"eval_step":cur_step, **_metrics})
@@ -716,6 +717,8 @@ def main():
     #     commit_message=f"Saving weights and logs at step {cur_step}",
     #     repo_name_or_path=training_args.output_dir
     # )
+
+    maybe_stop_wandb()
 
 
 
