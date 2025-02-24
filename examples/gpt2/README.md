@@ -132,6 +132,29 @@ python3 run_clm_flax.py \
     --eval_steps="2500"
 ```
 
+```bash
+python examples/gpt2/run_clm_flax_erland.py \
+    --output_dir="./norwegian-gpt2" \
+    --model_name_or_path="openai-community/gpt2" \
+    --model_type="gpt2" \
+    --dataset_name="oscar" \
+    --dataset_config_name="unshuffled_deduplicated_no" \
+    --do_train --do_eval \
+    --block_size="512" \
+    --per_device_train_batch_size="8" \
+    --per_device_eval_batch_size="4" \
+    --dtype="float16" \
+    --learning_rate="1e-3" --warmup_steps="1000" \
+    --adam_beta1="0.9" --adam_beta2="0.98" --weight_decay="0.01" \
+    --overwrite_output_dir \
+    --num_train_epochs="20" \
+    --logging_steps="100" \
+    --save_steps="2500" \
+    --eval_steps="2500" \
+    --parallel_strategy="pipeshard" \
+    --use_data_sample
+```
+
 Training should converge at a loss and perplexity 
 of 3.24 and 25.72 respectively after 20 epochs
 This should take less than ~21 hours on a single TPUv3-8 or a machine with 8 V100 GPUs.

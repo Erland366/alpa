@@ -720,6 +720,7 @@ def main():
 
     maybe_stop_wandb()
 
+    alpa.shutdown()
 
 
 

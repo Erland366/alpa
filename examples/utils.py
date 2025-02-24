@@ -1,11 +1,18 @@
 import jax
+import alpa
 import os
 import logging
+import typing
+import tensorflow as tf
+import transformers
+from datasets import Dataset
+
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Callable, Union, Dict
+from typing import Optional, Callable, Union, Dict, cast, Protocol, Literal
 from enum import Enum
 
 import optax
+from optax._src import base
 import jax.numpy as jnp
 from flax import traverse_util
 from transformers import (
@@ -15,13 +22,7 @@ from transformers import (
     FLAX_MODEL_FOR_MASKED_LM_MAPPING
 )
 
-HAS_WANDB = is_wandb_available()
-HAS_TENSORBOARD = is_tensorboard_available()
-DEBUG = True
-if DEBUG:
-    HAS_WANDB = False
-    HAS_TENSORBOARD = False
-    os.environ["WANDB_DISABLED"] = "true"
+
 
 __all__ = [
     "ModelArguments",
@@ -33,6 +34,7 @@ __all__ = [
     "DEBUG",
     "write_train_metric",
     "write_eval_metric",
+    "write_metric",
     "mb_item",
     "make_batch",
     "create_learning_rate_fn",
@@ -41,14 +43,112 @@ __all__ = [
     "maybe_stop_wandb",
     "login_wandb",
     "instantiate_wandb",
-    "setup_logging"
+    "setup_logging",
+    "tree_map_params",
+    "create_alpa_method",
+    "AlpaMethod",
+    "count_params",
+    "data_loader",
+    "init_debug",
+    "setup_experiment_logging"
 ]
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+
+def setup_experiment_logging():
+    global HAS_WANDB
+    global HAS_TENSORBOARD
+    global DEBUG
+
+    HAS_WANDB = is_wandb_available()
+    HAS_TENSORBOARD = is_tensorboard_available()
+    DEBUG = os.getenv("DEBUG", True) # For now it's flipped
+
+    if DEBUG:
+        HAS_WANDB = False
+        HAS_TENSORBOARD = False
+        os.environ["WANDB_DISABLED"] = "true"
+
+setup_experiment_logging()
+
+class AlpaMethod(str, Enum):
+    ZERO2 = "zero2"
+    ZERO3 = "zero3"
+    PARALLEL_3D = "parallel_3d"
+    PIPESHARD = "pipeshard"
+    SHARD_PARALLEL = "shard_parallel"
+    DATA_PARALLEL = "data_parallel"
+
+def create_alpa_method(method: AlpaMethod, training_args, *args, **kwargs):
+    num_micro_batches = training_args.num_micro_batches
+    if method == AlpaMethod.ZERO2:
+        parallel_method = alpa.Zero2Parallel(
+            *args, num_micro_batches=num_micro_batches, **kwargs
+        )
+    elif method == AlpaMethod.ZERO3:
+        parallel_method = alpa.Zero3Parallel(
+            *args, num_micro_batches=num_micro_batches, **kwargs
+        )
+    elif method == AlpaMethod.PARALLEL_3D:
+        parallel_method = alpa.get_3d_parallel_method(
+            *args,
+            num_micro_batches=num_micro_batches,
+            data_parallel=training_args.data_parallel,
+            operator_parallel=training_args.operator_parallel,
+            pipeline_parallel=training_args.pipeline_parallel,
+            
+            **kwargs
+        )
+    elif method == AlpaMethod.PIPESHARD:
+        parallel_method = alpa.PipeshardParallel(
+            *args,
+            num_micro_batches=num_micro_batches,
+            pipeline_schedule=training_args.pipeline_schedule,
+            stage_option="uniform",
+            ## Default value for layer_option here
+            # layer_option=alpa.AutoLayerOption(layer_num=2),
+            layer_option="manual",
+            **kwargs
+        )
+    elif method == AlpaMethod.SHARD_PARALLEL:
+        parallel_method = alpa.ShardParallel(
+            *args,
+            num_micro_batches=num_micro_batches,
+            **kwargs
+        )
+    elif method == AlpaMethod.DATA_PARALLEL:
+        parallel_method = alpa.DataParallel(
+            *args,
+            num_micro_batches=num_micro_batches,
+            **kwargs
+        )
+    else:
+        raise ValueError(f"Your {method} is not supported yet")
+
+    print(f"{parallel_method = }")
+    return parallel_method
+
+def init_debug():
+    if bool(os.getenv("ALPA_DEBUG", False)):
+        from alpa import global_config
+
+        os.environ["ALPA_DEBUG_PRINT_AS_STRATEGY"] = "1"
+        os.environ["JAX_DISABLE_JIT"] = "True"
+        global_config.pipeline_distributed_compile = False
+
+        logger.warning(
+            "You activate ALPA_DEBUG environment variable.",
+            "Run will be much SLOWER.",
+            "You should only ran minimal steps if using this method!"
+        )
+
 def init_alpa(cluster: str = "ray", normalize_embedding_shape: bool = True):
+
     import alpa 
+
+    tf.config.experimental.set_visible_devices([], "GPU")
     alpa.init(cluster=cluster)
     alpa.global_config.force_normalize_embedding_shapes = normalize_embedding_shape
 
@@ -106,6 +206,10 @@ class ModelArguments:
     trust_remote_code: bool = field(
         default=False,
         metadata={"help": "Whether you want to run custom code from the repo of HuggingFace"}
+    )
+    use_auth_token: Optional[bool] = field(
+        default=None,
+        metadata={"help" : "Whether you want to use HF API TOKEN for loading dataset, model, etc"}
     )
 
 
@@ -174,6 +278,23 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+    # GPT 2 Arguments
+    keep_linebreaks: bool = field(
+        default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
+    )
+
+    # ViT Arguments
+    train_dir: Optional[str] = field(
+        default=None, metadata={"help": "Directory for the training data."}
+    )
+    validation_dir: Optional[str] = field(
+        default=None, metadata={"help": "Directory for the validation data."}
+    )
+    image_size: Optional[int] = field(
+        default=224, metadata={"help": "The size (resolution) of each image."}
+    )
+
+    # CLIP Arguments
     text_column_name: Optional[str] = field(
             default='text',
             metadata={"help": "Column containing main text data."},
@@ -208,7 +329,10 @@ class DataTrainingArguments:
     )
 
     def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
+        if ((self.dataset_name is None) and
+         (self.train_file is None or self.validation_file is None) and
+         (self.train_dir is None or self.validation_dir is None)
+        ):
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
             if self.train_file is not None:
@@ -235,6 +359,11 @@ class ImageAugmentationArguments:
 
 @dataclass
 class TrainingArguments(TrainingArguments):
+    # Alpa Training Strategy
+    num_micro_batches: int = field(
+        default=1, 
+        metadata={"help": "The number of micro batches for gradient accumulation."}
+    )
     operator_parallel: int = field(
         default=1, 
         metadata={"help": "The degree of operator model parallelism."}
@@ -242,6 +371,18 @@ class TrainingArguments(TrainingArguments):
     pipeline_parallel: int = field(
         default=1, 
         metadata={"help": "The degree of pipeline model parallelism."}
+    )
+    data_parallel: int = field(
+        default=-1,
+        metadata={"help": "The degree of data parallelism. By default it will be -1 which means allocate the rest of the machine as data parallel"}
+    )
+    pipeline_schedule: Literal["1f1b", "gpipe", "inference"] = field(
+        default="1f1b",
+        metadata={"help": "The pipeline schedules."}
+    )
+    parallel_strategy: AlpaMethod = field(
+        default="pipeshard",
+        metadata={"help": "The parallel strategy that you can use for Alpa"}
     )
     use_remat: bool = field(
         default=True, 
@@ -256,8 +397,17 @@ class TrainingArguments(TrainingArguments):
         metadata={"help": "Entity for wandb"}
     )
     def __post_init__(self):
+        import jax
+
         if self.output_dir is not None:
             self.output_dir = os.path.expanduser(self.output_dir)
+
+        if jax.process_index() == 0 and self.parallel_strategy == AlpaMethod.PARALLEL_3D:
+            total_devices = len(jax.devices())
+            tp = self.operator_parallel
+            pp = self.pipeline_parallel
+            dp = total_devices // (tp * pp)
+            print(f"[DP]: {dp}, [TP]: {tp}, [PP]: {pp}")
 
     def to_dict(self):
         """
@@ -283,49 +433,94 @@ def write_eval_metric_wandb(eval_metrics, step):
 
 
 def write_train_metric(train_metrics, train_time, step, summary_writer=None):
+    import jax
+
     if jax.process_index() == 0:
         import wandb
         import alpa
-
         try:
             train_metrics = alpa.util.get_metrics(train_metrics)
         except Exception as _:
             pass
-
+        
         if wandb.run:
             for key, vals in train_metrics.items():
                 tag = f"train_{key}"
-                if hasattr(vals, "__iter__"):
-                    for i, val in enumerate(vals):
-                        wandb.log({tag: val}, step - len(vals) + i + 1)
+                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                    try:
+                        vals_list = list(vals)
+                        for i, val in enumerate(vals_list):
+                            wandb.log({tag: val}, step - len(vals_list) + i + 1)
+                    except TypeError:
+                        wandb.log({tag: vals}, step)
                 else:
-                    wandb.log({tag: val}, step)
+                    wandb.log({tag: vals}, step)
             wandb.log({"train_time": train_time}, step)
-
         
         if summary_writer:
             summary_writer.scalar("train_time", train_time, step)
-
-            train_metrics = alpa.util.get_metrics(train_metrics)
             for key, vals in train_metrics.items():
                 tag = f"train_{key}"
-                for i, val in enumerate(vals):
-                    summary_writer.scalar(tag, val, step - len(vals) + i + 1)
-
+                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                    try:
+                        vals_list = list(vals)
+                        for i, val in enumerate(vals_list):
+                            summary_writer.scalar(tag, val, step - len(vals_list) + i + 1)
+                    except TypeError:
+                        summary_writer.scalar(tag, vals, step)
+                else:
+                    summary_writer.scalar(tag, vals, step)
 
 def write_eval_metric(eval_metrics, step, summary_writer=None):
+    import jax
+
     if jax.process_index() == 0:
         import wandb
         import alpa
-
         try:
             eval_metrics = alpa.util.get_metrics(eval_metrics)
         except Exception as _:
             pass
-
+        
         if wandb.run:
-            for metric_name, value in eval_metrics.items():
-                summary_writer.scalar(f"eval_{metric_name}", value, step)
+            for key, vals in eval_metrics.items():
+                tag = f"eval_{key}"
+                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                    try:
+                        vals_list = list(vals)
+                        for i, val in enumerate(vals_list):
+                            wandb.log({tag: val}, step - len(vals_list) + i + 1)
+                    except TypeError:
+                        wandb.log({tag: vals}, step)
+                else:
+                    wandb.log({tag: vals}, step)
+
+        if summary_writer:
+            for key, vals in eval_metrics.items():
+                tag = f"eval_{key}"
+                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                    try:
+                        vals_list = list(vals)
+                        for i, val in enumerate(vals_list):
+                            summary_writer.scalar(tag, val, step - len(vals_list) + i + 1)
+                    except TypeError:
+                        summary_writer.scalar(tag, vals, step)
+                else:
+                    summary_writer.scalar(tag, vals, step)
+
+def write_metric(train_metrics, eval_metrics, train_time, step, summary_writer=None):
+    write_train_metric(
+        train_metrics=train_metrics, 
+        train_time=train_time, 
+        step=step, 
+        summary_writer=summary_writer
+    )
+
+    write_eval_metric(
+        eval_metrics=eval_metrics, 
+        step=step, 
+        summary_writer=summary_writer
+    )
 
 def create_learning_rate_fn(
     train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
@@ -394,6 +589,8 @@ def setup_logging(name, level: str="DEBUG"):
         level=getattr(logging, level)
     )
 
+    logger.setLevel(logging.INFO)
+
     if jax.process_index() == 0:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -401,3 +598,120 @@ def setup_logging(name, level: str="DEBUG"):
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
     return logger
+
+@jax.tree_util.register_pytree_node_class
+class _ParamsPlaceholder:
+    def tree_flatten(self):
+        return ((), None)
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        del aux, children
+        return cls()
+
+@typing.runtime_checkable
+class Initable(Protocol):
+    """An object with an init function."""
+
+    def init(self, params):
+        """Calling the init for given parameters returns a fresh opt state."""
+
+def tree_map_params(
+    initable,
+    f,
+    state,
+    /,
+    *rest,
+    transform_non_params = None,
+    is_leaf = None
+):
+    """Apply a callable over all params in the given optimizer state.
+
+    This function exists to help construct partition specs over optimizer
+    states, in the case that a partition spec is already known for the parameters.
+
+    For example, the following will replace all optimizer state parameter trees
+    with copies of the given partition spec instead. The argument
+    `transform_non_params` can be used to replace any remaining fields as
+    required, in this case, we replace those fields by None.
+
+    >>> params, specs = jnp.array(0.), jnp.array(0.)  # Trees with the same shape
+    >>> opt = optax.sgd(1e-3)
+    >>> state = opt.init(params)
+    >>> opt_specs = optax.tree_map_params(
+    ...     opt,
+    ...     lambda _, spec: spec,
+    ...     state,
+    ...     specs,
+    ...     transform_non_params=lambda _: None,
+    ...     )
+
+    Args:
+    initable: A callable taking parameters and returning an optimizer state, or
+        an object with an `init` attribute having the same function.
+    f: A callable that will be applied for all copies of the parameter tree
+        within this optimizer state.
+    state: The optimizer state to map over.
+    *rest: Additional arguments, having the same shape as the parameter tree,
+        that will be passed to f.
+    transform_non_params: An optional function that will be called on all
+        non-parameter fields within the optimizer state.
+    is_leaf: Passed through to `jax.tree.map`. This makes it possible to ignore
+        parts of the parameter tree e.g. when the gradient transformations modify
+        the shape of the original pytree, such as for ``optax.masked``.
+
+    Returns:
+    The result of applying the function f on all trees in the optimizer's state
+    that have the same shape as the parameter tree, along with the given
+    optional extra arguments.
+    """
+    placeholder = cast(base.chex.ArrayTree, _ParamsPlaceholder())
+     
+    if isinstance(initable, Initable):
+        initable = cast(Initable, initable)
+        state_with_placeholders = initable.init(placeholder)
+    else:
+        state_with_placeholders = initable(placeholder)
+
+    def map_params(maybe_placeholder_value, value):
+        if isinstance(maybe_placeholder_value, _ParamsPlaceholder):
+            return jax.tree_util.tree_map(f, value, *rest, is_leaf=is_leaf)
+        elif transform_non_params is not None:
+            return transform_non_params(value)
+        else:
+            return value
+
+    return jax.tree_util.tree_map(
+        map_params,
+        state_with_placeholders,
+        state,
+        is_leaf=lambda v: isinstance(v, _ParamsPlaceholder)
+    )
+
+def count_params(model):
+    return sum(x.size for x in jax.tree_leaves(model))
+
+# Mainly for CausalLM model
+def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
+                min_batch_size: int, shuffle: bool = False):
+    """
+    Returns batches of size `batch_size` from truncated `dataset`, sharded over all local devices.
+    Shuffle batches if `shuffle` is `True`.
+    """
+    if len(dataset) < batch_size:
+        assert len(dataset) >= min_batch_size
+        batch_size = len(dataset) // min_batch_size * min_batch_size
+
+    data_collator = transformers.DefaultDataCollator("np")
+    tf_dataset = dataset.to_tf_dataset(batch_size=batch_size,
+                                       columns=dataset.column_names,
+                                       collate_fn=data_collator,
+                                       shuffle=shuffle,
+                                       drop_remainder=True)
+
+    for batch in tf_dataset:
+        batch = {k: v._numpy() for k, v in batch.items()}
+        yield batch
+
+
+logger = setup_logging(__name__)

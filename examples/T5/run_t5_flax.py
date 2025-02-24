@@ -2,7 +2,6 @@ import sys
 
 sys.path.append(".")
 
-
 from examples.utils import *
 
 import json
@@ -337,6 +336,7 @@ def main():
     if not disable_log:
         login_wandb()
         instantiate_wandb(config=vars(parser))
+
     set_seed(getattr(training_args, "seed", 3407))
 
     logger.info(f"Training/evaluation parameters {training_args}")
@@ -535,8 +535,6 @@ def main():
 
             return loss
 
-        # grad_fn = jax.value_and_grad(loss_fn)
-        # loss, grad = grad_fn(state.params)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -546,7 +544,6 @@ def main():
             grad_fn = alpa.value_and_grad(loss_fn)
             loss, grad = grad_fn(state.params)
 
-        # grad = jax.lax.pmean(grad, "batch")
         new_state = state.apply_gradients(grads=grad)
 
         if dynamic_scale:
@@ -567,10 +564,6 @@ def main():
                 dynamic_scale=dynamic_scale,
             )
 
-        # metrics = jax.lax.pmean(
-        #     {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)},
-        #     axis_name="batch",
-        # )
         metrics = {
             "loss": loss,
             "learning_rate": linear_decay_lr_schedule_fn(state.step),
@@ -578,34 +571,31 @@ def main():
 
         return new_state, metrics, dropout_rng
 
-    # Create parallel version of the train step
-    method = alpa.Zero2Parallel(num_micro_batches=training_args.per_device_train_batch_size)
-    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
-    min_batch_size = alpa.get_global_num_devices() * training_args.per_device_train_batch_size
 
     # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-
         logits = model(**batch, params=params, train=False)[0]
-
-        # compute loss
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
-
-        # compute accuracy
         accuracy = jnp.equal(jnp.argmax(logits, axis=-1), labels)
-
-        # summarize metrics
         metrics = {"loss": loss.mean(), "accuracy": accuracy.mean()}
-        # metrics = jax.lax.pmean(metrics, axis_name="batch")
-
         return metrics
 
-    p_eval_step = alpa.parallelize(eval_step)
-    # p_eval_step = jax.pmap(eval_step, "batch", donate_argnums=(0,))
-
-    # Replicate the train state on each device
-    # state = jax_utils.replicate(state)
+    # Create parallel version of the train step
+    method = create_alpa_method(AlpaMethod(training_args.parallel_strategy), training_args)
+    p_train_step = alpa.parallelize(
+        train_step, 
+        method=method, 
+        donate_argnums=(0,)
+    )
+    p_eval_step = alpa.parallelize(
+        eval_step,
+        method=alpa.FollowParallel(
+            p_train_step,
+            num_micro_batches=training_args.per_device_eval_batch_size
+        )
+    )
+    min_batch_size = alpa.get_global_num_devices() * training_args.per_device_train_batch_size
 
     train_time = 0
     epochs = tqdm(range(num_epochs), desc="Epoch ... ", position=0)
@@ -647,8 +637,6 @@ def main():
             cur_step = epoch * (num_train_samples // train_batch_size) + step
 
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
-                # Save metrics
-                # train_metric = jax_utils.unreplicate(train_metric)
                 train_metrics = alpa.util.get_metrics(train_metrics)
                 train_metrics = jax.tree_util.tree_map(jnp.mean, train_metrics)
                 train_time += time.time() - train_start
@@ -656,6 +644,7 @@ def main():
                 #     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
                 # if jax.process_index() == 0:
                 #     write_train_metric_wandb(train_metrics, train_time, cur_step)
+                write_train_metric(train_metric, train_time, cur_step, summary_writer)
 
                 epochs.write(
                     f"Step... ({cur_step} | Loss: {train_metric['loss']}, Learning Rate:"
@@ -696,11 +685,9 @@ def main():
                     )
                     eval_metrics.append(metrics)
 
-                # get eval metrics
                 eval_metrics = alpa.util.get_metrics(eval_metrics)
                 eval_metrics = jax.tree_util.tree_map(jnp.mean, eval_metrics)
 
-                # normalize eval_metrics
                 try:
                     eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
                 except OverflowError:
@@ -711,11 +698,7 @@ def main():
                     f"Step... ({cur_step} | Loss: {eval_metrics['loss']}, Acc: {eval_metrics['accuracy']})"
                 )
 
-                # Save metrics
-                # if has_tensorboard and jax.process_index() == 0:
-                #     write_eval_metric(summary_writer, eval_metrics, cur_step)
-                # if jax.process_index() == 0:
-                #    write_eval_metric_wandb(eval_metrics, cur_step)
+                write_eval_metric(eval_metrics, cur_step, summary_writer)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -777,6 +760,8 @@ def main():
                 json.dump(eval_metrics, f, indent=4, sort_keys=True)
 
     maybe_stop_wandb()
+
+    alpa.shutdown()
 
 if __name__ == "__main__":
     main()

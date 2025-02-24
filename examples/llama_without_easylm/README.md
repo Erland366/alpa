@@ -54,6 +54,46 @@ python3 run_clm_flax.py \
 
 More documentation coming soon.
 
+```
+python3 examples/llama_without_easylm/run_llama_flax.py \
+    --output_dir ./output \
+    --model_name_or_path  Erland/Llama-3.2-1B-JAX \
+    --dataset_name /fs-computility/llm/caizheng/alpa_data/data/sg_90k_part1.json \
+    --do_train \
+    --block_size 1024 \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 2 \
+    --dtype float16 \
+    --learning_rate 5e-4 \
+    --weight_decay 0.0 \
+    --overwrite_output_dir \
+    --num_train_epochs 3 \
+    --logging_steps 1 \
+    --save_steps 3000 \
+    --eval_steps 1000 \
+    --use_data_sample 
+```
+
+```
+python examples/llama_without_easylm/run_llama_flax.py \
+    --output_dir ./output \
+    --config_name  Erland/Llama-3.2-1B-JAX \
+    --dataset_name /fs-computility/llm/caizheng/alpa_data/data/sg_90k_part1.json \
+    --do_train \
+    --block_size 1024 \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 2 \
+    --dtype float16 \
+    --learning_rate 5e-4 \
+    --weight_decay 0.0 \
+    --overwrite_output_dir \
+    --num_train_epochs 3 \
+    --logging_steps 1 \
+    --save_steps 3000 \
+    --eval_steps 1000 \
+    --use_data_sample 
+```
+
 
 # Acknowledgement
 Adopted from https://github.com/huggingface/transformers/tree/main/examples/flax/language-modeling
