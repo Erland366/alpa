@@ -160,7 +160,7 @@ class TrainingArguments:
     )
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
-    smoothing: float = field(default=0.9, metadata={"help": "Smoothing parameter for PGNS"})
+    smoothing: float = field(default=0.999, metadata={"help": "Smoothing parameter for PGNS"})
     scale_lr: bool = field(
         default=yml_config.training.scale_lr.enabled, metadata={"help": "Whether or not to scale the learning rate with batch size."}
     )
@@ -599,7 +599,7 @@ def main():
                        init_bsz=train_batch_size, 
                        num_workers=alpa.get_global_num_devices(), 
                        accum_scale=alpa.get_global_num_devices(),
-                       store_grads=flatten_and_concat(extract_values_with_key_p(state.params)))
+                       store_grads=jnp.array(0.))
     
     def loss_fn(logits, labels):
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
@@ -634,19 +634,10 @@ def main():
         new_state = state.apply_gradients(grads=grad)
 
         if yml_config.training.gns_enabled:
-            pinv = jax.tree_util.tree_map(jnp.ones_like, grad)
-            gradients = flatten_and_concat(extract_values_with_key_p(grad))
-            preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
-        
-            # Basing GNS estimation on the first 10% gradients
-            # –––––––––––––––––––––––––––––––––––––––––––––
-            first_10_percent = int(round(gradients.shape[0] * 10 / 100))
-            gradients = gradients[:first_10_percent]
-            preconditioners = preconditioners[:first_10_percent]
-            # –––––––––––––––––––––––––––––––––––––––––––––
+            grads_flat, _ = jax.tree_util.tree_flatten(grad)
+            gradients = jnp.array([jnp.mean(leaf) for leaf in grads_flat])
 
-            grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
-                                                                                                            preconditioners, 
+            grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients, 
                                                                                                             biased_sqr, 
                                                                                                             unbias_sqr, 
                                                                                                             biased_var, 
@@ -716,12 +707,6 @@ def main():
     last_time = time.time()
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
 
-    if yml_config.training.gns_enabled:
-        gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10)
-        gns.biased_sqr = init_distributed_scalar()
-        gns.unbias_sqr = init_distributed_scalar()
-        gns.biased_var = init_distributed_scalar()
-        gns.unbias_var = init_distributed_scalar()
 
 
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):

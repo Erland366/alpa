@@ -474,12 +474,8 @@ def main():
         )
 
     num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = (
-        int(training_args.per_device_train_batch_size)
-        * jax.device_count()
-        * training_args.gradient_accumulation_steps
-    )
-    eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
+    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
+    eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
@@ -751,6 +747,7 @@ def main():
             # skip to the step from which we are resuming
             if cur_step < resume_step:
                 continue
+            
 
             batch = make_batch(
                 batch
