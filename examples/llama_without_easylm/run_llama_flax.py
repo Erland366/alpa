@@ -72,74 +72,6 @@ MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
-def llama_manual_sharding(num_layers, state: TrainState):
-    param_partition = {
-        'lm_head': {
-            'kernel': PartitionSpec(None, None),  
-        },
-        'model': {
-            'embed_tokens': {
-                'embedding': PartitionSpec("mp", None),  
-            },
-            'layers': {
-                '%d' % (layer): {
-                    'input_layernorm': {
-                        'weight': PartitionSpec(None),  
-                    },
-                    'mlp': {
-                        'down_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'gate_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'up_proj': {
-                            'kernel': PartitionSpec("mp", None),  
-                        },
-                    },
-                    'post_attention_layernorm': {
-                        'weight': PartitionSpec(None),  
-                    },
-                    'self_attn': {
-                        'k_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'o_proj': {
-                            'kernel': PartitionSpec("mp", None),  
-                        },
-                        'q_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'v_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                    },
-                }
-                for layer in range(num_layers)
-            },
-            'norm': {
-                'weight': PartitionSpec(None),  
-            },
-        },
-    }
-
-    # Use tree_map_params with the correct structure
-
-    replicate = lambda x : jax.tree_util.tree_map(lambda _: PartitionSpec(None), x)
-    opt_state = tree_map_params(state.tx, lambda _, spec: spec, state.opt_state,
-                                param_partition, transform_non_params=lambda _: PartitionSpec(None))
-    manual_partition = TrainState(
-        step=PartitionSpec(None),
-        params=param_partition,
-        master_copy=param_partition if state.master_copy else None,
-        dynamic_scale=replicate(state.dynamic_scale),
-        tx=state.tx,
-        apply_fn=state.apply_fn,
-        opt_state=opt_state
-    )
-    return manual_partition
-
-
 @dataclass
 class ModelArguments(ModelArguments):
     pass
@@ -615,9 +547,6 @@ def main():
         return metrics
 
     # Manual partition spec
-    state_manual_sharding = llama_manual_sharding(config.num_hidden_layers, state)
-    ms_option = ManualShardingOption(
-        ("dp", "mp"), in_axis_resources=(state_manual_sharding, PartitionSpec("dp", None)))
     ignore_ids = (IGNORE_TOKEN_ID, )
 
     method = create_alpa_method(
@@ -679,12 +608,10 @@ def main():
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
             batch = next(train_loader)
-            print("Input IDs shape (inside train_step):", batch["input_ids"].shape)
             batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
                                      batch["attention_mask"]) - 1
 
             state, train_metric = p_train_step(state, batch)
-            breakpoint()
             train_metrics.append(train_metric)
 
             if step % grad_accum_steps == 0:

@@ -1,6 +1,10 @@
 import inspect
 import linecache
 import re
+import argparse
+import sys
+import addict
+import yaml
 
 import jax
 import alpa
@@ -23,10 +27,9 @@ from transformers import (
     is_wandb_available,
     is_tensorboard_available,
     TrainingArguments,
-    FLAX_MODEL_FOR_MASKED_LM_MAPPING
+    FLAX_MODEL_FOR_MASKED_LM_MAPPING,
+    HfArgumentParser,
 )
-
-
 
 __all__ = [
     "ModelArguments",
@@ -57,11 +60,55 @@ __all__ = [
     "setup_experiment_logging",
     "create_dynamic_function",
     "monkeypatch_rope_llama",
+    "parse_args",
 ]
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+def parse_args():
+    yaml_parser = argparse.ArgumentParser(add_help=False)
+    yaml_parser.add_argument("--config", type=str, help="Path to the config.yml file")
+    yaml_args, remaining = yaml_parser.parse_known_args()
+    
+    yaml_config = {}
+    
+    if yaml_args.config:
+        with open(yaml_args.config, 'r') as file:
+            yaml_config = yaml.safe_load(file)
+            yaml_config = addict.Dict(yaml_config) if addict else yaml_config
+
+    parser = HfArgumentParser(
+        (ModelArguments, DataTrainingArguments, TrainingArguments)
+    )
+    
+    if len(remaining) == 1 and remaining[0].endswith(".json"):
+        
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=os.path.abspath(remaining[0])
+        )
+    else:
+        
+        sys.argv = [sys.argv[0]] + remaining  
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
+    if yaml_config:
+        if 'model' in yaml_config:
+            for key, value in yaml_config.model.items():
+                if not getattr(model_args, key, None):
+                    setattr(model_args, key, value)
+                    
+        if 'data' in yaml_config:
+            for key, value in yaml_config.data.items():
+                if not getattr(data_args, key, None):
+                    setattr(data_args, key, value)
+        
+        if 'training' in yaml_config:
+            for key, value in yaml_config.training.items():
+                if not getattr(training_args, key, None):
+                    setattr(training_args, key, value)
+    
+    return model_args, data_args, training_args
 
 def setup_experiment_logging():
     global HAS_WANDB

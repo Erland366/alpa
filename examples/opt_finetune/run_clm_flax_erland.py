@@ -135,9 +135,7 @@ def monkey_patch_remat():
 
 
 def main():
-    parser = HfArgumentParser(
-        (ModelArguments, DataTrainingArguments, TrainingArguments)
-)
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
@@ -482,8 +480,13 @@ def main():
         alpa.global_config.flax_always_use_fp16_embedding = True
     else:
         use_master_copy = dynamic_scale = None
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
-                              dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
+    state = TrainState.create(
+        apply_fn=model.__call__,
+        params=model.params,
+        tx=optimizer,
+        dynamic_scale=dynamic_scale,
+        use_master_copy=use_master_copy
+    )
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
