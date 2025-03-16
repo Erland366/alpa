@@ -5,30 +5,33 @@ sys.path.append(".")
 from examples.utils import *
 
 import json
+import logging
 import math
 import os
 import time
-from dataclasses import dataclass
-from functools import partial
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 import functools
 from itertools import chain
 from pathlib import Path
-from jax.experimental.pjit import PartitionSpec
+from typing import Callable, Optional
 
+import datasets
 import numpy as np
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
 
 import alpa
 from alpa.model.model_util import DynamicScale, TrainState
-from alpa import ManualShardingOption
+from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption
 import jax
 import jax.numpy as jnp
 import optax
 import transformers
-from flax import traverse_util
-from flax.training.common_utils import onehot
-from dotenv import load_dotenv
+import tensorflow as tf
+from flax import jax_utils, traverse_util
+from flax.training import train_state
+from flax.training.common_utils import onehot, shard, shard_prng_key
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -40,104 +43,16 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
-from transformers.models.llama.modeling_flax_llama import FlaxLlamaForCausalLMModule
 from transformers.testing_utils import CaptureLogger
-from transformers.utils import get_full_repo_name
-
-monkeypatch_rope_llama() 
+from dotenv import load_dotenv
 
 load_dotenv()
 
-IGNORE_TOKEN_ID = -100
-
 logger = setup_logging(__name__)
 
-disable_log = os.getenv("WANDB_MODE", "offline") == "offline"
+disable_log = os.getenv("WANDB_MODE") == "offline"
 
-init_alpa("ray")
-
-def do_monkey_patch():
-    # TODO: jax 0.3.22 does not support eval shape with static args well. Remove
-    # after rebasing to jax 0.4, use the model's _do_init=False then.
-    def init_dummy(self, *args, **kwargs):
-        avals = jax.eval_shape(partial(self._backup_init, **kwargs), *args)
-        return jax.tree_util.tree_map(lambda x: jnp.full(x.shape, 1e-8, x.dtype),
-                                    avals)
-    if not hasattr(FlaxLlamaForCausalLMModule, "_backup_init"):
-        FlaxLlamaForCausalLMModule._backup_init = FlaxLlamaForCausalLMModule.init
-    FlaxLlamaForCausalLMModule.init = init_dummy
-
-
-MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-
-def llama_manual_sharding(num_layers, state: TrainState):
-    param_partition = {
-        'lm_head': {
-            'kernel': PartitionSpec(None, None),  
-        },
-        'model': {
-            'embed_tokens': {
-                'embedding': PartitionSpec("mp", None),  
-            },
-            'layers': {
-                '%d' % (layer): {
-                    'input_layernorm': {
-                        'weight': PartitionSpec(None),  
-                    },
-                    'mlp': {
-                        'down_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'gate_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'up_proj': {
-                            'kernel': PartitionSpec("mp", None),  
-                        },
-                    },
-                    'post_attention_layernorm': {
-                        'weight': PartitionSpec(None),  
-                    },
-                    'self_attn': {
-                        'k_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'o_proj': {
-                            'kernel': PartitionSpec("mp", None),  
-                        },
-                        'q_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                        'v_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  
-                        },
-                    },
-                }
-                for layer in range(num_layers)
-            },
-            'norm': {
-                'weight': PartitionSpec(None),  
-            },
-        },
-    }
-
-    # Use tree_map_params with the correct structure
-
-    replicate = lambda x : jax.tree_util.tree_map(lambda _: PartitionSpec(None), x)
-    opt_state = tree_map_params(state.tx, lambda _, spec: spec, state.opt_state,
-                                param_partition, transform_non_params=lambda _: PartitionSpec(None))
-    manual_partition = TrainState(
-        step=PartitionSpec(None),
-        params=param_partition,
-        master_copy=param_partition if state.master_copy else None,
-        dynamic_scale=replicate(state.dynamic_scale),
-        tx=state.tx,
-        apply_fn=state.apply_fn,
-        opt_state=opt_state
-    )
-    return manual_partition
+init_alpa(cluster="ray")
 
 
 @dataclass
@@ -145,27 +60,90 @@ class ModelArguments(ModelArguments):
     pass
 
 @dataclass
-class DataTrainingArguments(DataTrainingArguments):
-    def __post_init__(self):
-        if self.use_data_sample:
-            self.dataset_name = "Erland/oscar_sampled_1000"
-            self.dataset_config_name = "default"
-            delattr(self, "use_data_sample")
+class DataTraininingArguments(DataTrainingArguments):
+    pass
 
-        super().__post_init__()
+@dataclass
+class TrainingArguments(TrainingArguments):
+    pass
+
+
+def create_learning_rate_fn(
+    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
+) -> Callable[[int], jnp.array]:
+    """Returns a linear warmup, linear_decay learning rate function."""
+    steps_per_epoch = train_ds_size // train_batch_size
+    num_train_steps = steps_per_epoch * num_train_epochs
+    warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
+    decay_fn = optax.linear_schedule(
+        init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
+    )
+    schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
+    return schedule_fn
+
+
+def monkey_patch_remat():
+    # Use monkey patch to add remat for all transformer layers.
+    from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
+    from flax.linen.partitioning import remat
+    from flax.linen.module import wrap_method_once
+    import flax.linen as nn
+
+    @wrap_method_once
+    def setup(self):
+        self.layers = [
+            remat(FlaxOPTDecoderLayer, static_argnums=(2, 3, 4))(
+                self.config, name=str(i), dtype=self.dtype)
+            for i in range(self.config.num_hidden_layers)
+        ]
+        self.layerdrop = self.config.layerdrop
+
+    def call(
+        self,
+        hidden_states,
+        attention_mask,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ):
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask,
+                init_cache,
+                output_attentions,
+                deterministic,
+            )
+
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        outputs = [hidden_states, all_hidden_states, all_self_attns]
+        return outputs
+
+    setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
+    setattr(FlaxOPTDecoderLayerCollection, "__call__", call)
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser(
+        (ModelArguments, DataTrainingArguments, TrainingArguments)
+)
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
 
     if (
         os.path.exists(training_args.output_dir)
@@ -178,30 +156,14 @@ def main():
             "Use --overwrite_output_dir to overcome."
         )
 
+    if not disable_log:
+        login_wandb()
+        instantiate_wandb()
+
+    set_seed(getattr(training_args, "seed", 3407))
+
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Set seed before initializing model.
-    set_seed(training_args.seed)
-
-    # Handle the repository creation
-    if training_args.push_to_hub:
-        if training_args.hub_model_id is None:
-            repo_name = get_full_repo_name(
-                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
-            )
-        else:
-            repo_name = training_args.hub_model_id
-        repo = Repository(training_args.output_dir, clone_from=repo_name)
-
-    #  Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    #
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -287,19 +249,12 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    # Reduce vocab size to 1024
-    # config.vocab_size = 1024
+    if training_args.use_remat:
+        monkey_patch_remat()
 
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.tokenizer_name,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-    elif model_args.config_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.config_name,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             use_auth_token=True if model_args.use_auth_token else None,
@@ -318,8 +273,6 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    # do_monkey_patch()
-
     if model_args.model_name_or_path:
         model = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -327,8 +280,14 @@ def main():
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
-            from_pt=False
         )
+        #from transformers import FlaxOPTForCausalLM
+        #config.num_hidden_layers = 2
+        #model = FlaxOPTForCausalLM(
+        #    config=config,
+        #    seed=training_args.seed,
+        #    dtype=getattr(jnp, model_args.dtype),
+        #)
     else:
         model = FlaxAutoModelForCausalLM.from_config(
             config,
@@ -435,20 +394,17 @@ def main():
     num_devices = alpa.get_global_num_devices()
     train_min_batch_size = (num_devices // training_args.operator_parallel //
                             training_args.pipeline_parallel * training_args.num_micro_batches)
-                        
-    if training_args.do_eval:
-        eval_num_micro_batches = training_args.num_micro_batches
+    eval_num_micro_batches = training_args.num_micro_batches
+    eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                           training_args.pipeline_parallel * eval_num_micro_batches)
+    while len(eval_dataset) < eval_min_batch_size:
+        eval_num_micro_batches //= 2
         eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                            training_args.pipeline_parallel * eval_num_micro_batches)
-        while len(eval_dataset) < eval_min_batch_size:
-            eval_num_micro_batches //= 2
-            eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                                training_args.pipeline_parallel * eval_num_micro_batches)
+                               training_args.pipeline_parallel * eval_num_micro_batches)
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
-    summary_writer = None
-    if has_tensorboard and not disable_log:
+    if has_tensorboard:
         try:
             from flax.metrics.tensorboard import SummaryWriter
 
@@ -494,7 +450,7 @@ def main():
     def decay_mask_fn(params):
         flat_params = traverse_util.flatten_dict(params)
         flat_mask = {
-            path: (path[-1] != "bias" and path[-2:] not in [("input_layernorm", "weight"), ("post_attention_layernorm", "weight")])
+            path: (path[-1] != "bias" and path[-2:] not in [("ln_1", "scale"), ("ln_2", "scale"), ("ln_f", "scale")])
             for path in flat_params
         }
         return traverse_util.unflatten_dict(flat_mask)
@@ -507,8 +463,6 @@ def main():
             learning_rate=linear_decay_lr_schedule_fn,
         )
     else:
-        if training_args.weight_decay == 0.0:
-            decay_mask_fn = None
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(
@@ -517,58 +471,26 @@ def main():
                 b2=training_args.adam_beta2,
                 eps=training_args.adam_epsilon,
                 weight_decay=training_args.weight_decay,
-                mask=decay_mask_fn
-            )
+                mask=decay_mask_fn)
         )
-    # if training_args.gradient_accumulation_steps > 1:
-    #     optimizer = optax.MultiSteps(optimizer, training_args.gradient_accumulation_steps)
-    grad_accum_steps = training_args.gradient_accumulation_steps
 
     # Setup train state
-    if model_args.dtype == "float16" or model_args.dtype == "bfloat16":
+    if model_args.dtype == "float16":
         use_master_copy = True
         dynamic_scale = DynamicScale()
         # Fix a bug in huggingface's implementation (https://github.com/huggingface/transformers/pull/18462)
         alpa.global_config.flax_always_use_fp16_embedding = True
     else:
         use_master_copy = dynamic_scale = None
-
-    state = TrainState.create(
-        apply_fn=model.__call__, 
-        params=model.params, 
-        tx=optimizer, 
-        dynamic_scale=dynamic_scale,
-        use_master_copy=use_master_copy
-    )
-
-    dump_debug_info_train_step = dump_debug_info_eval_step = True
-
-
-    # def loss_fn(logits, labels, ignore_indices):
-    #     # Shift logits
-    #     shift_logits = logits[..., :-1, :]
-    #     shift_labels = labels[..., 1:]
-    #     # Handle the ignore index: compute the valid first
-    #     valid = jnp.full(shift_labels.shape, True)
-    #     for ignore_index in ignore_indices:
-    #         new_valid = jnp.not_equal(shift_labels, ignore_index)
-    #         valid = jnp.logical_and(valid, new_valid)
-    #     valid = jnp.asarray(valid, dtype=jnp.float32)
-    #     valid_len = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
-    #     # OneHot and mask the ignore index. For ignore_index(-100), the whole line
-    #     # in the output would be 0.
-    #     one_hot_labels = jax.nn.one_hot(shift_labels, shift_logits.shape[-1])
-    #     # Compute the softmax loss
-    #     log_p = jax.nn.log_softmax(shift_logits, axis=-1)
-    #     # (bs, seq_len, vocab) -> (bs, seq_len)
-    #     cross_entropy = jnp.sum(one_hot_labels * log_p, axis=-1)
-    #     loss = -jnp.mean(jnp.sum(cross_entropy * valid, axis=-1) / valid_len)
-    #     return loss
+    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
+                              dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
-        loss = optax.softmax_cross_entropy(shift_logits, onehot(shift_labels, shift_logits.shape[-1]))
+        loss = optax.softmax_cross_entropy(
+            shift_logits,
+            jax.nn.one_hot(shift_labels, logits.shape[-1]))
         return loss.mean()
 
     # Define gradient update step fn
@@ -576,7 +498,7 @@ def main():
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, train=True)[0]
+            logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
             loss = loss_fn(logits, labels)
             return loss
 
@@ -607,39 +529,31 @@ def main():
 
         return new_state, metrics
 
+    # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-        logits = model(**batch, params=params)[0]
-        loss = loss_fn(logits, labels, ignore_ids)
+        logits = model(**batch, params=params, deterministic=True)[0]
+        loss = loss_fn(logits, labels)
+
+        # summarize metrics
         metrics = {"loss": loss}
         return metrics
 
-    # Manual partition spec
-    state_manual_sharding = llama_manual_sharding(config.num_hidden_layers, state)
-    ms_option = ManualShardingOption(
-        ("dp", "mp"), in_axis_resources=(state_manual_sharding, PartitionSpec("dp", None)))
-    ignore_ids = (IGNORE_TOKEN_ID, )
+    # Create parallel version of the train and eval step
+    method = alpa.get_3d_parallel_method(
+            num_micro_batches=training_args.num_micro_batches,
+            data_parallel=-1,
+            operator_parallel=training_args.operator_parallel,
+            pipeline_parallel=training_args.pipeline_parallel)
 
-    method = create_alpa_method(
-        AlpaMethod(training_args.parallel_strategy), 
-        training_args,
-    )
+    p_train_step = alpa.parallelize(train_step,
+                                    method=method,
+                                    donate_argnums=(0,))
+    p_eval_step = alpa.parallelize(eval_step,
+                                   method=alpa.FollowParallel(
+                                       p_train_step, num_micro_batches=eval_num_micro_batches))
 
-    p_train_step = alpa.parallelize(
-        train_step,
-        method=method,
-        donate_argnums=(0,)
-    )
-
-    if training_args.do_eval:
-        p_eval_step = alpa.parallelize(
-            eval_step,
-            method=alpa.FollowParallel(
-                p_train_step, 
-                num_micro_batches=training_args.num_micro_batches
-            )
-        )                             
-                             
+    dump_debug_info_train_step = dump_debug_info_eval_step = True
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -666,29 +580,17 @@ def main():
 
         # Generate an epoch by shuffling sampling indices from the train dataset
         train_loader = data_loader(input_rng, train_dataset, train_batch_size,
-                                   1, shuffle=True)
+                                   train_min_batch_size, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
-
-        steps_trained_progress_bar = tqdm(
-            range(steps_per_epoch),
-            desc="Training...",
-            position=1,
-            leave=False
-        )
-        for step in range(steps_per_epoch):
-            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
-
+        # train
+        for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
             batch = next(train_loader)
-            print("Input IDs shape (inside train_step):", batch["input_ids"].shape)
             batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
                                      batch["attention_mask"]) - 1
-
             state, train_metric = p_train_step(state, batch)
-            breakpoint()
             train_metrics.append(train_metric)
 
-            if step % grad_accum_steps == 0:
-                steps_trained_progress_bar.update(1)
+            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
             if dump_debug_info_train_step:
                 dump_debug_info_train_step = False
@@ -715,14 +617,15 @@ def main():
 
                 # Save metrics
                 train_time += time.time() - train_start
-                train_metrics = alpa.util.get_metrics(train_metrics)
-                train_metrics = jax.tree_util.tree_map(jnp.mean, train_metrics)  # Use tree_util.tree_map on plural train_metrics
-                write_train_metric(train_metrics, train_time, cur_step, summary_writer)  # Use plural train_metrics
+                if has_tensorboard:
+                    write_train_metric(train_metrics, train_time, cur_step, summary_writer)
+
+                train_metric = jax.tree_map(np.mean, train_metric)
 
                 epochs.write(
                     f"Step... {cur_step} | "
-                    f"Loss: {train_metrics['loss']:.4f}, "
-                    f"Learning Rate: {train_metrics['learning_rate']:.5f}, "
+                    f"Loss: {train_metric['loss'].mean():.4f}, "
+                    f"Learning Rate: {train_metric['learning_rate'].mean():.5f}, "
                     f"Throughput: {throughput_tokens:.2f} token/s, "
                     f"{throughput_tflops:.2f} TFLOP/s"
                 )
@@ -730,48 +633,44 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            if training_args.do_eval:
-                # Only support steps
-                if ( cur_step % (training_args.eval_steps * grad_accum_steps) == 0 and
-                    cur_step > 0 and 
-                    model_args.eval_strategy == "steps"):
-                    # ======================== Evaluating ==============================
-                    eval_metrics = []
-                    eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
-                                            eval_min_batch_size)
-                    eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                    for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
-                        # Model forward
-                        batch = next(eval_loader)
-                        batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                                                batch["attention_mask"]) - 1
-                        metrics = p_eval_step(state.params, batch)
-                        eval_metrics.append(metrics)
+            if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+                # ======================== Evaluating ==============================
+                eval_metrics = []
+                eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                          eval_min_batch_size)
+                eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+                    # Model forward
+                    batch = next(eval_loader)
+                    batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                             batch["attention_mask"]) - 1
+                    metrics = p_eval_step(state.params, batch)
+                    eval_metrics.append(metrics)
 
-                        if dump_debug_info_eval_step:
-                            dump_debug_info_eval_step = False
-                            executable = p_eval_step.get_last_executable()
-                            executable.dump_debug_info("alpa_debug_info")
+                    if dump_debug_info_eval_step:
+                        dump_debug_info_eval_step = False
+                        executable = p_eval_step.get_last_executable()
+                        executable.dump_debug_info("alpa_debug_info")
 
-                    # normalize eval metrics
-                    eval_metrics = alpa.util.get_metrics(eval_metrics)
-                    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+                # normalize eval metrics
+                eval_metrics = alpa.util.get_metrics(eval_metrics)
+                eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                    try:
-                        eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-                    except OverflowError:
-                        eval_metrics["perplexity"] = float("inf")
+                try:
+                    eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+                except OverflowError:
+                    eval_metrics["perplexity"] = float("inf")
 
-                    # Print metrics and update progress bar
-                    desc = (
-                        f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
-                        f" {eval_metrics['perplexity']})"
-                    )
-                    epochs.write(desc)
+                # Print metrics and update progress bar
+                desc = (
+                    f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+                    f" {eval_metrics['perplexity']})"
+                )
+                epochs.write(desc)
 
-                    # Save metrics
-                    if has_tensorboard:
-                        write_eval_metric(summary_writer, eval_metrics, cur_step)
+                # Save metrics
+                if has_tensorboard:
+                    write_eval_metric(summary_writer, eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -817,8 +716,6 @@ def main():
     params = alpa.util.map_to_nparray(state.params)
     model.save_pretrained(training_args.output_dir, params=params)
     tokenizer.save_pretrained(training_args.output_dir)
-
-    alpa.shutdown()
 
 
 if __name__ == "__main__":

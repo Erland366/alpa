@@ -1,3 +1,7 @@
+import inspect
+import linecache
+import re
+
 import jax
 import alpa
 import os
@@ -50,7 +54,9 @@ __all__ = [
     "count_params",
     "data_loader",
     "init_debug",
-    "setup_experiment_logging"
+    "setup_experiment_logging",
+    "create_dynamic_function",
+    "monkeypatch_rope_llama",
 ]
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -98,7 +104,6 @@ def create_alpa_method(method: AlpaMethod, training_args, *args, **kwargs):
             data_parallel=training_args.data_parallel,
             operator_parallel=training_args.operator_parallel,
             pipeline_parallel=training_args.pipeline_parallel,
-            
             **kwargs
         )
     elif method == AlpaMethod.PIPESHARD:
@@ -109,13 +114,14 @@ def create_alpa_method(method: AlpaMethod, training_args, *args, **kwargs):
             stage_option="uniform",
             ## Default value for layer_option here
             # layer_option=alpa.AutoLayerOption(layer_num=2),
-            layer_option="manual",
+            # layer_option="manual",
             **kwargs
         )
     elif method == AlpaMethod.SHARD_PARALLEL:
         parallel_method = alpa.ShardParallel(
             *args,
             num_micro_batches=num_micro_batches,
+            auto_sharding_option=alpa.AutoShardingOption(allow_mixed_mesh_shape=True, force_batch_dim_to_mesh_dim=0),
             **kwargs
         )
     elif method == AlpaMethod.DATA_PARALLEL:
@@ -143,6 +149,55 @@ def init_debug():
             "Run will be much SLOWER.",
             "You should only ran minimal steps if using this method!"
         )
+
+def create_dynamic_function(source, function_name, original_func=None, filename_prefix="<dynamic>"):
+    """
+    We assume that we already patch the function, the rest step is to just call 
+    `exec(source, globals())`. This is to enable `inspect.getsource` on the patched function.
+    """
+    frame = inspect.currentframe().f_back
+    unique_id = id(frame)
+    frame_info = inspect.getframeinfo(frame)
+    patch_filepath = os.path.abspath(frame_info.filename)
+    patch_line_no = frame_info.lineno
+
+    if original_func:
+        original_func_name = original_func.__name__
+        filename = f"{filename_prefix}-{original_func_name}-{patch_filepath}-{patch_line_no}-{unique_id}"
+    else:
+        filename = f"{filename_prefix}-{patch_filepath}-{patch_line_no}-{unique_id}"
+    
+    filename = re.sub(r"[^\w\-_\.]", "_", filename)
+
+    code = compile(source, filename, "exec")
+    globals_ = frame.f_globals
+    locals_ = frame.f_locals
+
+    temp_locals = {}
+    exec(code, globals_, temp_locals)
+    print(temp_locals)
+    func = temp_locals[function_name]
+
+    lines = [line + "\n" for line in source.split("\n")]
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        lines,
+        filename,
+    )
+
+    return func
+
+def monkeypatch_rope_llama():
+    exec("from transformers.models.llama import modeling_flax_llama", globals())
+    source = inspect.getsource(modeling_flax_llama.FlaxLlamaRotaryEmbedding.__call__)
+    start = source.find("def")
+    source = source.split("\n")
+    source = "\n".join([x[start:] for x in source])
+    source = source.replace("key = apply", "# key = apply")
+    source = source.replace("query = apply", "# query = apply")
+    func = create_dynamic_function(source, "__call__")
+    modeling_flax_llama.FlaxLlamaRotaryEmbedding.__call__ = func
 
 def init_alpa(cluster: str = "ray", normalize_embedding_shape: bool = True):
 
@@ -434,79 +489,125 @@ def write_eval_metric_wandb(eval_metrics, step):
 
 def write_train_metric(train_metrics, train_time, step, summary_writer=None):
     import jax
-
     if jax.process_index() == 0:
         import wandb
         import alpa
-        try:
-            train_metrics = alpa.util.get_metrics(train_metrics)
-        except Exception as _:
-            pass
         
-        if wandb.run:
-            for key, vals in train_metrics.items():
-                tag = f"train_{key}"
-                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
-                    try:
-                        vals_list = list(vals)
-                        for i, val in enumerate(vals_list):
-                            wandb.log({tag: val}, step - len(vals_list) + i + 1)
-                    except TypeError:
+        if isinstance(train_metrics, list) and all(isinstance(item, dict) for item in train_metrics):
+            for i, metrics_dict in enumerate(train_metrics):
+                try:
+                    metrics_dict = alpa.util.get_metrics(metrics_dict)
+                except Exception as _:
+                    pass
+                
+                current_step = step - len(train_metrics) + i + 1
+                
+                if wandb.run:
+                    for key, vals in metrics_dict.items():
+                        tag = f"train_{key}"
+                        wandb.log({tag: vals}, current_step)
+                
+                if summary_writer:
+                    for key, vals in metrics_dict.items():
+                        tag = f"train_{key}"
+                        summary_writer.scalar(tag, vals, current_step)
+            
+            if wandb.run:
+                wandb.log({"train_time": train_time}, step)
+            
+            if summary_writer:
+                summary_writer.scalar("train_time", train_time, step)
+        else:
+            try:
+                train_metrics = alpa.util.get_metrics(train_metrics)
+            except Exception as _:
+                pass
+            
+            if wandb.run:
+                for key, vals in train_metrics.items():
+                    tag = f"train_{key}"
+                    if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                        try:
+                            vals_list = list(vals)
+                            for i, val in enumerate(vals_list):
+                                wandb.log({tag: val}, step - len(vals_list) + i + 1)
+                        except TypeError:
+                            wandb.log({tag: vals}, step)
+                    else:
                         wandb.log({tag: vals}, step)
-                else:
-                    wandb.log({tag: vals}, step)
-            wandb.log({"train_time": train_time}, step)
-        
-        if summary_writer:
-            summary_writer.scalar("train_time", train_time, step)
-            for key, vals in train_metrics.items():
-                tag = f"train_{key}"
-                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
-                    try:
-                        vals_list = list(vals)
-                        for i, val in enumerate(vals_list):
-                            summary_writer.scalar(tag, val, step - len(vals_list) + i + 1)
-                    except TypeError:
+                wandb.log({"train_time": train_time}, step)
+            
+            if summary_writer:
+                summary_writer.scalar("train_time", train_time, step)
+                for key, vals in train_metrics.items():
+                    tag = f"train_{key}"
+                    if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                        try:
+                            vals_list = list(vals)
+                            for i, val in enumerate(vals_list):
+                                summary_writer.scalar(tag, val, step - len(vals_list) + i + 1)
+                        except TypeError:
+                            summary_writer.scalar(tag, vals, step)
+                    else:
                         summary_writer.scalar(tag, vals, step)
-                else:
-                    summary_writer.scalar(tag, vals, step)
 
 def write_eval_metric(eval_metrics, step, summary_writer=None):
     import jax
-
     if jax.process_index() == 0:
         import wandb
         import alpa
-        try:
-            eval_metrics = alpa.util.get_metrics(eval_metrics)
-        except Exception as _:
-            pass
         
-        if wandb.run:
-            for key, vals in eval_metrics.items():
-                tag = f"eval_{key}"
-                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
-                    try:
-                        vals_list = list(vals)
-                        for i, val in enumerate(vals_list):
-                            wandb.log({tag: val}, step - len(vals_list) + i + 1)
-                    except TypeError:
+        # Handle list of dictionaries case
+        if isinstance(eval_metrics, list) and all(isinstance(item, dict) for item in eval_metrics):
+            for i, metrics_dict in enumerate(eval_metrics):
+                try:
+                    metrics_dict = alpa.util.get_metrics(metrics_dict)
+                except Exception as _:
+                    pass
+                
+                current_step = step - len(eval_metrics) + i + 1
+                
+                if wandb.run:
+                    for key, vals in metrics_dict.items():
+                        tag = f"eval_{key}"
+                        wandb.log({tag: vals}, current_step)
+                
+                if summary_writer:
+                    for key, vals in metrics_dict.items():
+                        tag = f"eval_{key}"
+                        summary_writer.scalar(tag, vals, current_step)
+        else:
+            # Original case: single dictionary
+            try:
+                eval_metrics = alpa.util.get_metrics(eval_metrics)
+            except Exception as _:
+                pass
+            
+            if wandb.run:
+                for key, vals in eval_metrics.items():
+                    tag = f"eval_{key}"
+                    if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                        try:
+                            vals_list = list(vals)
+                            for i, val in enumerate(vals_list):
+                                wandb.log({tag: val}, step - len(vals_list) + i + 1)
+                        except TypeError:
+                            wandb.log({tag: vals}, step)
+                    else:
                         wandb.log({tag: vals}, step)
-                else:
-                    wandb.log({tag: vals}, step)
-
-        if summary_writer:
-            for key, vals in eval_metrics.items():
-                tag = f"eval_{key}"
-                if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
-                    try:
-                        vals_list = list(vals)
-                        for i, val in enumerate(vals_list):
-                            summary_writer.scalar(tag, val, step - len(vals_list) + i + 1)
-                    except TypeError:
+            
+            if summary_writer:
+                for key, vals in eval_metrics.items():
+                    tag = f"eval_{key}"
+                    if hasattr(vals, "__iter__") and not isinstance(vals, (str, bytes)):
+                        try:
+                            vals_list = list(vals)
+                            for i, val in enumerate(vals_list):
+                                summary_writer.scalar(tag, val, step - len(vals_list) + i + 1)
+                        except TypeError:
+                            summary_writer.scalar(tag, vals, step)
+                    else:
                         summary_writer.scalar(tag, vals, step)
-                else:
-                    summary_writer.scalar(tag, vals, step)
 
 def write_metric(train_metrics, eval_metrics, train_time, step, summary_writer=None):
     write_train_metric(

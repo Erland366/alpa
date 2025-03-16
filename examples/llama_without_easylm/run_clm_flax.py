@@ -815,14 +815,11 @@ def main():
 
         return new_state, metrics
 
-    # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-        # logits = model(**batch, params=params, deterministic=True)[0]
         logits = model(**batch, params=params)[0]
         loss = loss_fn(logits, labels)
 
-        # summarize metrics
         metrics = {"loss": loss}
         return metrics
 
@@ -875,7 +872,6 @@ def main():
         # train
         for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
             batch = next(train_loader)
-            print("Input IDs shape (inside train_step):", batch["input_ids"].shape)
             batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
                                      batch["attention_mask"]) - 1
             state, train_metric = p_train_step(state, batch)

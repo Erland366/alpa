@@ -1,0 +1,14 @@
+python examples/ViT/run_image_classification_erland.py \
+    --output_dir ./vit-base-patch16-imagenette \
+    --model_name_or_path google/vit-base-patch16-224-in21k \
+    --train_dir="testing_chamber/imagenette2/train" \
+    --validation_dir="testing_chamber/imagenette2/val" \
+    --num_train_epochs 5 \
+    --learning_rate 1e-3 \
+    --per_device_train_batch_size 2 \
+    --per_device_eval_batch_size 2 \
+    --preprocessing_num_workers 4 \
+    --pipeline_parallel 2 \
+    --use_data_sample \
+    --parallel_strategy parallel_3d \
+    --overwrite_output_dir 

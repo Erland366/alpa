@@ -4,6 +4,7 @@ sys.path.append(".")
 
 from examples.utils import *
 
+import os
 import json
 import math
 import time
@@ -35,14 +36,15 @@ from datasets import (
     load_dataset,
     DatasetDict
 )
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
 
 logger = setup_logging(__name__)
 
-disable_log = True
-if disable_log:
-    import os
-    os.environ["WANDB_DISABLED"] = "true"
+disable_log = os.environ["WANDB_MODE"] == "offline"
 
 init_alpa()
 
@@ -427,7 +429,7 @@ def main():
     rng, dropout_rng = jax.random.split(rng)
 
     # Setup train state
-    if model_args.dtype == "float16":
+    if model_args.dtype == "float16" or model_args.dtype == "bfloat16":
         use_master_copy = True
         dynamic_scale = DynamicScale()
         # Fix a bug in huggingface's implementation (https://github.com/huggingface/transformers/pull/18462)
@@ -518,9 +520,7 @@ def main():
     )
 
     # Define gradient update step fn
-    def train_step(state, batch, dropout_rng):
-        dropout_rng = jax.random.fold_in(dropout_rng, state.step)
-
+    def train_step(state, batch):
         def loss_fn(params):
             labels = batch.pop("labels")
 
@@ -569,7 +569,7 @@ def main():
             "learning_rate": linear_decay_lr_schedule_fn(state.step),
         }
 
-        return new_state, metrics, dropout_rng
+        return new_state, metrics
 
 
     # Define eval fn
@@ -629,8 +629,8 @@ def main():
 
             # Model forward
             model_inputs = local_host_model_inputs
-            state, train_metric, dropout_rng = p_train_step(
-                state, local_host_model_inputs, dropout_rng
+            state, train_metric = p_train_step(
+                state, local_host_model_inputs
             )
             train_metrics.append(train_metric)
 
