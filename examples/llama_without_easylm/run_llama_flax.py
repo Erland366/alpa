@@ -5,37 +5,30 @@ sys.path.append(".")
 from examples.utils import *
 
 import json
-import logging
 import math
 import os
-import typing
 import time
-from dataclasses import asdict, dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from functools import partial
 import functools
 from itertools import chain
 from pathlib import Path
-from typing import Callable, Optional
 from jax.experimental.pjit import PartitionSpec
 
-import datasets
 import numpy as np
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from tqdm import tqdm
 
 import alpa
 from alpa.model.model_util import DynamicScale, TrainState
-from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption, ManualShardingOption
+from alpa import ManualShardingOption
 import jax
 import jax.numpy as jnp
 import optax
-from optax._src import base
 import transformers
-import tensorflow as tf
-from flax import jax_utils, traverse_util
-from flax.training import train_state
-from flax.training.common_utils import onehot, shard, shard_prng_key
+from flax import traverse_util
+from flax.training.common_utils import onehot
+from dotenv import load_dotenv
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -43,17 +36,25 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     FlaxAutoModelForCausalLM,
-    FlaxLlamaForCausalLM,
     HfArgumentParser,
     is_tensorboard_available,
     set_seed,
 )
 from transformers.models.llama.modeling_flax_llama import FlaxLlamaForCausalLMModule
-from typing import Any, Optional, Protocol, Tuple, Union, cast
 from transformers.testing_utils import CaptureLogger
-from transformers.utils import get_full_repo_name, send_example_telemetry
+from transformers.utils import get_full_repo_name
+
+monkeypatch_rope_llama() 
+
+load_dotenv()
 
 IGNORE_TOKEN_ID = -100
+
+logger = setup_logging(__name__)
+
+disable_log = os.getenv("WANDB_MODE", "offline") == "offline"
+
+init_alpa("ray")
 
 def do_monkey_patch():
     # TODO: jax 0.3.22 does not support eval shape with static args well. Remove
@@ -66,267 +67,9 @@ def do_monkey_patch():
         FlaxLlamaForCausalLMModule._backup_init = FlaxLlamaForCausalLMModule.init
     FlaxLlamaForCausalLMModule.init = init_dummy
 
-@jax.tree_util.register_pytree_node_class
-class _ParamsPlaceholder:
-
-    def tree_flatten(self):
-        return ((), None)
-
-    @classmethod
-    def tree_unflatten(cls, aux, children):
-        del aux, children
-        return cls()
-
-@typing.runtime_checkable
-class Initable(Protocol):
-    """An object with an init function."""
-
-    def init(self, params):
-        """Calling the init for given parameters returns a fresh opt state."""
-
-def tree_map_params(
-    initable,
-    f,
-    state,
-    /,
-    *rest,
-    transform_non_params = None,
-    is_leaf = None,
-):
-    """Apply a callable over all params in the given optimizer state.
-
-    This function exists to help construct partition specs over optimizer
-    states, in the case that a partition spec is already known for the parameters.
-
-    For example, the following will replace all optimizer state parameter trees
-    with copies of the given partition spec instead. The argument
-    `transform_non_params` can be used to replace any remaining fields as
-    required, in this case, we replace those fields by None.
-
-    >>> params, specs = jnp.array(0.), jnp.array(0.)  # Trees with the same shape
-    >>> opt = optax.sgd(1e-3)
-    >>> state = opt.init(params)
-    >>> opt_specs = optax.tree_map_params(
-    ...     opt,
-    ...     lambda _, spec: spec,
-    ...     state,
-    ...     specs,
-    ...     transform_non_params=lambda _: None,
-    ...     )
-
-    Args:
-    initable: A callable taking parameters and returning an optimizer state, or
-        an object with an `init` attribute having the same function.
-    f: A callable that will be applied for all copies of the parameter tree
-        within this optimizer state.
-    state: The optimizer state to map over.
-    *rest: Additional arguments, having the same shape as the parameter tree,
-        that will be passed to f.
-    transform_non_params: An optional function that will be called on all
-        non-parameter fields within the optimizer state.
-    is_leaf: Passed through to `jax.tree.map`. This makes it possible to ignore
-        parts of the parameter tree e.g. when the gradient transformations modify
-        the shape of the original pytree, such as for ``optax.masked``.
-
-    Returns:
-    The result of applying the function f on all trees in the optimizer's state
-    that have the same shape as the parameter tree, along with the given
-    optional extra arguments.
-    """
-
-    # Cast for pytype checks (no-op for other usages).
-    placeholder = cast(base.chex.ArrayTree, _ParamsPlaceholder())
-
-    if isinstance(initable, Initable):
-        initable = cast(Initable, initable)  # for pytype checks
-        state_with_placeholders = initable.init(placeholder)
-    else:
-        state_with_placeholders = initable(placeholder)
-
-    def map_params(maybe_placeholder_value, value):
-        if isinstance(maybe_placeholder_value, _ParamsPlaceholder):
-            return jax.tree_util.tree_map(f, value, *rest, is_leaf=is_leaf)
-        elif transform_non_params is not None:
-            return transform_non_params(value)
-        else:
-            return value
-
-    return jax.tree_util.tree_map(
-        map_params,
-        state_with_placeholders,
-        state,
-        is_leaf=lambda v: isinstance(v, _ParamsPlaceholder),
-    )
-
-alpa.init(cluster="ray")
-
-
-tf.config.experimental.set_visible_devices([], 'GPU')
-
-logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-
-@jax.tree_util.register_pytree_node_class
-class _ParamsPlaceholder:
-
-  def tree_flatten(self):
-    return ((), None)
-
-  @classmethod
-  def tree_unflatten(cls, aux, children):
-    del aux, children
-    return cls()
-
-@typing.runtime_checkable
-class Initable(Protocol):
-  """An object with an init function."""
-
-  def init(self, params):
-    """Calling the init for given parameters returns a fresh opt state."""
-
-def tree_map_params(
-    initable,
-    f,
-    state,
-    /,
-    *rest,
-    transform_non_params = None,
-    is_leaf = None,
-):
-  """Apply a callable over all params in the given optimizer state.
-
-  This function exists to help construct partition specs over optimizer
-  states, in the case that a partition spec is already known for the parameters.
-
-  For example, the following will replace all optimizer state parameter trees
-  with copies of the given partition spec instead. The argument
-  `transform_non_params` can be used to replace any remaining fields as
-  required, in this case, we replace those fields by None.
-
-  >>> params, specs = jnp.array(0.), jnp.array(0.)  # Trees with the same shape
-  >>> opt = optax.sgd(1e-3)
-  >>> state = opt.init(params)
-  >>> opt_specs = optax.tree_map_params(
-  ...     opt,
-  ...     lambda _, spec: spec,
-  ...     state,
-  ...     specs,
-  ...     transform_non_params=lambda _: None,
-  ...     )
-
-  Args:
-    initable: A callable taking parameters and returning an optimizer state, or
-      an object with an `init` attribute having the same function.
-    f: A callable that will be applied for all copies of the parameter tree
-      within this optimizer state.
-    state: The optimizer state to map over.
-    *rest: Additional arguments, having the same shape as the parameter tree,
-      that will be passed to f.
-    transform_non_params: An optional function that will be called on all
-      non-parameter fields within the optimizer state.
-    is_leaf: Passed through to `jax.tree.map`. This makes it possible to ignore
-      parts of the parameter tree e.g. when the gradient transformations modify
-      the shape of the original pytree, such as for ``optax.masked``.
-
-  Returns:
-    The result of applying the function f on all trees in the optimizer's state
-    that have the same shape as the parameter tree, along with the given
-    optional extra arguments.
-  """
-
-  # Cast for pytype checks (no-op for other usages).
-  placeholder = cast(base.chex.ArrayTree, _ParamsPlaceholder())
-
-  if isinstance(initable, Initable):
-    initable = cast(Initable, initable)  # for pytype checks
-    state_with_placeholders = initable.init(placeholder)
-  else:
-    state_with_placeholders = initable(placeholder)
-
-  def map_params(maybe_placeholder_value, value):
-    if isinstance(maybe_placeholder_value, _ParamsPlaceholder):
-      return jax.tree_util.tree_map(f, value, *rest, is_leaf=is_leaf)
-    elif transform_non_params is not None:
-      return transform_non_params(value)
-    else:
-      return value
-
-  return jax.tree_util.tree_map(
-      map_params,
-      state_with_placeholders,
-      state,
-      is_leaf=lambda v: isinstance(v, _ParamsPlaceholder),
-  )
-
-def llama_manual_sharding(num_layers, state: TrainState):
-    param_partition = {
-        'lm_head': {
-            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension (hidden), NOT the vocabulary dimension
-        },
-        'model': {
-            'embed_tokens': {
-                'embedding': PartitionSpec("mp", None),  # Shard along the first dimension (hidden), NOT the vocabulary dimension
-            },
-            'layers': {
-                '%d' % (layer): {
-                    'input_layernorm': {
-                        'weight': PartitionSpec(None),  # Replicate layer norm weights
-                    },
-                    'mlp': {
-                        'down_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
-                        },
-                        'gate_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
-                        },
-                        'up_proj': {
-                            'kernel': PartitionSpec("mp", None),  # Shard along the first dimension
-                        },
-                    },
-                    'post_attention_layernorm': {
-                        'weight': PartitionSpec(None),  # Replicate layer norm weights
-                    },
-                    'self_attn': {
-                        'k_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
-                        },
-                        'o_proj': {
-                            'kernel': PartitionSpec("mp", None),  # Shard along the first dimension
-                        },
-                        'q_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
-                        },
-                        'v_proj': {
-                            'kernel': PartitionSpec(None, "mp"),  # Shard along the second dimension
-                        },
-                    },
-                }
-                for layer in range(num_layers)
-            },
-            'norm': {
-                'weight': PartitionSpec(None),  # Replicate final layer norm weight
-            },
-        },
-    }
-
-    # Use tree_map_params with the correct structure
-
-    replicate = lambda x : jax.tree_util.tree_map(lambda _: PartitionSpec(None), x)
-    opt_state = tree_map_params(state.tx, lambda _, spec: spec, state.opt_state,
-                                param_partition, transform_non_params=lambda _: PartitionSpec(None))
-    manual_partition = TrainState(
-        step=PartitionSpec(None),
-        params=param_partition,
-        master_copy=param_partition if state.master_copy else None,
-        dynamic_scale=replicate(state.dynamic_scale),
-        tx=state.tx,
-        apply_fn=state.apply_fn,
-        opt_state=opt_state
-    )
-    return manual_partition
 
 
 @dataclass
@@ -344,63 +87,7 @@ class DataTrainingArguments(DataTrainingArguments):
         super().__post_init__()
 
 
-
-def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
-                min_batch_size: int, shuffle: bool = False):
-    """
-    Returns batches of size `batch_size` from truncated `dataset`, sharded over all local devices.
-    Shuffle batches if `shuffle` is `True`.
-    """
-    if len(dataset) < batch_size:
-        assert len(dataset) >= min_batch_size
-        batch_size = len(dataset) // min_batch_size * min_batch_size
-
-    data_collator = transformers.DefaultDataCollator("np")
-    tf_dataset = dataset.to_tf_dataset(batch_size=batch_size,
-                                       columns=dataset.column_names,
-                                       collate_fn=data_collator,
-                                       shuffle=shuffle,
-                                       drop_remainder=True)
-
-    for batch in tf_dataset:
-        batch = {k: v._numpy() for k, v in batch.items()}
-        yield batch
-
-
-def write_train_metric(summary_writer, train_metrics, train_time, step):
-    summary_writer.scalar("train_time", train_time, step)
-
-    train_metrics = alpa.util.get_metrics(train_metrics)
-    for key, vals in train_metrics.items():
-        tag = f"train_{key}"
-        for i, val in enumerate(vals):
-            summary_writer.scalar(tag, val, step - len(vals) + i + 1)
-
-
-def write_eval_metric(summary_writer, eval_metrics, step):
-    for metric_name, value in eval_metrics.items():
-        summary_writer.scalar(f"eval_{metric_name}", value, step)
-
-
-def create_learning_rate_fn(
-    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
-) -> Callable[[int], jnp.array]:
-    """Returns a linear warmup, linear_decay learning rate function."""
-    steps_per_epoch = train_ds_size // train_batch_size
-    num_train_steps = steps_per_epoch * num_train_epochs
-    warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
-    decay_fn = optax.linear_schedule(
-        init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
-    )
-    schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
-    return schedule_fn
-
-
 def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -411,7 +98,6 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_clm", model_args, data_args, framework="flax")
 
     if (
         os.path.exists(training_args.output_dir)
@@ -424,18 +110,6 @@ def main():
             "Use --overwrite_output_dir to overcome."
         )
 
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    # Setup logging, we only want one process per machine to log things on the screen.
-    logger.setLevel(logging.INFO)
-    datasets.utils.logging.set_verbosity_warning()
-    transformers.utils.logging.set_verbosity_info()
-
-    # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
 
     # Set seed before initializing model.
@@ -545,9 +219,19 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
+    # Reduce vocab size to 1024
+    # config.vocab_size = 1024
+
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.tokenizer_name,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    elif model_args.config_name:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.config_name,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             use_auth_token=True if model_args.use_auth_token else None,
@@ -566,8 +250,7 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    do_monkey_patch()
-
+    # do_monkey_patch()
 
     if model_args.model_name_or_path:
         model = FlaxAutoModelForCausalLM.from_pretrained(
@@ -578,14 +261,6 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
             from_pt=False
         )
-
-        #from transformers import FlaxOPTForCausalLM
-        #config.num_hidden_layers = 2
-        #model = FlaxOPTForCausalLM(
-        #    config=config,
-        #    seed=training_args.seed,
-        #    dtype=getattr(jnp, model_args.dtype),
-        #)
     else:
         model = FlaxAutoModelForCausalLM.from_config(
             config,
@@ -704,7 +379,8 @@ def main():
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
-    if has_tensorboard:
+    summary_writer = None
+    if has_tensorboard and not disable_log:
         try:
             from flax.metrics.tensorboard import SummaryWriter
 
@@ -776,12 +452,12 @@ def main():
                 mask=decay_mask_fn
             )
         )
-    if training_args.gradient_accumulation_steps > 1:
-        optimizer = optax.MultiSteps(optimizer, training_args.gradient_accumulation_steps)
+    # if training_args.gradient_accumulation_steps > 1:
+    #     optimizer = optax.MultiSteps(optimizer, training_args.gradient_accumulation_steps)
     grad_accum_steps = training_args.gradient_accumulation_steps
 
     # Setup train state
-    if model_args.dtype == "float16":
+    if model_args.dtype == "float16" or model_args.dtype == "bfloat16":
         use_master_copy = True
         dynamic_scale = DynamicScale()
         # Fix a bug in huggingface's implementation (https://github.com/huggingface/transformers/pull/18462)
@@ -799,40 +475,41 @@ def main():
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
-    # Manual partition spec
-    state_manual_sharding = llama_manual_sharding(config.num_hidden_layers, state)
-    ms_option = ManualShardingOption(
-        ("dp", "mp"), in_axis_resources=(state_manual_sharding, PartitionSpec("dp", None)))
-    ignore_ids = (IGNORE_TOKEN_ID, )
 
-    def loss_fn(logits, labels, ignore_indices):
-        # Shift logits
+    # def loss_fn(logits, labels, ignore_indices):
+    #     # Shift logits
+    #     shift_logits = logits[..., :-1, :]
+    #     shift_labels = labels[..., 1:]
+    #     # Handle the ignore index: compute the valid first
+    #     valid = jnp.full(shift_labels.shape, True)
+    #     for ignore_index in ignore_indices:
+    #         new_valid = jnp.not_equal(shift_labels, ignore_index)
+    #         valid = jnp.logical_and(valid, new_valid)
+    #     valid = jnp.asarray(valid, dtype=jnp.float32)
+    #     valid_len = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
+    #     # OneHot and mask the ignore index. For ignore_index(-100), the whole line
+    #     # in the output would be 0.
+    #     one_hot_labels = jax.nn.one_hot(shift_labels, shift_logits.shape[-1])
+    #     # Compute the softmax loss
+    #     log_p = jax.nn.log_softmax(shift_logits, axis=-1)
+    #     # (bs, seq_len, vocab) -> (bs, seq_len)
+    #     cross_entropy = jnp.sum(one_hot_labels * log_p, axis=-1)
+    #     loss = -jnp.mean(jnp.sum(cross_entropy * valid, axis=-1) / valid_len)
+    #     return loss
+
+    def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
-        # Handle the ignore index: compute the valid first
-        valid = jnp.full(shift_labels.shape, True)
-        for ignore_index in ignore_indices:
-            new_valid = jnp.not_equal(shift_labels, ignore_index)
-            valid = jnp.logical_and(valid, new_valid)
-        valid = jnp.asarray(valid, dtype=jnp.float32)
-        valid_len = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
-        # OneHot and mask the ignore index. For ignore_index(-100), the whole line
-        # in the output would be 0.
-        one_hot_labels = jax.nn.one_hot(shift_labels, shift_logits.shape[-1])
-        # Compute the softmax loss
-        log_p = jax.nn.log_softmax(shift_logits, axis=-1)
-        # (bs, seq_len, vocab) -> (bs, seq_len)
-        cross_entropy = jnp.sum(one_hot_labels * log_p, axis=-1)
-        loss = -jnp.mean(jnp.sum(cross_entropy * valid, axis=-1) / valid_len)
-        return loss
+        loss = optax.softmax_cross_entropy(shift_logits, onehot(shift_labels, shift_logits.shape[-1]))
+        return loss.mean()
 
     # Define gradient update step fn
     def train_step(state, batch):
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params)[0]
-            loss = loss_fn(logits, labels, ignore_ids)
+            logits = state.apply_fn(**batch, params=params, train=True)[0]
+            loss = loss_fn(logits, labels)
             return loss
 
         dynamic_scale = state.dynamic_scale
@@ -869,16 +546,13 @@ def main():
         metrics = {"loss": loss}
         return metrics
 
-    # Create parallel version of the train and eval step
-    method = alpa.get_3d_parallel_method(
-        num_micro_batches=training_args.per_device_train_batch_size,
-        data_parallel=-1,
-        operator_parallel=training_args.operator_parallel,
-        pipeline_parallel=training_args.pipeline_parallel,
-        manual_layer_num=config.num_hidden_layers,
-        manual_sharding_option=ms_option
-    )
+    # Manual partition spec
+    ignore_ids = (IGNORE_TOKEN_ID, )
 
+    method = create_alpa_method(
+        AlpaMethod(training_args.parallel_strategy), 
+        training_args,
+    )
 
     p_train_step = alpa.parallelize(
         train_step,
@@ -891,7 +565,7 @@ def main():
             eval_step,
             method=alpa.FollowParallel(
                 p_train_step, 
-                num_micro_batches=training_args.per_device_eval_batch_size
+                num_micro_batches=training_args.num_micro_batches
             )
         )                             
                              
@@ -921,7 +595,7 @@ def main():
 
         # Generate an epoch by shuffling sampling indices from the train dataset
         train_loader = data_loader(input_rng, train_dataset, train_batch_size,
-                                   train_min_batch_size, shuffle=True)
+                                   1, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
 
         steps_trained_progress_bar = tqdm(
@@ -934,7 +608,6 @@ def main():
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
             batch = next(train_loader)
-            print("Input IDs shape (inside train_step):", batch["input_ids"].shape)
             batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
                                      batch["attention_mask"]) - 1
 
@@ -969,15 +642,14 @@ def main():
 
                 # Save metrics
                 train_time += time.time() - train_start
-                if has_tensorboard:
-                    write_train_metric(summary_writer, train_metrics, train_time, cur_step)
-
-                train_metric = jax.tree_map(np.mean, train_metric)
+                train_metrics = alpa.util.get_metrics(train_metrics)
+                train_metrics = jax.tree_util.tree_map(jnp.mean, train_metrics)  # Use tree_util.tree_map on plural train_metrics
+                write_train_metric(train_metrics, train_time, cur_step, summary_writer)  # Use plural train_metrics
 
                 epochs.write(
                     f"Step... {cur_step} | "
-                    f"Loss: {train_metric['loss'].mean():.4f}, "
-                    f"Learning Rate: {train_metric['learning_rate'].mean():.5f}, "
+                    f"Loss: {train_metrics['loss']:.4f}, "
+                    f"Learning Rate: {train_metrics['learning_rate']:.5f}, "
                     f"Throughput: {throughput_tokens:.2f} token/s, "
                     f"{throughput_tflops:.2f} TFLOP/s"
                 )
@@ -1072,6 +744,8 @@ def main():
     params = alpa.util.map_to_nparray(state.params)
     model.save_pretrained(training_args.output_dir, params=params)
     tokenizer.save_pretrained(training_args.output_dir)
+
+    alpa.shutdown()
 
 
 if __name__ == "__main__":

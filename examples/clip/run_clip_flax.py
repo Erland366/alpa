@@ -6,7 +6,6 @@ from examples.utils import *
 
 import alpa
 import logging
-import os
 import sys
 import time
 import functools
@@ -19,6 +18,7 @@ import datasets
 from datasets import load_dataset
 from tqdm import tqdm
 from PIL import Image
+from typing import Optional
 
 import torch
 from torchvision.datasets import VisionDataset
@@ -33,10 +33,10 @@ from torchvision.transforms import (
     RandomResizedCrop,
     ToTensor,
     # /added for image augmentation
-    CenterCrop, 
-    ConvertImageDtype, 
-    Normalize, 
-    Resize
+    CenterCrop,
+    ConvertImageDtype,
+    Normalize,
+    Resize,
 )
 from torchvision.transforms.functional import InterpolationMode
 from alpa.model.model_util import DynamicScale, TrainState
@@ -59,16 +59,13 @@ from transformers import (
     CLIPProcessor,
     HfArgumentParser,
     is_tensorboard_available,
-    IntervalStrategy
-    
+    IntervalStrategy,
+    set_seed,
 )
-from transformers.testing_utils import CaptureLogger
 
-from importlib.util import find_spec
+init_alpa(normalize_embedding_shape=False)
 
-alpa.init(cluster="ray")
-
-logger = logging.getLogger(__name__)
+logger = setup_logging(__name__)
 
 disable_log = True
 if disable_log:
@@ -76,57 +73,119 @@ if disable_log:
     os.environ["WANDB_DISABLED"] = "true"
 
 
+# Modify the Transform class to ensure it's compatible with the model's vision config
 class Transform(torch.nn.Module):
     def __init__(self, image_size, mean, std):
         super().__init__()
+        logger.info(f"Creating image transformer with size: {image_size}, mean: {mean}, std: {std}")
+        
+        # Ensure image_size is an integer
+        if isinstance(image_size, (list, tuple)):
+            image_size = image_size[0]
+        
         self.transforms = torch.nn.Sequential(
-            Resize([image_size], interpolation=InterpolationMode.BICUBIC, antialias=True),
+            Resize(
+                [image_size], interpolation=InterpolationMode.BICUBIC, antialias=True
+            ),
             CenterCrop(image_size),
             ConvertImageDtype(torch.float),
             Normalize(mean, std),
         )
 
     def forward(self, x) -> torch.Tensor:
-        """`x` should be an instance of `PIL.Image.Image`"""
+        """`x` should be an instance of `PIL.Image.Image` or a tensor"""
         with torch.no_grad():
+            # Handle different input types
+            if not isinstance(x, torch.Tensor):
+                # Convert PIL image or numpy array to tensor if needed
+                if not isinstance(x, (torch.Tensor, np.ndarray)):
+                    x = torch.from_numpy(np.array(x))
+                else:
+                    x = torch.from_numpy(x)
+                    
+                # Ensure the tensor is in the right format (CHW)
+                if x.ndim == 3 and x.shape[0] not in (1, 3):
+                    # Assume HWC format, convert to CHW
+                    x = x.permute(2, 0, 1)
+                
+            # Apply the transforms
             x = self.transforms(x)
+            
         return x
 
-def rotate_checkpoints(ckpt_dir:str, save_total_limit:int):
+
+def rotate_checkpoints(ckpt_dir: str, save_total_limit: int):
     "Removes older checkpoints so that `save_total_limit` checkpoints are kept"
     # TODO: what to remove is decided using step number only, we might want to improve that
     ckpts = [str(x) for x in Path(ckpt_dir).glob("ckpt-*")]
     # sort checkpoints by step
-    ckpts_sorted = sorted(ckpts, key=lambda x: int(x.split('-')[-1]))
+    ckpts_sorted = sorted(ckpts, key=lambda x: int(x.split("-")[-1]))
     ckpts_to_delete = ckpts_sorted[:-save_total_limit]
     for ckpt in ckpts_to_delete:
-        logger.info(f"Deleting older checkpoint [{ckpt}] due to save_total_limit ({save_total_limit})")
+        logger.info(
+            f"Deleting older checkpoint [{ckpt}] due to save_total_limit ({save_total_limit})"
+        )
         shutil.rmtree(ckpt)
+
+
+@dataclass
+class ModelArguments(ModelArguments):
+    processor_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The name of the processor to use to convert the data in features for the model."
+        },
+    )
+
+    def __post_init__(self):
+        if self.tokenizer_name is not None and self.processor_name is None:
+            logger.warning(
+                "You have provided a `tokenizer_name` but not a `processor_name`. The `tokenizer_name` will be used to determine the processor."
+            )
+            self.processor_name = self.tokenizer_name
+        if self.processor_name is not None and self.tokenizer_name is not None:
+            logger.warning(
+                "Both `processor_name` and `tokenizer_name` are provided. `processor_name` will be used."
+            )
+            delattr(self, "tokenizer_name")
+
 
 @dataclass
 class DataTrainingArguments(DataTrainingArguments):
     def __post_init__(self):
         if self.use_data_sample:
             self.dataset_name = "RIW/small-coco"
-            self.dataset_config_name =None
+            self.dataset_config_name = None
             delattr(self, "use_data_sample")
 
         super().__post_init__()
 
+
 @dataclass
 class TrainingArguments(TrainingArguments):
-    project: str = field(
-        default="alpa_clip"
-    )
+    project: str = field(default="alpa_clip")
+
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, ImageAugmentationArguments))
+    parser = HfArgumentParser(
+        (
+            ModelArguments,
+            DataTrainingArguments,
+            TrainingArguments,
+            ImageAugmentationArguments,
+        )
+    )
+
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args, augmentation_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, augmentation_args = (
+            parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        )
     else:
-        model_args, data_args, training_args, augmentation_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, augmentation_args = (
+            parser.parse_args_into_dataclasses()
+        )
 
     if (
         os.path.exists(training_args.output_dir)
@@ -139,27 +198,11 @@ def main():
             "Use --overwrite_output_dir to overcome."
         )
 
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    # Setup logging, we only want one process per machine to log things on the screen.
-    logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
-    if jax.process_index() == 0:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
+    # login_wandb()
+    # instantiate_wandb()
+    set_seed(training_args.seed)
 
     logger.info(f"Training/evaluation parameters {training_args}")
-
-    # Load pretrained model and tokenizer
-
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
 
     if data_args.dataset_name is not None:
         dataset = load_dataset(
@@ -187,30 +230,62 @@ def main():
         )
 
     if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
+        config = AutoConfig.from_pretrained(
+            model_args.config_name, cache_dir=model_args.cache_dir
+        )
     elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
+        config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path, cache_dir=model_args.cache_dir
+        )
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
 
-    processor = CLIPProcessor.from_pretrained(model_args.model_name_or_path or model_args.config_name)
+    # Determine the source for the processor
+    if model_args.processor_name:
+        processor = CLIPProcessor.from_pretrained(
+            model_args.processor_name,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=model_args.token if model_args.token else None,
+        )
+    elif model_args.model_name_or_path:
+        processor = CLIPProcessor.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=model_args.token if model_args.token else None,
+        )
+    elif model_args.config_name:
+        processor = CLIPProcessor.from_pretrained(
+            model_args.config_name,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=model_args.token if model_args.token else None,
+        )
+    else:
+        raise ValueError("No processor source provided")
 
     image_processor = processor.image_processor
     tokenizer = processor.tokenizer
 
     if model_args.model_name_or_path:
         model = FlaxCLIPModel.from_pretrained(
-            model_args.model_name_or_path, 
-            config=config, 
-            seed=training_args.seed, 
-            dtype=getattr(jnp, model_args.dtype)
+            model_args.model_name_or_path,
+            config=config,
+            seed=training_args.seed,
+            dtype=getattr(jnp, model_args.dtype),
+        )
+    elif model_args.config_name:
+        model = FlaxCLIPModel.from_pretrained(
+            model_args.config_name,
+            config=config,
+            seed=training_args.seed,
+            dtype=getattr(jnp, model_args.dtype),
         )
     else:
         model = FlaxCLIPModel(
             config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype)
         )
+
 
     config = model.config
     if training_args.do_train:
@@ -218,7 +293,9 @@ def main():
     elif training_args.do_eval:
         column_names = dataset["validation"].column_names
     else:
-        logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
+        logger.info(
+            "There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`."
+        )
         return
 
     dataset_name_mapping = {
@@ -227,7 +304,9 @@ def main():
 
     dataset_columns = dataset_name_mapping.get(data_args.dataset_name, None)
     if data_args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+        image_column = (
+            dataset_columns[0] if dataset_columns is not None else column_names[0]
+        )
     else:
         image_column = data_args.image_column
         if image_column not in column_names:
@@ -235,7 +314,9 @@ def main():
                 f"--image_column' value '{data_args.image_column}' needs to be one of: {', '.join(column_names)}"
             )
     if data_args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+        caption_column = (
+            dataset_columns[1] if dataset_columns is not None else column_names[1]
+        )
     else:
         caption_column = data_args.caption_column
         if caption_column not in column_names:
@@ -244,14 +325,20 @@ def main():
             )
 
     image_transformations = Transform(
-        config.vision_config.image_size, image_processor.image_mean, image_processor.image_std
+        config.vision_config.image_size,
+        image_processor.image_mean,
+        image_processor.image_std,
     )
     image_transformations = torch.jit.script(image_transformations)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
-        attention_mask = torch.tensor([example["attention_mask"] for example in examples], dtype=torch.long)
+        input_ids = torch.tensor(
+            [example["input_ids"] for example in examples], dtype=torch.long
+        )
+        attention_mask = torch.tensor(
+            [example["attention_mask"] for example in examples], dtype=torch.long
+        )
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
@@ -260,19 +347,34 @@ def main():
 
     def tokenize_captions(examples):
         captions = list(examples[caption_column])
-        text_inputs = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", truncation=True)
+        max_length = config.text_config.max_position_embeddings if hasattr(config, 'text_config') else data_args.max_seq_length
+    
+        text_inputs = tokenizer(
+            captions,
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+        )
         examples["input_ids"] = text_inputs.input_ids
         examples["attention_mask"] = text_inputs.attention_mask
         return examples
 
     def transform_images(examples):
         if isinstance(examples[image_column][0], Image.Image):
-            images = [torch.from_numpy(np.array(image.convert("RGB")).transpose(2, 0, 1)) for image in examples[image_column]]
+            images = [
+                torch.from_numpy(np.array(image.convert("RGB")).transpose(2, 0, 1))
+                for image in examples[image_column]
+            ]
             # The transpose is needed to get CHW format (channels, height, width) that PyTorch expects
-        elif isinstance(examples[image_column][0], str): # Then it's a path
-            images = [read_image(image_file, mode=ImageReadMode.RGB) for image_file in examples[image_column]]
+        elif isinstance(examples[image_column][0], str):  # Then it's a path
+            images = [
+                read_image(image_file, mode=ImageReadMode.RGB)
+                for image_file in examples[image_column]
+            ]
         else:
-            raise ValueError(f"{examples[image_column][0]} is not either a `PIL.Image` or a path!")
+            raise ValueError(
+                f"{examples[image_column][0]} is not either a `PIL.Image` or a path!"
+            )
 
         examples["pixel_values"] = [image_transformations(image) for image in images]
         return examples
@@ -292,7 +394,6 @@ def main():
         return valid_images
 
     if training_args.do_train:
-
         if "train" not in dataset:
             raise ValueError("--do_train requires a train dataset")
 
@@ -302,7 +403,9 @@ def main():
             train_dataset = train_dataset.select(range(max_train_samples))
 
         train_dataset = train_dataset.filter(
-            filter_corrupt_images, batched=True, num_proc=data_args.preprocessing_num_workers
+            filter_corrupt_images,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
         )
         train_dataset = train_dataset.map(
             function=tokenize_captions,
@@ -324,7 +427,9 @@ def main():
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
         eval_dataset = eval_dataset.filter(
-            filter_corrupt_images, batched=True, num_proc=data_args.preprocessing_num_workers
+            filter_corrupt_images,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
         )
         eval_dataset = eval_dataset.map(
             function=tokenize_captions,
@@ -337,6 +442,19 @@ def main():
 
         eval_dataset.set_transform(transform_images)
 
+    num_devices = alpa.get_global_num_devices()
+    train_min_batch_size = (num_devices // training_args.operator_parallel //
+                            training_args.pipeline_parallel * training_args.num_micro_batches)
+                        
+    if training_args.do_eval:
+        eval_num_micro_batches = training_args.num_micro_batches
+        eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                            training_args.pipeline_parallel * eval_num_micro_batches)
+        while len(eval_dataset) < eval_min_batch_size:
+            eval_num_micro_batches //= 2
+            eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                                training_args.pipeline_parallel * eval_num_micro_batches)
+
     HAS_TENSORBOARD = is_tensorboard_available()
     if HAS_TENSORBOARD and jax.process_index() == 0:
         try:
@@ -344,16 +462,17 @@ def main():
 
             summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir))
         except ImportError as ie:
-            has_tensorboard = False
+            HAS_TENSORBOARD = False
             logger.warning(
                 f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
             )
+            summary_writer = None
     else:
         logger.warning(
             "Unable to display metrics through TensorBoard because the package is not installed: "
             "Please run pip install tensorboard to enable."
         )
-    
+
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
@@ -383,22 +502,21 @@ def main():
         )
 
     if (
-        jax.process_index() == 0 
-        and HAS_WANDB 
-        and not DEBUG
+        jax.process_index() == 0 and HAS_WANDB and not DEBUG
         # and ("wandb" in training_args.report_to) # Still error
     ):
         try:
             import wandb
+
             if training_args.run_name is None:
                 run_name = training_args.output_dir.split("/")[-1]
             else:
                 run_name = training_args.run_name
             wandb.init(
                 name=run_name,
-                entity=training_args.entity, 
+                entity=training_args.entity,
                 project=training_args.project,
-                sync_tensorboard=True
+                sync_tensorboard=True,
             )
             wandb.config.update(training_args)
             wandb.config.update(model_args)
@@ -437,11 +555,12 @@ def main():
             mask=functools.partial(decay_mask_fn, flatten_layers=flatten_layers_masked),
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(training_args.max_grad_norm),
-            optimizer
+            optax.clip_by_global_norm(training_args.max_grad_norm), optimizer
         )
     if training_args.gradient_accumulation_steps > 1:
-        optimizer = optax.MultiSteps(optimizer, training_args.gradient_accumulation_steps)
+        optimizer = optax.MultiSteps(
+            optimizer, training_args.gradient_accumulation_steps
+        )
     grad_accum_steps = training_args.gradient_accumulation_steps
 
     if model_args.dtype == "float16":
@@ -452,15 +571,15 @@ def main():
         use_master_copy = dynamic_scale = None
 
     state = TrainState.create(
-        apply_fn=model.__call__, 
-        params=model.params, 
-        tx=optimizer, 
+        apply_fn=model.__call__,
+        params=model.params,
+        tx=optimizer,
         dynamic_scale=dynamic_scale,
-        use_master_copy=use_master_copy
+        use_master_copy=use_master_copy,
     )
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
-    
+
     if training_args.resume_from_checkpoint:
         state = restore_checkpoint(training_args.resume_from_checkpoint, state)
         resume_step = mb_item(state.step)
@@ -468,22 +587,57 @@ def main():
         resume_step = 0
 
     # Check whether this is correct
-    def cross_entropy(logits, axis):
-        logprobs = jax.nn.log_softmax(logits, axis=axis)
-        nll = jnp.diag(logprobs)
-        ce = -jnp.mean(nll)
-        return ce
+    # def cross_entropy(logits, axis):
+    #     """copied from https://github.com/huggingface/transformers/blob/main/examples/flax/text-retrieval/run_clip.py#L488"""
+    #     labels = jnp.arange(logits.shape[0])
+    #     loss = optax.softmax_cross_entropy_with_integer_labels(
+    #         logits=logits, labels=labels
+    #     ).mean()
+    #     return loss
 
-    def clip_loss(similarity):
-        loss = (cross_entropy(similarity, axis=0) + cross_entropy(similarity, axis=1)) / 2
+    # def clip_loss(logits_per_image, logits_per_text):
+    #     """modified clip loss to accept both logits"""
+    #     loss_img = cross_entropy(logits_per_image, axis=0)
+    #     loss_txt = cross_entropy(logits_per_text, axis=1)
+    #     loss = (loss_img + loss_txt) / 2
+    #     return loss
+
+    def clip_loss(logits_per_image, logits_per_text):
+        batch_size = logits_per_image.shape[0]
+        labels = jnp.arange(batch_size)
+        
+        loss_i2t = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits_per_image, 
+            labels=labels
+        )
+        
+        loss_t2i = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits_per_text, 
+            labels=labels
+        )
+        
+        loss_i2t_mean = jnp.mean(loss_i2t)
+        loss_t2i_mean = jnp.mean(loss_t2i)
+        
+        loss = (loss_i2t_mean + loss_t2i_mean) / 2.0
+        
         return loss
 
     # Define gradient update step fn
-    def train_step(state, batch):
+    def train_step(state, batch, dropout_rng):
+        # Debug input shapes
+        logger.info("=== Input Shapes ===")
+        for k, v in batch.items():
+            logger.info(f"{k}: {v.shape}")
+        logger.info("===================")
+
+        dropout_rng = jax.random.fold_in(dropout_rng, state.step)
 
         def compute_loss(params):
-            logits = state.apply_fn(**batch, params=params)[0]
-            loss = clip_loss(logits)
+            outputs = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)  # Model forward pass
+            logits_per_image = outputs.logits_per_image
+            logits_per_text = outputs.logits_per_text
+            loss = clip_loss(logits_per_image, logits_per_text)
             return loss
 
         dynamic_scale = state.dynamic_scale
@@ -500,32 +654,39 @@ def main():
             new_state = new_state.replace(
                 opt_state=jax.tree_map(
                     functools.partial(jnp.where, is_fin),
-                    new_state.opt_state, state.opt_state),
+                    new_state.opt_state,
+                    state.opt_state,
+                ),
                 params=jax.tree_map(
-                    functools.partial(jnp.where, is_fin),
-                    new_state.params, state.params),
+                    functools.partial(jnp.where, is_fin), new_state.params, state.params
+                ),
                 master_copy=jax.tree_map(
                     functools.partial(jnp.where, is_fin),
-                    new_state.master_copy, state.master_copy),
-                dynamic_scale=dynamic_scale)
+                    new_state.master_copy,
+                    state.master_copy,
+                ),
+                dynamic_scale=dynamic_scale,
+            )
 
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        metrics = {
+            "loss": loss,
+            "learning_rate": linear_decay_lr_schedule_fn(state.step),
+        }
 
-        return new_state, metrics
-
+        return new_state, metrics, dropout_rng
 
     # Define eval fn
     def eval_step(params, batch):
-        logits = model(**batch, params=params, train=False)[0]
-        loss = clip_loss(logits)
+        logits = model(**batch, params=params, train=False)
+        logits_per_image = logits.logits_per_image
+        logits_per_text = logits.logits_per_text
+        loss = clip_loss(logits_per_image, logits_per_text)
         metrics = {"loss": loss}
         return metrics
 
-    method = alpa.get_3d_parallel_method(
-            num_micro_batches=training_args.per_device_train_batch_size,
-            data_parallel=-1,
-            operator_parallel=training_args.operator_parallel,
-            pipeline_parallel=training_args.pipeline_parallel
+    method = create_alpa_method(
+        AlpaMethod(training_args.parallel_strategy), 
+        training_args,
     )
 
     p_train_step = alpa.parallelize(
@@ -539,15 +700,19 @@ def main():
             eval_step,
             method=alpa.FollowParallel(
                 p_train_step, 
-                num_micro_batches=training_args.per_device_eval_batch_size
+                num_micro_batches=training_args.num_micro_batches
             )
-        )
+        )                             
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed and grad_accum) = {train_batch_size}")
+    logger.info(
+        f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}"
+    )
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed and grad_accum) = {train_batch_size}"
+    )
     logger.info(f"  Total optimization steps = {total_train_steps}")
 
     if not training_args.skip_memory_metrics:
@@ -569,8 +734,13 @@ def main():
 
         steps_per_epoch = len(train_dataset) // train_batch_size
 
-        steps_trained_progress_bar = tqdm(range(steps_per_epoch), desc="Training...", position=1,
-                                          leave=False, initial=(resume_step // grad_accum_steps))
+        steps_trained_progress_bar = tqdm(
+            range(steps_per_epoch),
+            desc="Training...",
+            position=1,
+            leave=False,
+            initial=(resume_step // grad_accum_steps),
+        )
         for step, batch in enumerate(train_loader):
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
@@ -579,9 +749,16 @@ def main():
                 continue
             
 
-            batch = make_batch(batch) # Since output of torch.DataLoader is `torch.Tensor`, we need to convert it into `jnp.array`
+            batch = make_batch(
+                batch
+            )  # Since output of torch.DataLoader is `torch.Tensor`, we need to convert it into `jnp.array`
 
-            state, train_metric = p_train_step(state, make_batch(batch))
+            print("Input batch shapes:")
+            print("pixel_values:", batch["pixel_values"].shape)
+            print("input_ids:", batch["input_ids"].shape)
+            print("attention_mask:", batch["attention_mask"].shape)
+
+            state, train_metric, dropout_rng = p_train_step(state, batch, dropout_rng)
             train_metrics.append(train_metric)
 
             if step % grad_accum_steps == 0:
@@ -592,8 +769,10 @@ def main():
                 executable = p_train_step.get_last_executable()
                 executable.sync()
                 executable.dump_debug_info("alpa_debug_info")
-                epochs.write(f"Initial compilation completed. "
-                             f"Time elapsed: {time.time() - train_start:.2f} s")
+                epochs.write(
+                    f"Initial compilation completed. "
+                    f"Time elapsed: {time.time() - train_start:.2f} s"
+                )
 
             step_ct += 1
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
@@ -603,17 +782,20 @@ def main():
                 throughput_tflops = alpa.util.compute_gpt_tflops(
                     batch_size=batch["input_ids"].shape[0],
                     seq_len=batch["input_ids"].shape[1],
-                    num_layers=config.num_hidden_layers,
-                    hidden_size=config.hidden_size,
-                    vocab_size=config.vocab_size,
+                    num_layers=config.vision_config.num_hidden_layers + config.text_config.num_hidden_layers,
+                    hidden_size=config.vision_config.hidden_size + config.text_config.hidden_size,
+                    vocab_size=config.text_config.vocab_size,
                     num_gpus=alpa.get_global_num_devices(),
-                    latency=latency)
+                    latency=latency,
+                )
                 step_ct = 0
 
                 # Save metrics
                 train_time += time.time() - train_start
-                if has_tensorboard:
-                    write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+                if HAS_TENSORBOARD:
+                    write_train_metric(
+                        train_metrics, train_time, cur_step, summary_writer
+                    )
 
                 train_metric = jax.tree_map(np.mean, train_metric)
 
@@ -629,14 +811,18 @@ def main():
                 last_time = time.time()
 
             if training_args.do_eval:
-                if ( cur_step % (training_args.eval_steps * grad_accum_steps) == 0 and
-                    cur_step > 0 and 
-                    model_args.eval_strategy == "steps"):
+                if (
+                    cur_step % (training_args.eval_steps * grad_accum_steps) == 0
+                    and cur_step > 0
+                    and model_args.eval_strategy == "steps"
+                ):
                     # ======================== Evaluating ==============================
                     eval_metrics = []
                     eval_steps = len(eval_dataset) // eval_batch_size
                     eval_iter = iter(eval_loader)
-                    for batch in tqdm(eval_loader, desc="Evaluating...", position=2, leave=False):
+                    for batch in tqdm(
+                        eval_loader, desc="Evaluating...", position=2, leave=False
+                    ):
                         # Model forward
                         metrics = p_eval_step(state.params, make_batch(batch))
                         eval_metrics.append(metrics)
@@ -645,7 +831,6 @@ def main():
                             dump_debug_info_eval_step = False
                             executable = p_eval_step.get_last_executable()
                             executable.dump_debug_info("alpa_debug_info")
-
 
                     # normalize eval metrics
                     eval_metrics = alpa.util.get_metrics(eval_metrics)
@@ -657,12 +842,18 @@ def main():
                     epochs.desc = desc
 
                     # Save metrics
-                    if has_tensorboard and jax.process_index() == 0:
+                    if HAS_TENSORBOARD and jax.process_index() == 0:
                         # cur_step = epoch * (len(train_dataset) // train_batch_size)
-                        write_eval_metric(summary_writer, eval_metrics, cur_step)
-                    if has_wandb and jax.process_index() == 0 and ("wandb" in training_args.report_to):
-                        _metrics = {f"eval_{k}":mb_item(v) for k, v in eval_metrics.items()}
-                        wandb.log({"eval_step":cur_step, **_metrics})
+                        write_eval_metric(eval_metrics, cur_step, summary_writer)
+                    if (
+                        has_wandb
+                        and jax.process_index() == 0
+                        and ("wandb" in training_args.report_to)
+                    ):
+                        _metrics = {
+                            f"eval_{k}": mb_item(v) for k, v in eval_metrics.items()
+                        }
+                        wandb.log({"eval_step": cur_step, **_metrics})
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -672,7 +863,10 @@ def main():
                 model.save_pretrained(training_args.output_dir, params=params)
                 tokenizer.save_pretrained(training_args.output_dir)
                 if training_args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                    repo.push_to_hub(
+                        commit_message=f"Saving weights and logs of step {cur_step}",
+                        blocking=False,
+                    )
 
     # Eval after training
     if training_args.do_eval:
@@ -693,15 +887,18 @@ def main():
         epochs.write(desc)
         epochs.desc = desc
 
-
         # Save metrics
-        if has_tensorboard and jax.process_index() == 0:
+        if HAS_TENSORBOARD and jax.process_index() == 0:
             # cur_step = epoch * (len(train_dataset) // train_batch_size)
-            write_eval_metric(summary_writer, eval_metrics, cur_step)
-        if has_wandb and jax.process_index() == 0 and ("wandb" in training_args.report_to):
-            _metrics = {f"eval_{k}":mb_item(v) for k, v in eval_metrics.items()}
-            wandb.log({"eval_step":cur_step, **_metrics})
-    
+            write_eval_metric(eval_metrics, cur_step, summary_writer)
+        if (
+            has_wandb
+            and jax.process_index() == 0
+            and ("wandb" in training_args.report_to)
+        ):
+            _metrics = {f"eval_{k}": mb_item(v) for k, v in eval_metrics.items()}
+            wandb.log({"eval_step": cur_step, **_metrics})
+
     # Save the final model
     epochs.write("\nSave the final model...")
     alpa.prefetch(state.params)
@@ -718,7 +915,9 @@ def main():
     #     repo_name_or_path=training_args.output_dir
     # )
 
+    maybe_stop_wandb()
 
+    alpa.shutdown()
 
 
 if __name__ == "__main__":

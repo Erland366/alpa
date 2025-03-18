@@ -53,3 +53,40 @@ python examples/clip/run_clip_flax.py \
     --pipeline_parallel 2 \
     --operator_parallel 1
 ```
+
+```python
+                   self_attn: {
+                        k_proj: {
+                            bias: ShapeDtypeStruct(shape=(768,), dtype=float32),
+                            kernel: ShapeDtypeStruct(shape=(768, 768), dtype=float32),
+                        },
+                        out_proj: {
+                            bias: ShapeDtypeStruct(shape=(768,), dtype=float32),
+                            kernel: ShapeDtypeStruct(shape=(768, 768), dtype=float32),
+                        },
+                        q_proj: {
+                            bias: ShapeDtypeStruct(shape=(768,), dtype=float32),
+                            kernel: ShapeDtypeStruct(shape=(768, 768), dtype=float32),
+                        },
+                        v_proj: {
+                            bias: ShapeDtypeStruct(shape=(768,), dtype=float32),
+                            kernel: ShapeDtypeStruct(shape=(768, 768), dtype=float32),
+                        },
+                    },
+                },
+            },
+        },
+        post_layernorm: {
+            bias: ShapeDtypeStruct(shape=(768,), dtype=float32),
+            scale: ShapeDtypeStruct(shape=(768,), dtype=float32),
+        },
+        pre_layrnorm: {
+            bias: ShapeDtypeStruct(shape=(768,), dtype=float32),
+            scale: ShapeDtypeStruct(shape=(768,), dtype=float32),
+        },
+    },
+    visual_projection: {
+        kernel: ShapeDtypeStruct(shape=(768, 512), dtype=float32),
+    },
+})
+```
