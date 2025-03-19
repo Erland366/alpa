@@ -158,7 +158,7 @@ def create_alpa_method(method: AlpaMethod, training_args, *args, **kwargs):
             *args,
             num_micro_batches=num_micro_batches,
             pipeline_schedule=training_args.pipeline_schedule,
-            stage_option="uniform",
+            stage_option="auto",
             ## Default value for layer_option here
             # layer_option=alpa.AutoLayerOption(layer_num=2),
             # layer_option="manual",

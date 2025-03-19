@@ -1,12 +1,12 @@
-python3 examples/clip/run_clip_flax.py \
+python3 examples/llama_without_easylm/run_llama_flax.py\
      --output_dir ./output \
-     --config_name  openai/clip-vit-base-patch32 \
+     --model_name Erland/Llama-3.2-1B-JAX \
      --dataset_name /fs-computility/llm/caizheng/alpa_data/data/sg_90k_part1.json \
      --do_train \
      --block_size 1024 \
-     --per_device_train_batch_size 16 \
-     --per_device_eval_batch_size 4 \
-     --num_micro_batches 8 \
+     --per_device_train_batch_size 4 \
+     --per_device_eval_batch_size 1 \
+     --num_micro_batches 4 \
      --dtype float32 \
      --learning_rate 5e-4 \
      --weight_decay 0.0 \
@@ -16,7 +16,5 @@ python3 examples/clip/run_clip_flax.py \
      --save_steps 3000 \
      --eval_steps 1000 \
      --use_data_sample \
-     --data_parallel 2 \
-     --parallel_strategy parallel_3d \
-     --image_column image \
-     --preprocessing_num_workers 2 \
+     --operator_parallel 2 \
+     --parallel_strategy parallel_3d
