@@ -1,6 +1,6 @@
-python3 examples/llama_without_easylm/run_llama_flax.py\
+python3 examples/gemma/run_gemma_flax.py\
      --output_dir ./output \
-     --model_name Erland/Llama-3.2-1B-JAX \
+     --config_name google/gemma-1.1-2b-it \
      --dataset_name /fs-computility/llm/caizheng/alpa_data/data/sg_90k_part1.json \
      --do_train \
      --block_size 1024 \
@@ -16,5 +16,5 @@ python3 examples/llama_without_easylm/run_llama_flax.py\
      --save_steps 3000 \
      --eval_steps 1000 \
      --use_data_sample \
-     --operator_parallel 2 \
+     --pipeline_parallel 2 \
      --parallel_strategy parallel_3d

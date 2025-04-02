@@ -4,6 +4,7 @@ sys.path.append(".")
 
 from examples.utils import *
 
+import inspect
 import json
 import math
 import os
@@ -44,7 +45,18 @@ from transformers.models.gemma.modeling_flax_gemma import FlaxGemmaForCausalLMMo
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name
 
-# monkeypatch_rope_llama() 
+def monkeypatch_rope_gemma():
+    exec("from transformers.models.gemma import modeling_flax_gemma", globals())
+    source = inspect.getsource(modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__)
+    start = source.find("def")
+    source = source.split("\n")
+    source = "\n".join([x[start:] for x in source])
+    source = source.replace("key = apply", "# key = apply")
+    source = source.replace("query = apply", "# query = apply")
+    func = create_dynamic_function(source, "__call__")
+    modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__ = func
+
+monkeypatch_rope_gemma() 
 
 load_dotenv()
 

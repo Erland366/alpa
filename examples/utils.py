@@ -246,6 +246,7 @@ def monkeypatch_rope_llama():
     func = create_dynamic_function(source, "__call__")
     modeling_flax_llama.FlaxLlamaRotaryEmbedding.__call__ = func
 
+
 def init_alpa(cluster: str = "ray", normalize_embedding_shape: bool = True):
 
     import alpa 
