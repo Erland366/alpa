@@ -498,6 +498,10 @@ class TrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Entity for wandb"}
     )
+    manual_sharding: bool = field(
+        default=False,
+        metadata={"help": "Whether to manually shard the model or not."}
+    )
     def __post_init__(self):
         import jax
 

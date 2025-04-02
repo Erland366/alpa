@@ -16,5 +16,5 @@ python3 examples/llama_without_easylm/run_llama_flax.py\
      --save_steps 3000 \
      --eval_steps 1000 \
      --use_data_sample \
-     --operator_parallel 2 \
+     --pipeline_parallel 2 \
      --parallel_strategy parallel_3d
