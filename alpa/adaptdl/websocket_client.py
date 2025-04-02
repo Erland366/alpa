@@ -24,5 +24,7 @@ def handle_message(message):
     print(f"Handling message synchronously: {message} at time {datetime.now().strftime('%H:%M:%S')}")
     if message == "reallocation":
         pollux_agent.reallocation_approaching = True
+    if message.startswith("dequeued"):
+        pollux_agent.queued = False
     # if message == "command_xyz":
         # perform_action()

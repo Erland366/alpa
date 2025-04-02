@@ -39,9 +39,11 @@ class PlacementGroupRequest(BaseModel):
 @app.post("/initial-request-placement-group")
 async def initial_request_placement_group(job_id: str, name: str):
     try:
-        pg = await orchestrator.initial_request_placement_group(job_id, name)
+        response = await orchestrator.initial_request_placement_group(job_id, name)
+        if response == "QUEUED":
+            return {"message": f"{response}"}
+        pg = response
         print(f"Placement group: {pg}")
-        # print(f"Objects in the pg object: {dir(pg)}")
         return {"message": f"placement group with name {ray.util.placement_group_table(pg)['name']} created!"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)
@@ -88,7 +90,7 @@ async def get_all_jobs():
 @app.post("/release-resources")
 async def release_resources(job_id: str, reason: ResourceReleaseReason):
     try:
-        orchestrator.release_resources(job_id, reason)
+        await orchestrator.release_resources(job_id, reason)
         return {"message": f"successfully released resources of job {job_id}"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=e.message)

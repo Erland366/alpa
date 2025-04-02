@@ -23,6 +23,7 @@ RAY_CLUSTER_ADDRESS = "127.0.0.1:6379"
 RAY_CLUSTER_NAMESPACE = "Alpa-AdaptDL-Ray-NameSpace"
 POLICY_INITIAL_NUM_GPU = 1
 FAIRNESS_KNOB = -1
+GPU_PER_JOB_RATIO = 1
 
 logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -157,11 +158,7 @@ class Orchestrator:
         logger.info("Warning! Replacing all the jobs!")
         self.jobs = jobs
         
-        
-    async def initial_request_placement_group(self, job_id: str, name: str):
-        if job_id in self.allocation_matrix.keys() or self.jobs[job_id].status is not JobState.registered:
-            raise SchedulerError("This job is not supposed to request initial resources!")
-        
+    def get_node_fit_job(self, job_id: str):
         # Get used and free resources' vectors
         used_resources = np.zeros(self.all_host_num_devices.shape, dtype=int)
         
@@ -177,12 +174,28 @@ class Orchestrator:
         for i, num_free_gpus in enumerate(free_resources):
             if num_free_gpus >= init_num_gpus:
                 allocated_node = i
+                
+        return allocated_node
+    
         
-        if allocated_node is None: # TODO: also check if such a placement group is available
+    async def initial_request_placement_group(self, job_id: str, name: str):
+        if job_id in self.allocation_matrix.keys() or self.jobs[job_id].status is not JobState.registered:
+            raise SchedulerError("This job is not supposed to request initial resources!")
+        
+        init_num_gpus = min(POLICY_INITIAL_NUM_GPU, self.gpus_per_node)
+        
+        allocated_node = self.get_node_fit_job(job_id)
+        
+        total_gpus = np.sum(self.all_host_num_devices)
+        running_jobs = len(self.allocation_matrix)
+        ratio = total_gpus / (running_jobs + 1)
+        
+        if allocated_node is None or ratio < GPU_PER_JOB_RATIO: # TODO: also check if such a placement group is available
             self.jobs_queue.append(job_id)
             self.jobs[job_id].status = JobState.queued
+            self.jobs[job_id].pg_name = name
             logger.info(f"queued job {job_id}")
-            return None # TODO: instead, implement a queueing mechanism, job should wait for a placement group
+            return "QUEUED" # TODO: instead, implement a queueing mechanism, job should wait for a placement group
         else:
             # allocation_vector = np.array([init_num_gpus if i == allocated_node else 0 for i in range(self.all_host_num_devices.shape[0])])
             # logger.info(f"allocation_vector - {allocation_vector}")
@@ -302,8 +315,32 @@ class Orchestrator:
             raise SchedulerError("This job is not found in the scheduler's database")
         self.jobs[job_id].pollux_agent = pollux_agent
         
+        
+    async def attempt_dequeue(self):
+        for job_id in self.jobs_queue:
+            init_num_gpus = min(POLICY_INITIAL_NUM_GPU, self.gpus_per_node)
+            
+            total_gpus = np.sum(self.all_host_num_devices)
+            running_jobs = len(self.allocation_matrix)
+            ratio = total_gpus / (running_jobs + 1)
+            
+            if ratio >= GPU_PER_JOB_RATIO:
+                logger.info(f"Job {job_id} can be potentially dequeued. Searching for possible allocations...")
+                allocated_node = self.get_node_fit_job(job_id)
+                
+                if allocated_node is not None:
+                    num_hosts = 1
+                    host_num_devices = [init_num_gpus] * num_hosts
+                    print(f"trying self.create_placement_group() in attempt_dequeue...")
+                    pg = await self.create_placement_group(num_hosts, host_num_devices, self.jobs[job_id].pg_name, job_id)
+                    
+                    from main import send_message_to_client
+                    await send_message_to_client(job_id=job_id, message="dequeued")
+                    self.jobs_queue.remove(job_id)
+                    logger.info(f"Dequeued job {job_id} and sent a notice")
+                    
     
-    def release_resources(self, job_id: str, reason: ResourceReleaseReason):
+    async def release_resources(self, job_id: str, reason: ResourceReleaseReason):
         if job_id not in self.allocation_matrix.keys():
             raise SchedulerError("This job does not have any allocated resources!")
         try:
@@ -317,6 +354,7 @@ class Orchestrator:
                     self.job_ids_reallocating_resources.pop(job_id, None)
             del self.allocation_matrix[job_id]
             logger.info(f"Resources of job {job_id} released!")
+            await self.attempt_dequeue()
         except Exception as e:
             # del self.allocation_matrix[job_id]
             raise SchedulerError(f"Placement group not found, job probably called alpa.shutdown(). Exception: {e}")
@@ -433,6 +471,8 @@ class Orchestrator:
 
                 # Not reallocating if some jobs did not properly start yet
                 # Temporary solution
+                # TODO: this only works for the first time. After a reallocation, another mechanism should be used to make sure that jobs are past compilation stage
+                # e.g., check job's last report time. Also, the job could be in evaluation stage (if enabled).
                 wait_for_other_jobs = False
 
                 for job_id, job in self.jobs.items():
