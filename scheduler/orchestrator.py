@@ -317,7 +317,7 @@ class Orchestrator:
         
         
     async def attempt_dequeue(self):
-        for job_id in self.jobs_queue:
+        for job_id in list(self.jobs_queue):
             init_num_gpus = min(POLICY_INITIAL_NUM_GPU, self.gpus_per_node)
             
             total_gpus = np.sum(self.all_host_num_devices)
