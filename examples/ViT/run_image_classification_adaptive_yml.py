@@ -64,7 +64,7 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -161,9 +161,6 @@ class TrainingArguments:
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=0.999, metadata={"help": "Smoothing parameter for PGNS"})
-    scale_lr: bool = field(
-        default=yml_config.training.scale_lr.enabled, metadata={"help": "Whether or not to scale the learning rate with batch size."}
-    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -452,7 +449,6 @@ def main():
         },
         save_code=yml_config.wandb.save_code,
         mode=yml_config.wandb.mode,
-        # settings=wandb.Settings(code_dir=os.path.dirname(os.path.dirname(alpa.__file__)))
     )
     run.log_code(
                     os.path.dirname(os.path.dirname(alpa.__file__)),
@@ -478,18 +474,10 @@ def main():
 
         return batch
 
-    pollux_agent.total_batch_size = train_batch_size
-    pollux_agent.last_state_retrieved_batch_size = train_batch_size
-    pollux_agent.dataset_size = len(train_dataset)
+    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
 
     # Set regression coefficients if specified in the config
-    if yml_config.pollux_agent.fix_regressors:
-        for item in yml_config.pollux_agent.regression_coefficients:
-            key = tuple(item.key)  # Convert list in .yml to tuple
-            values = item
-            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
-            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
-        pollux_agent.fix_regressors()
+    fix_regressors(yml_config)
 
     # Create data loaders
     if not yml_config.dataloader.train.adaptive_data_loader.enabled:
@@ -530,14 +518,6 @@ def main():
        collate_fn=collate_fn,
     )
 
-    # eval_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
-    #     dataset=eval_dataset,
-    #     batch_size=eval_batch_size,
-    #     shuffle=False, 
-    #     drop_last=False,
-    #     collate_fn=collate_fn,
-    # )
-
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
     if has_tensorboard and jax.process_index() == 0:
@@ -569,29 +549,16 @@ def main():
         training_args.learning_rate,
     )
 
-    if yml_config.training.scale_lr.type == 'sqrt':
-        scaling_rule = SqrtScale()
-    else:
-        scaling_rule = LinearScale()
-    
-    # TODO: initial batch size should probably be stored separately to avoid newer batch size being set after a checkpoint-restart
-    scaled_linear_decay_lr_schedule_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
-                                                             scaling_rule=scaling_rule)
-
-    if not training_args.scale_lr:
-        scaled_linear_decay_lr_schedule_fn = linear_decay_lr_schedule_fn
+    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
 
     # create adam optimizer
     adamw = optax.adamw(
-        #learning_rate=linear_decay_lr_schedule_fn,
-        learning_rate=scaled_linear_decay_lr_schedule_fn,
+        learning_rate=scaled_learning_rate_fn,
         b1=training_args.adam_beta1,
         b2=training_args.adam_beta2,
         eps=training_args.adam_epsilon,
         weight_decay=training_args.weight_decay,
     )
-
-    #adamw = optax.sgd(learning_rate=scaled_linear_decay_lr_schedule_fn)
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
@@ -647,7 +614,7 @@ def main():
                                                                                                             theta)
 
             metrics = {"loss": loss, 
-                "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step), 
+                "learning_rate": scaled_learning_rate_fn(state.step), 
                 "gradients": gradients, 
                 "grad_sqr": grad_sqr, 
                 "grad_var": grad_var, 
@@ -658,7 +625,7 @@ def main():
                 }
         else:
             metrics = {"loss": loss, 
-                "learning_rate": scaled_linear_decay_lr_schedule_fn(state.step),
+                "learning_rate": scaled_learning_rate_fn(state.step),
                 }
 
         return new_state, metrics

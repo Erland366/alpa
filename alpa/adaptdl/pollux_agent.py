@@ -346,6 +346,11 @@ class PolluxAgent:
         with open(filename,'wb') as f:
             pickle.dump(self, f)
 
+    def preset_batch_size(self, total_batch_size, last_state_retrieved_batch_size, dataset_size):
+        self.total_batch_size = total_batch_size
+        self.last_state_retrieved_batch_size = last_state_retrieved_batch_size
+        self.dataset_size = dataset_size
+
 def init_regressor():
     return LinearRegression()
     

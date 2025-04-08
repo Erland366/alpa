@@ -72,7 +72,7 @@ from alpa.adaptdl.gns_util import (extract_values_with_key_p,
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -163,9 +163,6 @@ class TrainingArguments:
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=yml_config.training.smoothing, metadata={"help": "Smoothing parameter for PGNS"})
-    scale_lr: bool = field(
-        default=yml_config.training.scale_lr.enabled, metadata={"help": "Whether or not to scale the learning rate with batch size."}
-    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -617,13 +614,6 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        #from transformers import FlaxOPTForCausalLM
-        #config.num_hidden_layers = 2
-        #model = FlaxOPTForCausalLM(
-        #    config=config,
-        #    seed=training_args.seed,
-        #    dtype=getattr(jnp, model_args.dtype),
-        #)
     else:
         print(f"Pretraining mode")
         model = FlaxAutoModelForCausalLM.from_config(
@@ -793,18 +783,10 @@ def main():
     scale = training_args.scale
     theta = training_args.smoothing * scale
     
-    pollux_agent.total_batch_size = train_batch_size
-    pollux_agent.last_state_retrieved_batch_size = train_batch_size
-    pollux_agent.dataset_size = len(train_dataset)
+    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
 
     # Set regression coefficients if specified in the config
-    if yml_config.pollux_agent.fix_regressors:
-        for item in yml_config.pollux_agent.regression_coefficients:
-            key = tuple(item.key)  # Convert list in .yml to tuple
-            values = item
-            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
-            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
-        pollux_agent.fix_regressors()
+    fix_regressors(yml_config)
 
     if not yml_config.dataloader.train.adaptive_data_loader.enabled:
         train_loader = DataLoader(
@@ -851,14 +833,7 @@ def main():
         training_args.learning_rate,
     )
 
-    if yml_config.training.scale_lr.type == 'sqrt':
-        scaling_rule = SqrtScale()
-    else:
-        scaling_rule = LinearScale()
-    scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
-                                                        scaling_rule=scaling_rule)
-    if not training_args.scale_lr:
-        scaled_learning_rate_fn = linear_decay_lr_schedule_fn
+    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
 
     # We use Optax's "masking" functionality to not apply weight decay
     # to bias and LayerNorm scale parameters. decay_mask_fn returns a

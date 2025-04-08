@@ -4,6 +4,9 @@ import alpa
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 from typing import Callable, Optional
 from alpa.model.model_util import DynamicScale, TrainState
+from addict import Dict as AddictDict
+import numpy as np
+from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 
 def update_state_on_bs_change(state):
     if pollux_agent.last_state_retrieved_batch_size == pollux_agent.total_batch_size:
@@ -100,3 +103,29 @@ def reallocate_and_update_state(state):
     pollux_agent.update_dataloader_batchsize = True
     
     return state
+
+def fix_regressors(yml_config: AddictDict):
+    """
+    Set regression coefficients if specified in the config
+    """
+    if yml_config.pollux_agent.fix_regressors:
+        for item in yml_config.pollux_agent.regression_coefficients:
+            key = tuple(item.key)  # Convert list in .yml to tuple
+            values = item
+            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
+            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
+        pollux_agent.fix_regressors()
+
+def get_scaled_learning_rate_fn(yml_config: AddictDict, original_learning_rate_fn):
+    if not yml_config.training.scale_lr.enabled:
+        return original_learning_rate_fn
+    if yml_config.training.scale_lr.type == 'sqrt':
+        scaling_rule = SqrtScale()
+    else:
+        scaling_rule = LinearScale()
+    
+    # TODO: initial batch size should probably be stored separately to avoid newer batch size being set after a checkpoint-restart
+    scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=original_learning_rate_fn, initial_batch_size=pollux_agent.total_batch_size,
+                                                             scaling_rule=scaling_rule)
+
+    return scaled_learning_rate_fn
