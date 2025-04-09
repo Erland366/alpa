@@ -64,7 +64,7 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -565,7 +565,6 @@ def main():
     gns.initialize_gns(state=state, 
                        init_bsz=train_batch_size, 
                        num_workers=alpa.get_global_num_devices(), 
-                       accum_scale=alpa.get_global_num_devices(),
                        store_grads=jnp.array(0.))
     
     def loss_fn(logits, labels):
@@ -641,21 +640,7 @@ def main():
         metrics = {"loss": loss, "accuracy": accuracy}
         return metrics
 
-    # Create parallel version of the train and eval step
-    if yml_config.training.parallel_method.method == 'ShardParallel':
-        method = alpa.ShardParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
-    elif yml_config.training.parallel_method.method == 'PipeshardParallel':
-        stage_option = yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option
-        method = alpa.PipeshardParallel(stage_option=stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
-    elif yml_config.training.parallel_method.method == 'DataParallel':
-        method = alpa.DataParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
-    elif yml_config.training.parallel_method.method == '3D':
-        method = alpa.get_3d_parallel_method(num_micro_batches=yml_config.training.parallel_method.num_micro_batches,
-                                             data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
-                                             operator_parallel=yml_config.training.parallel_method.parameters._3D.operator_parallel,
-                                             pipeline_parallel=yml_config.training.parallel_method.parameters._3D.pipeline_parallel)
-    else:
-        method = alpa.DataParallel()
+    method = get_parallel_method(yml_config)
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)

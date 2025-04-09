@@ -12,14 +12,12 @@ class GradientNoiseScale():
                  state=None, 
                  num_workers=None, 
                  init_batch_size=None, 
-                 accum_scale=None 
                  ) -> None:
         # initialization of pgns state
         self.state = state          # pgns_gradients unflattened
         self.mp_scaler = mp_scaler
         #self.num_replicas = num_workers
         self.num_workers = num_workers
-        self.accum_scale = accum_scale
         self.accum_count = 1
         self.init_batch_size = init_batch_size
         self.store_grads = jax.tree_util.tree_map(jnp.zeros_like, state)         #previous Gradient
@@ -67,11 +65,10 @@ class GradientNoiseScale():
         self.unbias_var     = unbias_var
         self.store_grads    = gradients
 
-    def initialize_gns(self, state, init_bsz, num_workers, accum_scale, store_grads):
+    def initialize_gns(self, state, init_bsz, num_workers, store_grads):
         self.state = state
         self.init_batch_size = init_bsz
         self.num_workers = num_workers
-        self.accum_scale = accum_scale
         self.store_grads = store_grads
 
 gns = GradientNoiseScale()
