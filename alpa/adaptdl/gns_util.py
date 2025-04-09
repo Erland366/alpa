@@ -11,6 +11,11 @@ from jax.core import ShapedArray
 from jax.interpreters import pxla
 
 
+def get_mean_leaves(structure):
+    structure_flat, _ = jax.tree_util.tree_flatten(structure)
+    mean_leaves = jnp.array([jnp.mean(leaf) for leaf in structure_flat])
+    return mean_leaves
+
 def extract_values_with_key_p(structure):
     flat_structure, tree_def = tree_flatten(structure)
     #flattened_gradients = [node._value for node in flat_structure]
@@ -35,10 +40,16 @@ def normsqr_groups(grads, pinvs):
     return jnp.sum(jnp.array(normsqr_list))
 
 
-def compute_gradient_noise_scale(prev_grads, new_grads, 
-                                  biased_sqr, unbias_sqr, biased_var, unbias_var,
-                                  count, scale, theta
-                                 ):
+def compute_gradient_noise_scale(variables: dict, new_grads):
+    prev_grads = variables.get('gns_store_grads', None)
+    biased_sqr = variables.get('gns_biased_sqr', None)
+    unbias_sqr = variables.get('gns_unbias_sqr', None)
+    biased_var = variables.get('gns_biased_var', None)
+    unbias_var = variables.get('gns_unbias_var', None)
+    count = variables.get('count', None)
+    scale = variables.get('scale', None)
+    theta = variables.get('theta', None)
+
     def normsqr_groups(flat_grads):
         return jnp.sum(jnp.square(flat_grads))
     
@@ -54,7 +65,18 @@ def compute_gradient_noise_scale(prev_grads, new_grads,
     grad_var = (local_sqr - total_sqr) * scale / (count - 1)
     biased_sqr, unbias_sqr, grad_sqr = update_avg(grad_sqr, theta, biased_sqr, unbias_sqr)
     biased_var, unbias_var, grad_var = update_avg(grad_var, theta, biased_var, unbias_var)
-    return grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var
+
+    gns_dict = {
+                "gradients": new_grads, 
+                "grad_sqr": grad_sqr, 
+                "grad_var": grad_var, 
+                "biased_sqr": biased_sqr,
+                "unbias_sqr": unbias_sqr, 
+                "biased_var": biased_var, 
+                "unbias_var": unbias_var,
+                }
+
+    return gns_dict
 
 
 def flatten_and_concat(nested):

@@ -64,11 +64,7 @@ from transformers import (
 )
 from alpa.adaptdl.pollux_agent import pollux_agent
 from jax.tree_util import tree_flatten, tree_unflatten
-from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
-                                   compute_gradient_noise_scale, 
-                                   init_distributed_scalar,
-                                   init_distributed_zeros_like,
-                                   flatten_and_concat)
+from alpa.adaptdl.gns_util import compute_gradient_noise_scale, get_mean_leaves
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
@@ -881,9 +877,12 @@ def main():
                               dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
     gns.initialize_gns(state=state, 
-                init_bsz=train_batch_size, 
-                num_workers=alpa.get_global_num_devices(), 
-                store_grads=flatten_and_concat(extract_values_with_key_p(state.params)))
+                       init_bsz=train_batch_size, 
+                       num_workers=alpa.get_global_num_devices(), 
+                       store_grads=jnp.array(0.),
+                       count=count,
+                       scale=scale,
+                       theta=theta)
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
@@ -901,16 +900,6 @@ def main():
             logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
             loss = loss_fn(logits, labels)
             return loss
-
-        if yml_config.training.gns_enabled:
-            prev_grads = variables.get('gns_store_grads', None)
-            biased_sqr = variables.get('gns_biased_sqr', None)
-            unbias_sqr = variables.get('gns_unbias_sqr', None)
-            biased_var = variables.get('gns_biased_var', None)
-            unbias_var = variables.get('gns_unbias_var', None)
-            count = variables.get('count', None)
-            scale = variables.get('scale', None)
-            theta = variables.get('theta', None)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -935,44 +924,15 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
+        metrics = {
+            "loss": loss, 
+            "learning_rate": scaled_learning_rate_fn(state.step),
+        }
+
         if yml_config.training.gns_enabled:
-            pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
-            gradients = flatten_and_concat(extract_values_with_key_p(grads))
-            preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
-            
-            # Basing GNS estimation on the first 10% gradients
-            # –––––––––––––––––––––––––––––––––––––––––––––
-            first_10_percent = int(round(gradients.shape[0] * 10 / 100))
-            gradients = gradients[:first_10_percent]
-            preconditioners = preconditioners[:first_10_percent]
-            # –––––––––––––––––––––––––––––––––––––––––––––
-
-            grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
-                                                                                                        preconditioners, 
-                                                                                                        biased_sqr, 
-                                                                                                        unbias_sqr, 
-                                                                                                        biased_var, 
-                                                                                                        unbias_var, 
-                                                                                                        count, 
-                                                                                                        scale, 
-                                                                                                        theta)
-
-            metrics = {
-                "loss": loss,
-                "learning_rate": scaled_learning_rate_fn(state.step),
-                "gradients": gradients, 
-                "grad_sqr": grad_sqr, 
-                "grad_var": grad_var, 
-                "biased_sqr": biased_sqr,
-                "unbias_sqr": unbias_sqr, 
-                "biased_var": biased_var, 
-                "unbias_var": unbias_var,
-            }
-        else:
-            metrics = {
-                "loss": loss,
-                "learning_rate": scaled_learning_rate_fn(state.step),
-            }
+            gradients = get_mean_leaves(grads)
+            gns_dict = compute_gradient_noise_scale(variables, gradients)
+            metrics.update(gns_dict)
 
         return new_state, metrics
 
@@ -1013,14 +973,6 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
-    if yml_config.training.gns_enabled:
-        gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10, dtype=jnp.float32 if dynamic_scale else None)
-        gns.biased_sqr = init_distributed_scalar()
-        gns.unbias_sqr = init_distributed_scalar()
-        gns.biased_var = init_distributed_scalar()
-        gns.unbias_var = init_distributed_scalar()
-
-    # for epoch in epochs:
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================
         train_start = time.time()
@@ -1033,9 +985,8 @@ def main():
         for step, batch in enumerate(train_loader):
             batch = process_batch(batch)
 
-            variables_dict = {'dropout_rng': dropout_rng}
             if yml_config.training.gns_enabled:
-                variables_dict.update({'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta})
+                variables_dict = gns.construct_gns_dict()
 
             if pollux_agent.reallocation_approaching:
                 state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
@@ -1045,10 +996,8 @@ def main():
             train_metrics.append(train_metric)
 
             if yml_config.training.gns_enabled:
-                gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
-                        train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
-
-                update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
+                gns.update_state(state, train_metric)
+                update_grad_params(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
