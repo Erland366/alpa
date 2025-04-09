@@ -973,6 +973,8 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
+    variables_dict = None
+
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================
         train_start = time.time()
