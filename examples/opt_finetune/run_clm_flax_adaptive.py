@@ -72,7 +72,7 @@ from alpa.adaptdl.gns_util import (extract_values_with_key_p,
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -1039,47 +1039,7 @@ def main():
                 variables_dict.update({'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta})
 
             if pollux_agent.reallocation_approaching:
-                p_train_step.get_last_executable().sync()
-
-                materialized_variables_dict = {}
-                for k, v in variables_dict.items():
-                    if isinstance(v, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                        materialized_variables_dict[k] = v._value
-                    elif isinstance(v, list):
-                        materialized_list = []
-                        for el in v:
-                            if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                                materialized_list.append(el._value)
-                            else:
-                                materialized_list.append(el)
-                        materialized_variables_dict[k] = materialized_list
-                    else:
-                        materialized_variables_dict[k] = v
-                variables_dict = materialized_variables_dict
-                if isinstance(pollux_agent.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
-                     and isinstance(pollux_agent.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
-                    pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
-
-                if isinstance(gns.store_grads, list):
-                    store_grads_materialized = []
-                    for el in gns.store_grads:
-                        if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                            store_grads_materialized.append(el._value)
-                        else:
-                            store_grads_materialized.append(el)
-                    gns.store_grads = store_grads_materialized
-                if isinstance(gns.biased_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.biased_sqr = gns.biased_sqr._value
-                if isinstance(gns.unbias_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.unbias_sqr = gns.unbias_sqr._value
-                if isinstance(gns.biased_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.biased_var = gns.biased_var._value
-                if isinstance(gns.unbias_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.unbias_var = gns.unbias_var._value
-
-                state = reallocate_and_update_state(state)
-
+                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
                 continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
 
             state, train_metric = p_train_step(state, batch, variables_dict)

@@ -64,7 +64,7 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -669,94 +669,28 @@ def main():
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
         train_metrics = []
-        noise_scale_list = []
-        steps_list = []
-        losses = []
-        epoch_losses = []
-        eval_losses = []
-        eval_acc = []
 
         steps_per_epoch = len(train_dataset) // train_batch_size
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for step, batch in enumerate(train_loader):
-            #if isinstance(p_train_step.method, alpa.PipeshardParallel) and \
-            #    (p_train_step.method == 'auto' or isinstance(p_train_step.method, alpa.AutoLayerOption)):
-            #    state = update_state_on_bs_change(state)
-            # exec_time = time.perf_counter()
-            
 
             variables_dict = {'dropout_rng': dropout_rng}
             if yml_config.training.gns_enabled:
                 variables_dict.update({'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta})
-            #state, train_metric = p_train_step(state, batch, dropout_rng, gns.store_grads, 
-            #                                    gns.biased_sqr, gns.unbias_sqr, gns.biased_var, gns.unbias_var, count, scale, theta)
 
             if pollux_agent.reallocation_approaching:
-                p_train_step.get_last_executable().sync()
-
-                materialized_variables_dict = {}
-                for k, v in variables_dict.items():
-                    if isinstance(v, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                        materialized_variables_dict[k] = v._value
-                    elif isinstance(v, list):
-                        materialized_list = []
-                        for el in v:
-                            if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                                materialized_list.append(el._value)
-                            else:
-                                materialized_list.append(el)
-                        materialized_variables_dict[k] = materialized_list
-                    else:
-                        materialized_variables_dict[k] = v
-                variables_dict = materialized_variables_dict
-                if isinstance(pollux_agent.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
-                     and isinstance(pollux_agent.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
-                    pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
-
-                if isinstance(gns.store_grads, list):
-                    store_grads_materialized = []
-                    for el in gns.store_grads:
-                        if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                            store_grads_materialized.append(el._value)
-                        else:
-                            store_grads_materialized.append(el)
-                    gns.store_grads = store_grads_materialized
-                if isinstance(gns.biased_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.biased_sqr = gns.biased_sqr._value
-                if isinstance(gns.unbias_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.unbias_sqr = gns.unbias_sqr._value
-                if isinstance(gns.biased_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.biased_var = gns.biased_var._value
-                if isinstance(gns.unbias_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.unbias_var = gns.unbias_var._value
-
-                state = reallocate_and_update_state(state)
-
+                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
                 continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
             
             state, train_metric = p_train_step(state, batch, variables_dict)
-
-            # exec_time = time.perf_counter() - exec_time
-            # logger.info(f'train_step time: {exec_time}')
-            # gns_update_time = time.perf_counter()
-            
-            # epoch_losses.append(train_metric['loss']._value)
-            
-                
-            # print(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
-            
-            # logger.info(f'epoch: {epoch}, step: {step}')
-            # logger.info(f'grad_sqr: {train_metric["grad_sqr"]._value}, grad_var: {train_metric["grad_var"]._value}')
+            train_metrics.append(train_metric)
 
             if yml_config.training.gns_enabled:
                 gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
                         train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
 
                 update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
-            
-            #train_metrics.append(train_metric)
         
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
