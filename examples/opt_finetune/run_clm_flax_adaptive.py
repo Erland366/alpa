@@ -902,7 +902,6 @@ def main():
             loss = loss_fn(logits, labels)
             return loss
 
-        dropout_rng = variables.get('dropout_rng', None)
         if yml_config.training.gns_enabled:
             prev_grads = variables.get('gns_store_grads', None)
             biased_sqr = variables.get('gns_biased_sqr', None)

@@ -572,11 +572,7 @@ def main():
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, 
-                   batch, 
-                   variables: Dict 
-                   #dropout_rng: PRNGKey, prev_grads, biased_sqr, unbias_sqr, biased_var, unbias_var, count, scale, theta
-                   ):
+    def train_step(state, batch, variables: Dict):
 
         def compute_loss(params):
             labels = batch.pop("labels")
@@ -584,7 +580,6 @@ def main():
             loss = loss_fn(logits, labels)
             return loss
         
-        dropout_rng = variables.get('dropout_rng', None)
         if yml_config.training.gns_enabled:
             prev_grads = variables.get('gns_store_grads', None)
             biased_sqr = variables.get('gns_biased_sqr', None)
