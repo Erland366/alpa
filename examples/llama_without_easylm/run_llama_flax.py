@@ -138,6 +138,8 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    # TODO: Temporary
+    training_args.manual_sharding = False
 
     if (
         os.path.exists(training_args.output_dir)
