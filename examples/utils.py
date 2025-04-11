@@ -60,6 +60,7 @@ __all__ = [
     "setup_experiment_logging",
     "create_dynamic_function",
     "monkeypatch_rope_llama",
+    "monkeypatch_rope_gemma",
     "parse_args",
 ]
 
@@ -865,6 +866,17 @@ def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
     for batch in tf_dataset:
         batch = {k: v._numpy() for k, v in batch.items()}
         yield batch
+
+def monkeypatch_rope_gemma():
+    exec("from transformers.models.gemma import modeling_flax_gemma", globals())
+    source = inspect.getsource(modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__)
+    start = source.find("def")
+    source = source.split("\n")
+    source = "\n".join([x[start:] for x in source])
+    source = source.replace("key = apply", "# key = apply")
+    source = source.replace("query = apply", "# query = apply")
+    func = create_dynamic_function(source, "__call__")
+    modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__ = func
 
 
 logger = setup_logging(__name__)
