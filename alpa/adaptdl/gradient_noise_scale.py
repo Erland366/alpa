@@ -1,37 +1,19 @@
 import jax
 import jax.numpy as jnp
-#import time
 import alpa
-
-#from jax.tree_util import tree_flatten, tree_unflatten
-#from jax.lib import xla_bridge
-from alpa.device_mesh import DistributedArray
 
 class GradientNoiseScale():
     def __init__(self, mp_scaler=None, 
                  state=None, 
                  num_workers=None, 
                  init_batch_size=None, 
-                 accum_scale=None 
                  ) -> None:
-        # initialization of pgns state
-        self.state = state          # pgns_gradients unflattened
+        self.state = state
         self.mp_scaler = mp_scaler
-        #self.num_replicas = num_workers
         self.num_workers = num_workers
-        self.accum_scale = accum_scale
         self.accum_count = 1
         self.init_batch_size = init_batch_size
-        self.store_grads = jax.tree_util.tree_map(jnp.zeros_like, state)         #previous Gradient
-        #self.running_noise = 0.0
-        #self.running_scale = 0.0
-        # self.noise = 0.0
-        # self.scale = 0.0
-        # self.noise_scale = 0.0
-        # self.biased_sqr = 0.0 
-        # self.unbias_sqr = 0.0 
-        # self.biased_var = 0.0 
-        # self.unbias_var = 0.0
+        self.store_grads = jnp.array(0.)
         self.noise = jnp.array(0.)
         self.scale = jnp.array(0.)
         self.noise_scale = jnp.array(0.)
@@ -46,33 +28,40 @@ class GradientNoiseScale():
 
         pinv = jax.tree_util.tree_map(ones_like, grads._value)
         return pinv
-   
-    # def update_state(self, state, grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var, gradients):
-    #     self.state          = state
-    #     self.noise          = grad_sqr
-    #     self.scale          = grad_var
-    #     self.biased_sqr     = biased_sqr 
-    #     self.unbias_sqr     = unbias_sqr 
-    #     self.biased_var     = biased_var 
-    #     self.unbias_var     = unbias_var
-    #     self.store_grads    = gradients
 
-    def update_state(self, state, grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var, gradients):
+    def update_state(self, state, train_metric: dict):
         self.state          = state
-        self.noise          = grad_sqr
-        self.scale          = grad_var
-        self.biased_sqr     = biased_sqr 
-        self.unbias_sqr     = unbias_sqr 
-        self.biased_var     = biased_var 
-        self.unbias_var     = unbias_var
-        self.store_grads    = gradients
+        self.noise          = train_metric["grad_sqr"]
+        self.scale          = train_metric["grad_var"]
+        self.biased_sqr     = train_metric["biased_sqr"]
+        self.unbias_sqr     = train_metric["unbias_sqr"]
+        self.biased_var     = train_metric["biased_var"]
+        self.unbias_var     = train_metric["unbias_var"]
+        self.store_grads    = train_metric["gradients"]
 
-    def initialize_gns(self, state, init_bsz, num_workers, accum_scale, store_grads):
+    def initialize_gns(self, state, init_bsz, num_workers, store_grads, count, scale, theta):
         self.state = state
         self.init_batch_size = init_bsz
         self.num_workers = num_workers
-        self.accum_scale = accum_scale
         self.store_grads = store_grads
+        self.gns_count = count
+        self.gns_scale = scale
+        self.gns_theta = theta
+
+    def construct_gns_dict(self):
+        gns_dict = {
+            'gns_store_grads': self.store_grads, 
+            'gns_biased_sqr': self.biased_sqr, 
+            'gns_unbias_sqr': self.unbias_sqr, 
+            'gns_biased_var': self.biased_var, 
+            'gns_unbias_var': self.unbias_var, 
+            'count': self.gns_count, 
+            'scale': self.gns_scale, 
+            'theta': self.gns_theta
+            }
+        
+        return gns_dict
+        
 
 gns = GradientNoiseScale()
    

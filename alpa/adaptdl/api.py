@@ -4,6 +4,9 @@ import alpa
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
 from typing import Callable, Optional
 from alpa.model.model_util import DynamicScale, TrainState
+from addict import Dict as AddictDict
+import numpy as np
+from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
 
 def update_state_on_bs_change(state):
     if pollux_agent.last_state_retrieved_batch_size == pollux_agent.total_batch_size:
@@ -100,3 +103,95 @@ def reallocate_and_update_state(state):
     pollux_agent.update_dataloader_batchsize = True
     
     return state
+
+def fix_regressors(yml_config: AddictDict):
+    """
+    Set regression coefficients if specified in the config
+    """
+    if yml_config.pollux_agent.fix_regressors:
+        for item in yml_config.pollux_agent.regression_coefficients:
+            key = tuple(item.key)  # Convert list in .yml to tuple
+            values = item
+            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
+            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
+        pollux_agent.fix_regressors()
+
+def get_scaled_learning_rate_fn(yml_config: AddictDict, original_learning_rate_fn):
+    if not yml_config.training.scale_lr.enabled:
+        return original_learning_rate_fn
+    if yml_config.training.scale_lr.type == 'sqrt':
+        scaling_rule = SqrtScale()
+    else:
+        scaling_rule = LinearScale()
+    
+    # TODO: initial batch size should probably be stored separately to avoid newer batch size being set after a checkpoint-restart
+    scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=original_learning_rate_fn, initial_batch_size=pollux_agent.total_batch_size,
+                                                             scaling_rule=scaling_rule)
+
+    return scaled_learning_rate_fn
+
+def get_parallel_method(yml_config: AddictDict):
+    if yml_config.training.parallel_method.method == 'ShardParallel':
+        method = alpa.ShardParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
+    elif yml_config.training.parallel_method.method == 'PipeshardParallel':
+        stage_option = yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option
+        method = alpa.PipeshardParallel(stage_option=stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
+    elif yml_config.training.parallel_method.method == 'DataParallel':
+        method = alpa.DataParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
+    elif yml_config.training.parallel_method.method == '3D':
+        method = alpa.get_3d_parallel_method(num_micro_batches=yml_config.training.parallel_method.num_micro_batches,
+                                             data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
+                                             operator_parallel=yml_config.training.parallel_method.parameters._3D.operator_parallel,
+                                             pipeline_parallel=yml_config.training.parallel_method.parameters._3D.pipeline_parallel)
+    else:
+        method = alpa.DataParallel()
+    
+    return method
+
+def do_reallocation(yml_config: AddictDict, p_train_step, variables_dict: dict, gns, state):
+    p_train_step.get_last_executable().sync()
+
+    materialized_variables_dict = {}
+    for k, v in variables_dict.items():
+        if isinstance(v, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+            materialized_variables_dict[k] = v._value
+        elif isinstance(v, list):
+            materialized_list = []
+            for el in v:
+                if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                    materialized_list.append(el._value)
+                else:
+                    materialized_list.append(el)
+            materialized_variables_dict[k] = materialized_list
+        else:
+            materialized_variables_dict[k] = v
+
+    if isinstance(pollux_agent.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
+            and isinstance(pollux_agent.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+        pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
+        pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
+
+    if isinstance(gns.store_grads, list):
+        store_grads_materialized = []
+        for el in gns.store_grads:
+            if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+                store_grads_materialized.append(el._value)
+            else:
+                store_grads_materialized.append(el)
+        gns.store_grads = store_grads_materialized
+    if isinstance(gns.biased_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+        gns.biased_sqr = gns.biased_sqr._value
+    if isinstance(gns.unbias_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+        gns.unbias_sqr = gns.unbias_sqr._value
+    if isinstance(gns.biased_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+        gns.biased_var = gns.biased_var._value
+    if isinstance(gns.unbias_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
+        gns.unbias_var = gns.unbias_var._value
+
+    state = reallocate_and_update_state(state)
+
+    # TODO: no need to return materialized_variables_dict if main training loop has `continue` right after this function, because
+    # variables_dict is rebuilt at the beginning of every iteration (rethink this?)
+
+    # TODO: when changing how GNS is accessed/computed, do not forget to do the changes here too
+    return state, materialized_variables_dict

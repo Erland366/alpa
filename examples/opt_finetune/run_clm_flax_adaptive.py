@@ -64,15 +64,11 @@ from transformers import (
 )
 from alpa.adaptdl.pollux_agent import pollux_agent
 from jax.tree_util import tree_flatten, tree_unflatten
-from alpa.adaptdl.gns_util import (extract_values_with_key_p, 
-                                   compute_gradient_noise_scale, 
-                                   init_distributed_scalar,
-                                   init_distributed_zeros_like,
-                                   flatten_and_concat)
+from alpa.adaptdl.gns_util import compute_gradient_noise_scale, get_mean_leaves
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -163,9 +159,6 @@ class TrainingArguments:
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
     smoothing: float = field(default=yml_config.training.smoothing, metadata={"help": "Smoothing parameter for PGNS"})
-    scale_lr: bool = field(
-        default=yml_config.training.scale_lr.enabled, metadata={"help": "Whether or not to scale the learning rate with batch size."}
-    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -617,13 +610,6 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        #from transformers import FlaxOPTForCausalLM
-        #config.num_hidden_layers = 2
-        #model = FlaxOPTForCausalLM(
-        #    config=config,
-        #    seed=training_args.seed,
-        #    dtype=getattr(jnp, model_args.dtype),
-        #)
     else:
         print(f"Pretraining mode")
         model = FlaxAutoModelForCausalLM.from_config(
@@ -793,18 +779,10 @@ def main():
     scale = training_args.scale
     theta = training_args.smoothing * scale
     
-    pollux_agent.total_batch_size = train_batch_size
-    pollux_agent.last_state_retrieved_batch_size = train_batch_size
-    pollux_agent.dataset_size = len(train_dataset)
+    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
 
     # Set regression coefficients if specified in the config
-    if yml_config.pollux_agent.fix_regressors:
-        for item in yml_config.pollux_agent.regression_coefficients:
-            key = tuple(item.key)  # Convert list in .yml to tuple
-            values = item
-            pollux_agent.alloc_config_regressor[key].coef_ = np.array([values.coef])
-            pollux_agent.alloc_config_regressor[key].intercept_ = values.intercept
-        pollux_agent.fix_regressors()
+    fix_regressors(yml_config)
 
     if not yml_config.dataloader.train.adaptive_data_loader.enabled:
         train_loader = DataLoader(
@@ -851,14 +829,7 @@ def main():
         training_args.learning_rate,
     )
 
-    if yml_config.training.scale_lr.type == 'sqrt':
-        scaling_rule = SqrtScale()
-    else:
-        scaling_rule = LinearScale()
-    scaled_learning_rate_fn = create_scaled_lr_fn(original_lr_fn=linear_decay_lr_schedule_fn, initial_batch_size=train_batch_size,
-                                                        scaling_rule=scaling_rule)
-    if not training_args.scale_lr:
-        scaled_learning_rate_fn = linear_decay_lr_schedule_fn
+    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
 
     # We use Optax's "masking" functionality to not apply weight decay
     # to bias and LayerNorm scale parameters. decay_mask_fn returns a
@@ -906,10 +877,12 @@ def main():
                               dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
     gns.initialize_gns(state=state, 
-                init_bsz=train_batch_size, 
-                num_workers=alpa.get_global_num_devices(), 
-                accum_scale=alpa.get_global_num_devices(),
-                store_grads=flatten_and_concat(extract_values_with_key_p(state.params)))
+                       init_bsz=train_batch_size, 
+                       num_workers=alpa.get_global_num_devices(), 
+                       store_grads=jnp.array(0.),
+                       count=count,
+                       scale=scale,
+                       theta=theta)
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
@@ -927,17 +900,6 @@ def main():
             logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
             loss = loss_fn(logits, labels)
             return loss
-
-        dropout_rng = variables.get('dropout_rng', None)
-        if yml_config.training.gns_enabled:
-            prev_grads = variables.get('gns_store_grads', None)
-            biased_sqr = variables.get('gns_biased_sqr', None)
-            unbias_sqr = variables.get('gns_unbias_sqr', None)
-            biased_var = variables.get('gns_biased_var', None)
-            unbias_var = variables.get('gns_unbias_var', None)
-            count = variables.get('count', None)
-            scale = variables.get('scale', None)
-            theta = variables.get('theta', None)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -962,44 +924,15 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
+        metrics = {
+            "loss": loss, 
+            "learning_rate": scaled_learning_rate_fn(state.step),
+        }
+
         if yml_config.training.gns_enabled:
-            pinv = jax.tree_util.tree_map(jnp.ones_like, grads)
-            gradients = flatten_and_concat(extract_values_with_key_p(grads))
-            preconditioners = flatten_and_concat(extract_values_with_key_p(pinv))
-            
-            # Basing GNS estimation on the first 10% gradients
-            # –––––––––––––––––––––––––––––––––––––––––––––
-            first_10_percent = int(round(gradients.shape[0] * 10 / 100))
-            gradients = gradients[:first_10_percent]
-            preconditioners = preconditioners[:first_10_percent]
-            # –––––––––––––––––––––––––––––––––––––––––––––
-
-            grad_sqr, grad_var, biased_sqr, unbias_sqr, biased_var, unbias_var = compute_gradient_noise_scale(prev_grads, gradients,
-                                                                                                        preconditioners, 
-                                                                                                        biased_sqr, 
-                                                                                                        unbias_sqr, 
-                                                                                                        biased_var, 
-                                                                                                        unbias_var, 
-                                                                                                        count, 
-                                                                                                        scale, 
-                                                                                                        theta)
-
-            metrics = {
-                "loss": loss,
-                "learning_rate": scaled_learning_rate_fn(state.step),
-                "gradients": gradients, 
-                "grad_sqr": grad_sqr, 
-                "grad_var": grad_var, 
-                "biased_sqr": biased_sqr,
-                "unbias_sqr": unbias_sqr, 
-                "biased_var": biased_var, 
-                "unbias_var": unbias_var,
-            }
-        else:
-            metrics = {
-                "loss": loss,
-                "learning_rate": scaled_learning_rate_fn(state.step),
-            }
+            gradients = get_mean_leaves(grads)
+            gns_dict = compute_gradient_noise_scale(variables, gradients)
+            metrics.update(gns_dict)
 
         return new_state, metrics
 
@@ -1018,27 +951,10 @@ def main():
                              batch["attention_mask"]) - 1
         return {k: v.numpy() for k, v in batch.items()}
 
-    # Create parallel version of the train and eval step
-    if yml_config.training.parallel_method.method == 'ShardParallel':
-        method = alpa.ShardParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
-    elif yml_config.training.parallel_method.method == 'PipeshardParallel':
-        stage_option = yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option
-        method = alpa.PipeshardParallel(stage_option=stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
-    elif yml_config.training.parallel_method.method == 'DataParallel':
-        method = alpa.DataParallel(num_micro_batches=yml_config.training.parallel_method.num_micro_batches if yml_config.training.parallel_method.num_micro_batches != 1 else None)
-    elif yml_config.training.parallel_method.method == '3D':
-        method = alpa.get_3d_parallel_method(num_micro_batches=yml_config.training.parallel_method.num_micro_batches,
-                                             data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
-                                             operator_parallel=yml_config.training.parallel_method.parameters._3D.operator_parallel,
-                                             pipeline_parallel=yml_config.training.parallel_method.parameters._3D.pipeline_parallel)
-    else:
-        method = alpa.DataParallel()
+    method = get_parallel_method(yml_config)
 
-    p_train_step = alpa.parallelize(train_step,
-                                    method=method,
-                                    donate_argnums=(0,))
+    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
     p_eval_step = alpa.parallelize(eval_step)
-
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
     logger.info("***** Running training *****")
@@ -1057,14 +973,8 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
-    if yml_config.training.gns_enabled:
-        gns.store_grads = init_distributed_zeros_like(gns.store_grads, percent=10, dtype=jnp.float32 if dynamic_scale else None)
-        gns.biased_sqr = init_distributed_scalar()
-        gns.unbias_sqr = init_distributed_scalar()
-        gns.biased_var = init_distributed_scalar()
-        gns.unbias_var = init_distributed_scalar()
+    variables_dict = None
 
-    # for epoch in epochs:
     for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
         # ======================== Training ================================
         train_start = time.time()
@@ -1077,62 +987,19 @@ def main():
         for step, batch in enumerate(train_loader):
             batch = process_batch(batch)
 
-            variables_dict = {'dropout_rng': dropout_rng}
             if yml_config.training.gns_enabled:
-                variables_dict.update({'gns_store_grads': gns.store_grads, 'gns_biased_sqr': gns.biased_sqr, 'gns_unbias_sqr': gns.unbias_sqr, 'gns_biased_var': gns.biased_var, 'gns_unbias_var': gns.unbias_var, 'count': count, 'scale': scale, 'theta': theta})
+                variables_dict = gns.construct_gns_dict()
 
             if pollux_agent.reallocation_approaching:
-                p_train_step.get_last_executable().sync()
-
-                materialized_variables_dict = {}
-                for k, v in variables_dict.items():
-                    if isinstance(v, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                        materialized_variables_dict[k] = v._value
-                    elif isinstance(v, list):
-                        materialized_list = []
-                        for el in v:
-                            if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                                materialized_list.append(el._value)
-                            else:
-                                materialized_list.append(el)
-                        materialized_variables_dict[k] = materialized_list
-                    else:
-                        materialized_variables_dict[k] = v
-                variables_dict = materialized_variables_dict
-                if isinstance(pollux_agent.grad_norm_sqr_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)) \
-                     and isinstance(pollux_agent.grad_variance_abstract, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    pollux_agent.grad_norm_sqr_abstract = pollux_agent.grad_norm_sqr = pollux_agent.grad_norm_sqr_abstract._value.item()
-                    pollux_agent.grad_variance_abstract = pollux_agent.grad_variance = pollux_agent.grad_variance_abstract._value.item()
-
-                if isinstance(gns.store_grads, list):
-                    store_grads_materialized = []
-                    for el in gns.store_grads:
-                        if isinstance(el, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                            store_grads_materialized.append(el._value)
-                        else:
-                            store_grads_materialized.append(el)
-                    gns.store_grads = store_grads_materialized
-                if isinstance(gns.biased_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.biased_sqr = gns.biased_sqr._value
-                if isinstance(gns.unbias_sqr, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.unbias_sqr = gns.unbias_sqr._value
-                if isinstance(gns.biased_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.biased_var = gns.biased_var._value
-                if isinstance(gns.unbias_var, (alpa.device_mesh.DistributedArray, alpa.device_mesh.ReplicatedDistributedArray)):
-                    gns.unbias_var = gns.unbias_var._value
-
-                state = reallocate_and_update_state(state)
-
+                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
                 continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
 
             state, train_metric = p_train_step(state, batch, variables_dict)
             train_metrics.append(train_metric)
 
             if yml_config.training.gns_enabled:
-                gns.update_state(state, train_metric["grad_sqr"], train_metric["grad_var"], train_metric["biased_sqr"], train_metric["unbias_sqr"], 
-                        train_metric["biased_var"], train_metric["unbias_var"], train_metric["gradients"])
-
-                update_grad_params(train_metric["grad_sqr"], train_metric["grad_var"])
+                gns.update_state(state, train_metric)
+                update_grad_params(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 

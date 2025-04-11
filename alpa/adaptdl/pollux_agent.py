@@ -24,6 +24,8 @@ class PolluxAgent:
     def __init__(self, state=None):
         self.enabled = False
         self.is_evaluating = False # True when performing evaluation steps
+        
+        self.queued = False
 
         self.NUM_SYNC_PER_CONFIG = 100 # number of times to synchronize iterations to measure T_iter for each configuration
         self.IS_COMPIL_THRESHOLD = 2 # number of seconds, above which time spent counts as compilation overhead
@@ -343,6 +345,11 @@ class PolluxAgent:
         
         with open(filename,'wb') as f:
             pickle.dump(self, f)
+
+    def preset_batch_size(self, total_batch_size, last_state_retrieved_batch_size, dataset_size):
+        self.total_batch_size = total_batch_size
+        self.last_state_retrieved_batch_size = last_state_retrieved_batch_size
+        self.dataset_size = dataset_size
 
 def init_regressor():
     return LinearRegression()

@@ -4,6 +4,7 @@ from typing import Union, Optional, List, Tuple, Set, Dict
 import requests
 import logging
 import pickle
+import time
 
 
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +29,18 @@ def initial_request_placement_group(name: str):
         "name": name
     }
     r = requests.post(url=url, params=request_data)
+    response_data = r.json()
+    
+    if "message" in response_data and response_data["message"] == "QUEUED":
+        logger.info(f"Job {pollux_agent.job_id} has been queued. Waiting for resources...")
+        # The job will continue when it receives a "dequeued" websocket message
+        pollux_agent.queued = True
+        while pollux_agent.queued:
+            time.sleep(1)
+        logger.info(f"Dequeued - Got placement group for job_id {pollux_agent.job_id}")
+        return response_data
     logger.info(f"Got placement group for job_id {pollux_agent.job_id}")
+    return response_data
 
 
 def reallocation_request_placement_group(name: str):
