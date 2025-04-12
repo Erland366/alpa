@@ -1,0 +1,1445 @@
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright 2021 The HuggingFace Team All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Pre-training/Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...) on a text file or a dataset.
+
+Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
+https://huggingface.co/models?filter=text-generation
+"""
+# You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+import sys
+
+sys.path.append(".")
+sys.path.append("..")
+
+import json
+import logging
+import math
+import os
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+import functools
+from itertools import chain
+from pathlib import Path
+from typing import Callable, Optional, Dict
+from torch.utils.data import DataLoader
+
+import datasets
+import numpy as np
+from datasets import Dataset, load_dataset
+from tqdm import tqdm
+
+import alpa
+from alpa.model.model_util import DynamicScale, TrainState
+from alpa import AutoShardingOption, AutoLayerOption, ManualStageOption
+import jax
+import jax.numpy as jnp
+import optax
+import transformers
+import flax
+# import tensorflow as tf
+from flax import jax_utils, traverse_util
+from flax.training import train_state
+from flax.training.common_utils import onehot, shard, shard_prng_key
+from huggingface_hub import Repository
+from datasets import Dataset
+from transformers import (
+    CONFIG_MAPPING,
+    FLAX_MODEL_FOR_CAUSAL_LM_MAPPING,
+    AutoConfig,
+    AutoTokenizer,
+    FlaxT5ForConditionalGeneration,
+    T5Config,
+    BatchEncoding,
+    PreTrainedTokenizerBase,
+    HfArgumentParser,
+    is_tensorboard_available,
+    set_seed,
+)
+from alpa.adaptdl.pollux_agent import pollux_agent
+from jax.tree_util import tree_flatten, tree_unflatten
+from alpa.adaptdl.gns_util import compute_gradient_noise_scale, get_mean_leaves
+from alpa.adaptdl.dataloader import current_dataloader
+from alpa.adaptdl.metrics import update_grad_params, update_progress
+from jax._src.config import flags
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
+import alpa.adaptdl.dataloader
+import alpa.adaptdl.epoch
+from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
+import datetime
+import wandb
+import argparse
+import yaml
+from addict import Dict as AddictDict
+from typing import List
+from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
+
+def compute_input_and_target_lengths(
+    inputs_length, noise_density, mean_noise_span_length
+):
+    def _tokens_length_to_inputs_length_targets_length(tokens_length):
+        num_noise_tokens = int(round(tokens_length * noise_density))
+        num_nonnoise_tokens = tokens_length - num_noise_tokens
+        num_noise_spans = int(round(num_noise_tokens / mean_noise_span_length))
+        # Input contain all nonnoise tokens, sentinels for all noise spans
+        # and one EOS token.
+        _input_length = num_nonnoise_tokens + num_noise_spans + 1
+        _output_length = num_noise_tokens + num_noise_spans + 1
+        return _input_length, _output_length
+
+    tokens_length = inputs_length
+
+    while (
+        _tokens_length_to_inputs_length_targets_length(tokens_length + 1)[0]
+        <= inputs_length
+    ):
+        tokens_length += 1
+    inputs_lengths, targets_length = _tokens_length_to_inputs_length_targets_length(
+        tokens_length
+    )
+
+    # minor hack to get the targets length to be equal to inputs length
+    # which is more likely to have been set to a nice round number.
+    if noise_density == 0.5 and targets_length > inputs_length:
+        tokens_length -= 1
+        targets_length -= 1
+    return tokens_length, targets_length
+
+def generate_batch_splits(
+    samples_idx: np.ndarray, batch_size: int, drop_last=True
+) -> np.ndarray:
+    """Generate batches of data for a specified batch size from sample indices. If the dataset size is not divisible by
+    the batch size and `drop_last` is `True`, the last incomplete batch is dropped. Else, it is returned."""
+    num_samples = len(samples_idx)
+    if drop_last:
+        samples_to_remove = num_samples % batch_size
+        if samples_to_remove != 0:
+            samples_idx = samples_idx[:-samples_to_remove]
+        sections_split = num_samples // batch_size
+        samples_idx = samples_idx.reshape((sections_split, batch_size))
+    else:
+        sections_split = math.ceil(num_samples / batch_size)
+        samples_idx = np.array_split(samples_idx, sections_split)
+    return samples_idx
+
+@flax.struct.dataclass
+class FlaxDataCollatorForT5MLM:
+    """
+    Data collator used for T5 span-masked language modeling.
+    It is made sure that after masking the inputs are of length `data_args.max_seq_length` and targets are also of fixed length.
+    For more information on how T5 span-masked language modeling works, one can take a look
+    at the `official paper <https://arxiv.org/pdf/1910.10683.pdf>`__
+    or the `official code for preprocessing <https://github.com/google-research/text-to-text-transfer-transformer/blob/master/t5/data/preprocessors.py>`__ .
+
+    Args:
+        tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
+            The tokenizer used for encoding the data.
+        noise_density (:obj:`float`):
+            The probability with which to (randomly) mask tokens in the input.
+        mean_noise_span_length (:obj:`float`):
+            The average span length of the masked tokens.
+        input_length (:obj:`int`):
+            The expected input length after masking.
+        target_length (:obj:`int`):
+            The expected target length after masking.
+        pad_token_id: (:obj:`int`):
+            The pad token id of the model
+        decoder_start_token_id: (:obj:`int):
+            The decoder start token id of the model
+    """
+
+    tokenizer: PreTrainedTokenizerBase
+    noise_density: float
+    mean_noise_span_length: float
+    input_length: int
+    target_length: int
+    pad_token_id: int
+    decoder_start_token_id: int
+
+    def __call__(self, examples: List[Dict[str, np.ndarray]]) -> BatchEncoding:
+        # convert list to dict and tensorize input
+        batch = BatchEncoding(
+            {
+                k: np.array([examples[i][k] for i in range(len(examples))])
+                for k, v in examples[0].items()
+            }
+        )
+
+        input_ids = batch["input_ids"]
+        batch_size, expandend_input_length = input_ids.shape
+
+        mask_indices = np.asarray(
+            [
+                self.random_spans_noise_mask(expandend_input_length)
+                for i in range(batch_size)
+            ]
+        )
+        labels_mask = ~mask_indices
+
+        input_ids_sentinel = self.create_sentinel_ids(mask_indices.astype(np.int8))
+        labels_sentinel = self.create_sentinel_ids(labels_mask.astype(np.int8))
+
+        batch["input_ids"] = self.filter_input_ids(input_ids, input_ids_sentinel)
+        batch["labels"] = self.filter_input_ids(input_ids, labels_sentinel)
+
+        if batch["input_ids"].shape[-1] != self.input_length:
+            raise ValueError(
+                f"`input_ids` are incorrectly preprocessed. `input_ids` length is {batch['input_ids'].shape[-1]}, but"
+                f" should be {self.input_length}."
+            )
+
+        if batch["labels"].shape[-1] != self.target_length:
+            raise ValueError(
+                f"`labels` are incorrectly preprocessed. `labels` length is {batch['labels'].shape[-1]}, but should be"
+                f" {self.target_length}."
+            )
+
+        # to check that tokens are correctly preprocessed, one can run `self.tokenizer.batch_decode(input_ids)` and `self.tokenizer.batch_decode(labels)` here...
+        batch["decoder_input_ids"] = shift_tokens_right(
+            batch["labels"], self.pad_token_id, self.decoder_start_token_id
+        )
+
+        return batch
+
+    def create_sentinel_ids(self, mask_indices):
+        """
+        Sentinel ids creation given the indices that should be masked.
+        The start indices of each mask are replaced by the sentinel ids in increasing
+        order. Consecutive mask indices to be deleted are replaced with `-1`.
+        """
+        start_indices = mask_indices - np.roll(mask_indices, 1, axis=-1) * mask_indices
+        start_indices[:, 0] = mask_indices[:, 0]
+
+        sentinel_ids = np.where(
+            start_indices != 0, np.cumsum(start_indices, axis=-1), start_indices
+        )
+        sentinel_ids = np.where(
+            sentinel_ids != 0, (len(self.tokenizer) - sentinel_ids), 0
+        )
+        sentinel_ids -= mask_indices - start_indices
+
+        return sentinel_ids
+
+    def filter_input_ids(self, input_ids, sentinel_ids):
+        """
+        Puts sentinel mask on `input_ids` and fuse consecutive mask tokens into a single mask token by deleting.
+        This will reduce the sequence length from `expanded_inputs_length` to `input_length`.
+        """
+        batch_size = input_ids.shape[0]
+
+        input_ids_full = np.where(sentinel_ids != 0, sentinel_ids, input_ids)
+        # input_ids tokens and sentinel tokens are >= 0, tokens < 0 are
+        # masked tokens coming after sentinel tokens and should be removed
+        input_ids = input_ids_full[input_ids_full >= 0].reshape((batch_size, -1))
+        input_ids = np.concatenate(
+            [
+                input_ids,
+                np.full((batch_size, 1), self.tokenizer.eos_token_id, dtype=np.int32),
+            ],
+            axis=-1,
+        )
+        return input_ids
+
+    def random_spans_noise_mask(self, length):
+        """This function is copy of `random_spans_helper <https://github.com/google-research/text-to-text-transfer-transformer/blob/84f8bcc14b5f2c03de51bd3587609ba8f6bbd1cd/t5/data/preprocessors.py#L2682>`__ .
+
+        Noise mask consisting of random spans of noise tokens.
+        The number of noise tokens and the number of noise spans and non-noise spans
+        are determined deterministically as follows:
+        num_noise_tokens = round(length * noise_density)
+        num_nonnoise_spans = num_noise_spans = round(num_noise_tokens / mean_noise_span_length)
+        Spans alternate between non-noise and noise, beginning with non-noise.
+        Subject to the above restrictions, all masks are equally likely.
+
+        Args:
+            length: an int32 scalar (length of the incoming token sequence)
+            noise_density: a float - approximate density of output mask
+            mean_noise_span_length: a number
+
+        Returns:
+            a boolean tensor with shape [length]
+        """
+
+        orig_length = length
+
+        num_noise_tokens = int(np.round(length * self.noise_density))
+        num_nonnoise_tokens = length - num_noise_tokens
+        # avoid degeneracy by ensuring positive numbers of noise and nonnoise tokens.
+        num_noise_tokens = min(max(num_noise_tokens, 1), length - 1)
+        # num_noise_tokens should be less than num_noise_tokens and num_nonnoise_tokens
+        num_noise_spans = int(
+            np.round(
+                min(num_noise_tokens, num_nonnoise_tokens) / self.mean_noise_span_length
+            )
+        )
+
+        # avoid degeneracy by ensuring positive number of noise spans
+        num_noise_spans = max(num_noise_spans, 1)
+
+        # pick the lengths of the noise spans and the non-noise spans
+        def _random_segmentation(num_items, num_segments):
+            """Partition a sequence of items randomly into non-empty segments.
+            Args:
+                num_items: an integer scalar > 0
+                num_segments: an integer scalar in [1, num_items]
+            Returns:
+                a Tensor with shape [num_segments] containing positive integers that add
+                up to num_items
+            """
+            mask_indices = np.arange(num_items - 1) < (num_segments - 1)
+            np.random.shuffle(mask_indices)
+            first_in_segment = np.pad(mask_indices, [[1, 0]])
+            segment_id = np.cumsum(first_in_segment)
+            # count length of sub segments assuming that list is sorted
+            _, segment_length = np.unique(segment_id, return_counts=True)
+            return segment_length
+
+        noise_span_lengths = _random_segmentation(num_noise_tokens, num_noise_spans)
+        nonnoise_span_lengths = _random_segmentation(
+            num_nonnoise_tokens, num_noise_spans
+        )
+
+        interleaved_span_lengths = np.reshape(
+            np.stack([nonnoise_span_lengths, noise_span_lengths], axis=1),
+            [num_noise_spans * 2],
+        )
+        span_starts = np.cumsum(interleaved_span_lengths)[:-1]
+        span_start_indicator = np.zeros((length,), dtype=np.int8)
+        span_start_indicator[span_starts] = True
+        span_num = np.cumsum(span_start_indicator)
+        is_noise = np.equal(span_num % 2, 1)
+
+        return is_noise[:orig_length]
+
+def parse_config_arg():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
+    args, remaining = parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + remaining  # Removing --config from sys.argv
+    return args.config
+
+config_path = parse_config_arg()
+
+with open(config_path, 'r') as file:
+    yml_config = yaml.safe_load(file)
+yml_config = AddictDict(yml_config)
+
+alpa.init(cluster="ray", copus_enabled=True, scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
+          num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,
+          namespace=yml_config.cluster_config.namespace)
+
+from transformers.testing_utils import CaptureLogger
+from transformers.utils import get_full_repo_name, send_example_telemetry
+
+# tf.config.experimental.set_visible_devices([], 'GPU')
+
+logger = logging.getLogger(__name__)
+
+MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
+MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+@dataclass
+class TrainingArguments:
+    output_dir: str = field(
+        default=yml_config.paths.output_dir,
+        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+    )
+    overwrite_output_dir: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Overwrite the content of the output directory. "
+                "Use this to continue training if output_dir points to a checkpoint directory."
+            )
+        },
+    )
+    do_train: bool = field(default=True, metadata={"help": "Whether to run training."})
+    do_eval: bool = field(default=True, metadata={"help": "Whether to run eval on the dev set."})
+    per_device_train_batch_size: int = field(
+        default=yml_config.dataloader.train.init_local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
+    )
+    per_device_eval_batch_size: int = field(
+        default=yml_config.dataloader.eval.local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
+    )
+    num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
+    operator_parallel: int = field(default=1, metadata={"help": "The degree of operator model parallelism."})
+    pipeline_parallel: int = field(default=1, metadata={"help": "The degree of pipeline model parallelism."})
+    use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})
+    learning_rate: float = field(default=yml_config.training.learning_rate, metadata={"help": "The initial learning rate for AdamW."})
+    weight_decay: float = field(default=yml_config.training.weight_decay, metadata={"help": "Weight decay for AdamW if we apply some."})
+    adam_beta1: float = field(default=yml_config.training.adam_beta1, metadata={"help": "Beta1 for AdamW optimizer"})
+    adam_beta2: float = field(default=yml_config.training.adam_beta2, metadata={"help": "Beta2 for AdamW optimizer"})
+    adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
+    adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
+    num_train_epochs: float = field(default=yml_config.training.num_train_epochs, metadata={"help": "Total number of training epochs to perform."})
+    warmup_steps: int = field(default=yml_config.training.warmup_steps, metadata={"help": "Linear warmup over warmup_steps."})
+    logging_steps: int = field(default=yml_config.training.logging_steps, metadata={"help": "Log every X updates steps."})
+    save_steps: int = field(default=yml_config.training.save_steps, metadata={"help": "Save checkpoint every X updates steps."})
+    eval_steps: int = field(default=yml_config.training.eval_steps, metadata={"help": "Run an evaluation every X steps."})
+    seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
+    push_to_hub: bool = field(
+        default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
+    )
+    hub_model_id: str = field(
+        default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
+    )
+    hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
+    pretrain: bool = field(
+        default=yml_config.training.pretrain, metadata={"help": "Whether or not to pretrain."}
+    )
+    count: int = field(default=2, metadata={"help": "The number of stored grads."})
+    scale: int = field(default=1, metadata={"help": "Scale"})
+    smoothing: float = field(default=yml_config.training.smoothing, metadata={"help": "Smoothing parameter for PGNS"})
+
+    def __post_init__(self):
+        if self.output_dir is not None:
+            self.output_dir = os.path.expanduser(self.output_dir)
+
+    def to_dict(self):
+        """
+        Serializes this instance while replace `Enum` by their values (for JSON serialization support). It obfuscates
+        the token values by removing their value.
+        """
+        d = asdict(self)
+        for k, v in d.items():
+            if isinstance(v, Enum):
+                d[k] = v.value
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], Enum):
+                d[k] = [x.value for x in v]
+            if k.endswith("_token"):
+                d[k] = f"<{k.upper()}>"
+        return d
+
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
+    """
+
+    model_name_or_path: Optional[str] = field(
+        default=yml_config.model_name_or_path,
+        metadata={
+            "help": (
+                "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
+            )
+        },
+    )
+    model_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=yml_config.paths.cache_dir, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+    )
+    use_fast_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+    )
+    dtype: Optional[str] = field(
+        default=yml_config.training.dtype,
+        metadata={
+            "help": (
+                "Floating-point format in which the model weights should be initialized and trained. Choose one of"
+                " `[float32, float16, bfloat16]`."
+            )
+        },
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+                "with private models)."
+            )
+        },
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+
+    dataset_name: Optional[str] = field(
+        default=yml_config.data.dataset_name, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default=yml_config.data.dataset_config_name, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
+    validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
+    )
+    max_train_samples: Optional[int] = field(
+        default=yml_config.data.max_train_samples,
+        metadata={
+            "help": (
+                "For debugging purposes or quicker training, truncate the number of training examples to this "
+                "value if set."
+            )
+        },
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
+                "value if set."
+            )
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    validation_split_percentage: Optional[int] = field(
+        default=5,
+        metadata={
+            "help": "The percentage of the train set used as validation set in case there's no validation split"
+        },
+    )
+    block_size: Optional[int] = field(
+        default=yml_config.data.block_size,
+        metadata={
+            "help": (
+                "Optional input sequence length after tokenization. "
+                "The training dataset will be truncated in block of this size for training. "
+                "Default to the model max input length for single sentence inputs (take into account special tokens)."
+            )
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=yml_config.dataloader.train.preprocessing_num_workers,
+        metadata={"help": "The number of processes to use for the preprocessing."},
+    )
+    keep_linebreaks: bool = field(
+        default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
+    )
+    max_seq_length: Optional[int] = field(
+        default=512,
+        metadata={
+            "help": (
+                "The maximum total input sequence length after tokenization. Sequences longer "
+                "than this will be truncated, sequences shorter will be padded."
+            )
+        },
+    )
+    mlm_probability: float = field(
+        default=0.15,
+        metadata={
+            "help" : "Ratio of tokens to mask for span masked language modeling loss"
+        }
+    )
+    mean_noise_span_length: float = field(
+        default=3.0,
+        metadata={
+            "help" : "Mean span length of masked tokens"
+        }
+    )
+
+    def __post_init__(self):
+
+        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
+            raise ValueError("Need either a dataset name or a training/validation file.")
+        else:
+            if self.train_file is not None:
+                extension = self.train_file.split(".")[-1]
+                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
+            if self.validation_file is not None:
+                extension = self.validation_file.split(".")[-1]
+                assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
+
+@dataclass
+class RunningGradientsState:
+    store_grads: list
+    noise: float
+    scale: float
+    noise_scale: float
+    beta: float
+    running_noise: float
+    running_scale: float
+    n_batch: int
+
+
+def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
+                min_batch_size: int, shuffle: bool = False):
+    """
+    Returns batches of size `batch_size` from truncated `dataset`, sharded over all local devices.
+    Shuffle batches if `shuffle` is `True`.
+    """
+    if len(dataset) < batch_size:
+        assert len(dataset) >= min_batch_size
+        batch_size = len(dataset) // min_batch_size * min_batch_size
+
+    data_collator = transformers.DefaultDataCollator("np")
+    tf_dataset = dataset.to_tf_dataset(batch_size=batch_size,
+                                       columns=dataset.column_names,
+                                       collate_fn=data_collator,
+                                       shuffle=shuffle,
+                                       drop_remainder=True)
+
+    for batch in tf_dataset:
+        batch = {k: v._numpy() for k, v in batch.items()}
+        yield batch
+
+
+def write_train_metric(summary_writer, train_metrics, train_time, step):
+    summary_writer.scalar("train_time", train_time, step)
+
+    train_metrics = alpa.util.get_metrics(train_metrics)
+    for key, vals in train_metrics.items():
+        tag = f"train_{key}"
+        for i, val in enumerate(vals):
+            summary_writer.scalar(tag, val, step - len(vals) + i + 1)
+
+
+def write_eval_metric(summary_writer, eval_metrics, step):
+    for metric_name, value in eval_metrics.items():
+        summary_writer.scalar(f"eval_{metric_name}", value, step)
+
+
+def create_learning_rate_fn(
+    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
+) -> Callable[[int], jnp.array]:
+    """Returns a linear warmup, linear_decay learning rate function."""
+    steps_per_epoch = train_ds_size // train_batch_size
+    num_train_steps = steps_per_epoch * num_train_epochs
+    warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
+    decay_fn = optax.linear_schedule(
+        init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
+    )
+    schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
+    return schedule_fn
+
+
+def monkey_patch_remat():
+    # Use monkey patch to add remat for all transformer layers.
+    from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
+    from flax.linen.partitioning import remat
+    from flax.linen.module import wrap_method_once
+    import flax.linen as nn
+
+    @wrap_method_once
+    def setup(self):
+        self.layers = [
+            remat(FlaxOPTDecoderLayer, static_argnums=(2, 3, 4))(
+                self.config, name=str(i), dtype=self.dtype)
+            for i in range(self.config.num_hidden_layers)
+        ]
+        self.layerdrop = self.config.layerdrop
+
+    def call(
+        self,
+        hidden_states,
+        attention_mask,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ):
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask,
+                init_cache,
+                output_attentions,
+                deterministic,
+            )
+
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        outputs = [hidden_states, all_hidden_states, all_self_attns]
+        return outputs
+
+    setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
+    setattr(FlaxOPTDecoderLayerCollection, "__call__", call)
+
+
+def main():
+    # See all possible arguments in src/transformers/training_args.py
+    # or by passing the --help flag to this script.
+    # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    try:
+        from alpa.adaptdl.gradient_noise_scale import gns
+    except Exception as e:
+        print(f'could not import gns: {e}')
+
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
+    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    send_example_telemetry("run_clm", model_args, data_args, framework="flax")
+
+    if (
+        os.path.exists(training_args.output_dir)
+        and os.listdir(training_args.output_dir)
+        and training_args.do_train
+        and not training_args.overwrite_output_dir
+    ):
+        raise ValueError(
+            f"Output directory ({training_args.output_dir}) already exists and is not empty."
+            "Use --overwrite_output_dir to overcome."
+        )
+
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    # Setup logging, we only want one process per machine to log things on the screen.
+    logger.setLevel(logging.INFO)
+    datasets.utils.logging.set_verbosity_warning()
+    transformers.utils.logging.set_verbosity_info()
+
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    logger.info(f"Training/evaluation parameters {training_args}")
+
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+
+    # Handle the repository creation
+    if training_args.push_to_hub:
+        if training_args.hub_model_id is None:
+            repo_name = get_full_repo_name(
+                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
+            )
+        else:
+            repo_name = training_args.hub_model_id
+        repo = Repository(training_args.output_dir, clone_from=repo_name)
+
+    #  Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
+    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
+    # (the dataset will be downloaded automatically from the datasets Hub).
+    #
+    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
+    # 'text' is found. You can easily tweak this behavior (see below).
+    #
+    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+    # download the dataset.
+    if data_args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        dataset = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=model_args.cache_dir,
+            keep_in_memory=False,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+        if "validation" not in dataset.keys():
+            dataset["validation"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[:{data_args.validation_split_percentage}%]",
+                cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+            dataset["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+    else:
+        data_files = {}
+        dataset_args = {}
+        if data_args.train_file is not None:
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+        extension = data_args.train_file.split(".")[-1]
+        if extension == "txt":
+            extension = "text"
+            dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
+        dataset = load_dataset(
+            extension,
+            data_files=data_files,
+            cache_dir=model_args.cache_dir,
+            **dataset_args,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+        if "validation" not in dataset.keys():
+            dataset["validation"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[:{data_args.validation_split_percentage}%]",
+                cache_dir=model_args.cache_dir,
+                **dataset_args,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+            dataset["train"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                **dataset_args,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
+    # https://huggingface.co/docs/datasets/loading_datasets.html.
+
+    # Load pretrained model and tokenizer
+
+    # Distributed training:
+    # The .from_pretrained methods guarantee that only one local process can concurrently
+    # download model & vocab.
+    if model_args.config_name:
+        config = AutoConfig.from_pretrained(
+            model_args.config_name,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    elif model_args.model_name_or_path:
+        config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    else:
+        config = CONFIG_MAPPING[model_args.model_type]()
+        logger.warning("You are instantiating a new config instance from scratch.")
+
+    if training_args.use_remat:
+        monkey_patch_remat()
+
+    if model_args.tokenizer_name:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    elif model_args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            #use_fast=model_args.use_fast_tokenizer,
+            use_auth_token=True if model_args.use_auth_token else None,
+            use_fast=False,
+        )
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+
+    if model_args.model_name_or_path and not training_args.pretrain:
+        print(f"Finetuning mode")
+        model = FlaxT5ForConditionalGeneration.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            seed=training_args.seed,
+            dtype=getattr(jnp, model_args.dtype),
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    else:
+        print(f"Pretraining mode")
+        model = FlaxT5ForConditionalGeneration.from_config(
+            config,
+            seed=training_args.seed,
+            dtype=getattr(jnp, model_args.dtype),
+        )
+
+    run = wandb.init(
+        # Set the project where this run will be logged
+        project=yml_config.wandb.project,
+        config={
+            "model_name_or_path": model_args.model_name_or_path,
+            "model_args": model_args,
+            "data_args": data_args,
+            "training_args": training_args,
+            "yml_config": yml_config,
+        },
+        save_code=yml_config.wandb.save_code,
+        mode=yml_config.wandb.mode,
+    )
+
+    run.log_code(
+            os.path.dirname(os.path.dirname(alpa.__file__)),
+            exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
+            )
+
+    # Preprocessing the datasets.
+    # First we tokenize all the texts.
+    if training_args.do_train:
+        column_names = dataset["train"].column_names
+    else:
+        column_names = dataset["validation"].column_names
+    text_column_name = "text" if "text" in column_names else column_names[0]
+
+    # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
+    tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+
+    def tokenize_function(examples):
+        with CaptureLogger(tok_logger) as cl:
+            output = tokenizer(examples[text_column_name], return_attention_mask=False)
+        # clm input could be much much longer than block_size
+        if "Token indices sequence length is longer than the" in cl.out:
+            tok_logger.warning(
+                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
+                " before being passed to the model."
+            )
+        return output
+
+    logger.info("***** Tokenize dataset *****")
+    tokenized_datasets = dataset.map(
+        tokenize_function,
+        batched=True,
+        num_proc=None if data_args.preprocessing_num_workers == 0 else data_args.preprocessing_num_workers,
+        remove_columns=column_names,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
+
+    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+
+    expanded_inputs_length, targets_length = compute_input_and_target_lengths(
+        inputs_length=max_seq_length,
+        noise_density=data_args.mlm_probability,
+        mean_noise_span_length=data_args.mean_noise_span_length,
+    )
+
+
+    if data_args.block_size is None:
+        block_size = tokenizer.model_max_length
+        if block_size > config.max_position_embeddings:
+            logger.warning(
+                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
+                "Picking 1024 instead. You can change that default value by passing --block_size xxx."
+            )
+            block_size = 1024
+    else:
+        if data_args.block_size > tokenizer.model_max_length:
+            logger.warning(
+                f"The block_size passed ({data_args.block_size}) is larger than the maximum length for the model"
+                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
+            )
+        block_size = min(data_args.block_size, tokenizer.model_max_length)
+
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    def group_texts(examples):
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        # Drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # Customize this part to your needs.
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        if total_length >= expanded_inputs_length:
+            total_length = (
+                total_length // expanded_inputs_length
+            ) * expanded_inputs_length
+        result = {
+            k: [
+                t[i : i + expanded_inputs_length]
+                for i in range(0, total_length, expanded_inputs_length)
+            ]
+            for k, t in concatenated_examples.items()
+        }
+        return result
+
+    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
+    # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
+    # to preprocess.
+    #
+    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
+
+    logger.info("***** Build dataset *****")
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        num_proc=None if data_args.preprocessing_num_workers == 0 else data_args.preprocessing_num_workers,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
+
+    if training_args.do_train:
+        if "train" not in tokenized_datasets:
+            raise ValueError("--do_train requires a train dataset")
+        train_dataset = lm_datasets["train"]
+        if data_args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset), data_args.max_train_samples)
+            train_dataset = train_dataset.select(range(max_train_samples))
+
+    if training_args.do_eval:
+        if "validation" not in tokenized_datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_dataset = lm_datasets["validation"]
+        if data_args.max_eval_samples is not None:
+            max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+            eval_dataset = eval_dataset.select(range(max_eval_samples))
+
+    # Adjust batch size and num_micro_batches for small datasets
+    num_devices = alpa.get_global_num_devices()
+    train_min_batch_size = (num_devices // training_args.operator_parallel //
+                            training_args.pipeline_parallel * training_args.num_micro_batches)
+    eval_num_micro_batches = training_args.num_micro_batches
+    eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                           training_args.pipeline_parallel * eval_num_micro_batches)
+    while len(eval_dataset) < eval_min_batch_size:
+        eval_num_micro_batches //= 2
+        eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                               training_args.pipeline_parallel * eval_num_micro_batches)
+
+    # Data collator example
+
+    data_collator = FlaxDataCollatorForT5MLM(
+        tokenizer=tokenizer,
+        noise_density=data_args.mlm_probability,
+        mean_noise_span_length=data_args.mean_noise_span_length,
+        input_length=max_seq_length,
+        target_length=targets_length,
+        pad_token_id=tokenizer.pad_token_id,
+        decoder_start_token_id=tokenizer.pad_token_id,
+    )
+
+    # Enable tensorboard only on the master node
+    # has_tensorboard = is_tensorboard_available()
+    has_tensorboard = False
+    if has_tensorboard:
+        try:
+            from flax.metrics.tensorboard import SummaryWriter
+
+            summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir))
+        except ImportError as ie:
+            has_tensorboard = False
+            logger.warning(
+                f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
+            )
+    else:
+        logger.warning(
+            "Unable to display metrics through TensorBoard because the package is not installed: "
+            "Please run pip install tensorboard to enable."
+        )
+
+    # Initialize our training
+    rng = jax.random.PRNGKey(training_args.seed)
+    rng, dropout_rng = jax.random.split(rng)
+
+    # Store some constant
+    num_epochs = int(training_args.num_train_epochs)
+    train_batch_size = int(training_args.per_device_train_batch_size) * num_devices
+    eval_batch_size = int(training_args.per_device_eval_batch_size) * num_devices
+    steps_per_epoch = len(train_dataset) // train_batch_size
+    total_train_steps = steps_per_epoch * num_epochs
+
+
+    count = training_args.count
+    scale = training_args.scale
+    theta = training_args.smoothing * scale
+    
+    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
+
+    # Set regression coefficients if specified in the config
+    fix_regressors(yml_config)
+
+    if not yml_config.dataloader.train.adaptive_data_loader.enabled:
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=train_batch_size,
+            shuffle=yml_config.dataloader.train.shuffle,
+            collate_fn=transformers.default_data_collator, # we don't need any special collator 
+            drop_last=True,
+            num_workers=data_args.preprocessing_num_workers,
+            persistent_workers=yml_config.dataloader.train.persistent_workers,
+        )
+    else:
+        train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+            dataset=train_dataset,
+            batch_size=train_batch_size,
+            shuffle=yml_config.dataloader.train.shuffle,
+            collate_fn=transformers.default_data_collator, # we don't need any special collator
+            drop_last=True,
+            num_workers=data_args.preprocessing_num_workers,
+            persistent_workers=yml_config.dataloader.train.persistent_workers,
+        )
+        if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
+            train_loader.autoscale_batch_size(max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
+                                                local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices() if 
+                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
+                                                                  else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
+                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max), 
+                                                gradient_accumulation=False)
+
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=eval_batch_size,
+        shuffle=yml_config.dataloader.eval.shuffle,
+        drop_last=True,
+        collate_fn=transformers.default_data_collator, # we don't need any special collator 
+        )
+
+    # Create learning rate schedule
+    linear_decay_lr_schedule_fn = create_learning_rate_fn(
+        len(train_dataset),
+        train_batch_size,
+        training_args.num_train_epochs,
+        training_args.warmup_steps,
+        training_args.learning_rate,
+    )
+
+    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
+
+    # We use Optax's "masking" functionality to not apply weight decay
+    # to bias and LayerNorm scale parameters. decay_mask_fn returns a
+    # mask boolean with the same structure as the parameters.
+    # The mask is True for parameters that should be decayed.
+    # Note that this mask is specifically adapted for FlaxGPT2.
+    # For other models, one should correct the layer norm parameter naming
+    # accordingly.
+    def decay_mask_fn(params):
+        flat_params = traverse_util.flatten_dict(params)
+        flat_mask = {
+            path: (path[-1] != "bias" and path[-2:] not in [("ln_1", "scale"), ("ln_2", "scale"), ("ln_f", "scale")])
+            for path in flat_params
+        }
+        return traverse_util.unflatten_dict(flat_mask)
+
+    # create adam optimizer
+    if training_args.adafactor:
+        # We use the default parameters here to initialize adafactor,
+        # For more details about the parameters please check https://github.com/deepmind/optax/blob/ed02befef9bf81cbbf236be3d2b0e032e9ed4a40/optax/_src/alias.py#L74
+        optimizer = optax.adafactor(
+            learning_rate=scaled_learning_rate_fn,
+        )
+    else:
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(
+                learning_rate=scaled_learning_rate_fn,
+                b1=training_args.adam_beta1,
+                b2=training_args.adam_beta2,
+                eps=training_args.adam_epsilon,
+                weight_decay=training_args.weight_decay,
+                mask=decay_mask_fn)
+        )
+
+    # Setup train state
+    if model_args.dtype == "float16":
+        use_master_copy = True
+        dynamic_scale = DynamicScale()
+        # Fix a bug in huggingface's implementation (https://github.com/huggingface/transformers/pull/18462)
+        alpa.global_config.flax_always_use_fp16_embedding = True
+    else:
+        use_master_copy = dynamic_scale = None
+    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
+                              dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
+
+    gns.initialize_gns(state=state, 
+                       init_bsz=train_batch_size, 
+                       num_workers=alpa.get_global_num_devices(), 
+                       store_grads=jnp.array(0.),
+                       count=count,
+                       scale=scale,
+                       theta=theta)
+
+    def loss_fn(logits, labels):
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+        loss = optax.softmax_cross_entropy(
+            shift_logits,
+            jax.nn.one_hot(shift_labels, logits.shape[-1]))
+        return loss.mean()
+
+    # Define gradient update step fn
+    def train_step(state, batch, variables: Dict):
+
+        def compute_loss(params):
+            labels = batch.pop("labels")
+            logits = state.apply_fn(**batch, params=params)[0]
+            loss = loss_fn(logits, labels)
+            return loss
+
+        dynamic_scale = state.dynamic_scale
+        if dynamic_scale:
+            grad_fn = dynamic_scale.value_and_grad(compute_loss)
+            dynamic_scale, is_fin, loss, grads = grad_fn(state.params)
+        else:
+            grad_fn = alpa.value_and_grad(compute_loss)
+            loss, grads = grad_fn(state.params)
+
+        new_state = state.apply_gradients(grads=grads)
+
+        if dynamic_scale:
+            new_state = new_state.replace(
+                opt_state=jax.tree_map(
+                    functools.partial(jnp.where, is_fin),
+                    new_state.opt_state, state.opt_state),
+                params=jax.tree_map(
+                    functools.partial(jnp.where, is_fin),
+                    new_state.params, state.params),
+                master_copy=jax.tree_map(
+                    functools.partial(jnp.where, is_fin),
+                    new_state.master_copy, state.master_copy),
+                dynamic_scale=dynamic_scale)
+
+        metrics = {
+            "loss": loss, 
+            "learning_rate": scaled_learning_rate_fn(state.step),
+        }
+
+        if yml_config.training.gns_enabled:
+            gradients = get_mean_leaves(grads)
+            gns_dict = compute_gradient_noise_scale(variables, gradients)
+            metrics.update(gns_dict)
+
+        return new_state, metrics
+
+    # Define eval fn
+    def eval_step(params, batch):
+        labels = batch.pop("labels")
+        logits = model(**batch, params=params, deterministic=True)[0]
+        loss = loss_fn(logits, labels)
+
+        # summarize metrics
+        metrics = {"loss": loss}
+        return metrics
+
+    def process_batch(batch):
+        return {k: v.numpy() for k, v in batch.items()}
+
+    method = get_parallel_method(yml_config)
+
+    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+    p_eval_step = alpa.parallelize(eval_step)
+    dump_debug_info_train_step = dump_debug_info_eval_step = True
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {num_epochs}")
+    logger.info(f"  Batch size per device (w. accumulation) = {training_args.per_device_train_batch_size}")
+    logger.info(f"  Global train batch size (w. parallel & distributed) = {train_batch_size}")
+    logger.info(f"  Total optimization steps = {total_train_steps}")
+
+    train_time = 0
+    train_metrics = []
+    epochs = tqdm(range(num_epochs), desc="Epoch ... ", position=0)
+
+    step_ct = 0
+    last_time = time.time()
+
+    epochs.write("Initial compilation. This might take some minutes...")
+
+    variables_dict = None
+
+    num_of_hosts = jax.process_count()
+    current_host_idx = jax.process_index()
+
+    for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
+        # ======================== Training ================================
+        train_start = time.time()
+
+        # Create sampling rng
+        rng, input_rng = jax.random.split(rng)
+
+        steps_per_epoch = len(train_dataset) // train_batch_size
+        # train
+        for step, batch in enumerate(train_loader):
+            batch = process_batch(batch)
+            batch = Dataset.from_dict(batch)
+            batch = data_collator(batch)
+
+            if yml_config.training.gns_enabled:
+                variables_dict = gns.construct_gns_dict()
+
+            if pollux_agent.reallocation_approaching:
+                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
+                continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
+
+            batch = {
+                key: np.split(batch.data[key], num_of_hosts, axis=0)[
+                    current_host_idx
+                ]
+                for key, value in batch.data.items()
+            }
+            state, train_metric = p_train_step(state, batch, variables_dict)
+            train_metrics.append(train_metric)
+
+            if yml_config.training.gns_enabled:
+                gns.update_state(state, train_metric)
+                update_grad_params(train_metric)
+
+            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+
+            if dump_debug_info_train_step:
+                dump_debug_info_train_step = False
+                executable = p_train_step.get_last_executable()
+                executable.sync()
+                executable.dump_debug_info("alpa_debug_info")
+                epochs.write(f"Initial compilation completed. "
+                             f"Time elapsed: {time.time() - train_start:.2f} s")
+
+            step_ct += 1
+            if cur_step % training_args.logging_steps == 0 and cur_step > 0:
+                p_train_step.get_last_executable().sync()
+                latency = (time.time() - last_time) / step_ct
+                throughput_tokens = np.prod(batch["input_ids"].shape) / latency
+                throughput_tflops = alpa.util.compute_gpt_tflops(
+                    batch_size=batch["input_ids"].shape[0],
+                    seq_len=batch["input_ids"].shape[1],
+                    num_layers=config.num_hidden_layers,
+                    hidden_size=config.hidden_size,
+                    vocab_size=config.vocab_size,
+                    num_gpus=alpa.get_global_num_devices(),
+                    latency=latency)
+                step_ct = 0
+
+                # Save metrics
+                train_time += time.time() - train_start
+                if has_tensorboard:
+                    write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+
+                train_metric = jax.tree_map(np.mean, train_metric)
+
+                epochs.write(
+                    f"Step... {cur_step} | "
+                    f"Loss: {train_metric['loss'].mean():.4f}, "
+                    f"Learning Rate: {train_metric['learning_rate'].mean():.5f}, "
+                    f"Throughput: {throughput_tokens:.2f} token/s, "
+                    f"{throughput_tflops:.2f} TFLOP/s"
+                )
+
+                train_metrics = []
+                last_time = time.time()
+
+            if yml_config.evaluation.enabled:
+                pollux_agent.is_evaluating = True
+                if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+                    # ======================== Evaluating ==============================
+                    eval_metrics = []
+
+                    eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                    for step, batch in enumerate(eval_loader):
+                        # Model forward
+                        batch = process_batch(batch)
+                        batch = Dataset.from_dict(batch)
+                        batch = data_collator(batch)
+
+                        batch = {
+                            key: np.split(batch.data[key], num_of_hosts, axis=0)[
+                                current_host_idx
+                            ]
+                            for key, value in batch.data.items()
+                        }
+
+                        metrics = p_eval_step(state.params, batch)
+                        eval_metrics.append(metrics)
+
+                        if dump_debug_info_eval_step:
+                            dump_debug_info_eval_step = False
+                            executable = p_eval_step.get_last_executable()
+                            executable.dump_debug_info("alpa_debug_info_eval")
+
+                    # normalize eval metrics
+                    eval_metrics = alpa.util.get_metrics(eval_metrics)
+                    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+
+                    try:
+                        eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+                    except OverflowError:
+                        eval_metrics["perplexity"] = float("inf")
+
+                    # Print metrics and update progress bar
+                    desc = (
+                        f"Step... ({cur_step} | Eval Loss: {eval_metrics['loss']} | Eval Perplexity:"
+                        f" {eval_metrics['perplexity']})"
+                    )
+                    epochs.write(desc)
+                    
+                    wandb.log({
+                        "eval_loss": eval_metrics['loss'],
+                        "eval_acc": eval_metrics['perplexity'],
+                        "epoch": cur_step / steps_per_epoch
+                                })
+
+                    # Save metrics
+                    if has_tensorboard:
+                        write_eval_metric(summary_writer, eval_metrics, cur_step)
+
+                if cur_step % training_args.save_steps == 0 and cur_step > 0:
+                    # save checkpoint after each epoch and push checkpoint to the hub
+                    epochs.write("\nSave checkpoint...")
+                    alpa.prefetch(state.params)
+                    params = alpa.util.map_to_nparray(state.params)
+                    model.save_pretrained(training_args.output_dir, params=params)
+                    tokenizer.save_pretrained(training_args.output_dir)
+                    if training_args.push_to_hub:
+                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                pollux_agent.is_evaluating = False
+
+    # # Eval after training
+    # if training_args.do_eval:
+    #     eval_metrics = []
+    #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+    #     for step, batch in enumerate(eval_loader):
+    #         # Model forward
+    #         batch = process_batch(batch)
+    #         metrics = p_eval_step(state.params, batch)
+    #         eval_metrics.append(metrics)
+
+    #     # normalize eval metrics
+    #     eval_metrics = alpa.util.get_metrics(eval_metrics)
+    #     eval_metrics = jax.tree_map(lambda x: jnp.mean(x).item(), eval_metrics)
+
+    #     try:
+    #         eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+    #     except OverflowError:
+    #         eval_metrics["perplexity"] = float("inf")
+
+    #     eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
+    #     path = os.path.join(training_args.output_dir, "eval_results.json")
+    #     with open(path, "w") as f:
+    #         json.dump(eval_metrics, f, indent=4, sort_keys=True)
+
+    # Save the final model
+    epochs.write("\nSave the final model...")
+    alpa.prefetch(state.params)
+    params = alpa.util.map_to_nparray(state.params)
+    model.save_pretrained(training_args.output_dir, params=params)
+    tokenizer.save_pretrained(training_args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
