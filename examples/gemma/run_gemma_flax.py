@@ -4,6 +4,7 @@ sys.path.append(".")
 
 from examples.utils import *
 
+import inspect
 import json
 import math
 import os
@@ -40,11 +41,22 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
-from transformers.models.llama.modeling_flax_llama import FlaxLlamaForCausalLMModule
+from transformers.models.gemma.modeling_flax_gemma import FlaxGemmaForCausalLMModule
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name
 
-monkeypatch_rope_llama() 
+def monkeypatch_rope_gemma():
+    exec("from transformers.models.gemma import modeling_flax_gemma", globals())
+    source = inspect.getsource(modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__)
+    start = source.find("def")
+    source = source.split("\n")
+    source = "\n".join([x[start:] for x in source])
+    source = source.replace("key = apply", "# key = apply")
+    source = source.replace("query = apply", "# query = apply")
+    func = create_dynamic_function(source, "__call__")
+    modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__ = func
+
+monkeypatch_rope_gemma() 
 
 load_dotenv()
 
@@ -63,9 +75,9 @@ def do_monkey_patch():
         avals = jax.eval_shape(partial(self._backup_init, **kwargs), *args)
         return jax.tree_util.tree_map(lambda x: jnp.full(x.shape, 1e-8, x.dtype),
                                     avals)
-    if not hasattr(FlaxLlamaForCausalLMModule, "_backup_init"):
-        FlaxLlamaForCausalLMModule._backup_init = FlaxLlamaForCausalLMModule.init
-    FlaxLlamaForCausalLMModule.init = init_dummy
+    if not hasattr(FlaxGemmaForCausalLMModule, "_backup_init"):
+        FlaxGemmaForCausalLMModule._backup_init = FlaxGemmaForCausalLMModule.init
+    FlaxGemmaForCausalLMModule.init = init_dummy
 
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
@@ -86,46 +98,6 @@ class DataTrainingArguments(DataTrainingArguments):
 
         super().__post_init__()
 
-def llama_manual_sharding(num_layers, state: TrainState):
-    # TODO: when rebased to jax 0.4.6, use the tree_map_with_path
-    param_partition = {
-        'model': {
-            'embed_tokens': {'embedding': PartitionSpec("mp", None)},
-            'norm': {'weight': PartitionSpec(None)},
-            'layers': {
-                '%d' % (layer): {
-                    'self_attn': {
-                        # TODO: check whether we need the transpose or not
-                        'q_proj': {'kernel': PartitionSpec(None, "mp")},
-                        'k_proj': {'kernel': PartitionSpec(None, "mp")},
-                        'v_proj': {'kernel': PartitionSpec(None, "mp")},
-                        'o_proj': {'kernel': PartitionSpec("mp", None)},
-                    },
-                    'mlp': {
-                        'down_proj': {'kernel': PartitionSpec(None, "mp")},
-                        'gate_proj': {'kernel': PartitionSpec("mp", None)},
-                        'up_proj': {'kernel': PartitionSpec(None, "mp")},
-                    },
-                    'input_layernorm': {'weight': PartitionSpec(None)},
-                    'post_attention_layernorm': {'weight': PartitionSpec(None)},
-                }
-            for layer in range(num_layers)},
-        },
-        'lm_head': {'kernel': PartitionSpec(None, "mp")},
-    }
-    replicate = lambda x : jax.tree_util.tree_map(lambda _: PartitionSpec(None), x)
-    opt_state = tree_map_params(state.tx, lambda _, spec: spec, state.opt_state,
-                                param_partition, transform_non_params=lambda _: PartitionSpec(None))
-    manual_partition = TrainState(
-        step=PartitionSpec(None),
-        params=param_partition,
-        master_copy=param_partition if state.master_copy else None,
-        dynamic_scale=replicate(state.dynamic_scale),
-        tx=state.tx,
-        apply_fn=state.apply_fn,
-        opt_state=opt_state)
-    return manual_partition
-
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
@@ -138,8 +110,6 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    # TODO: Temporary
-    training_args.manual_sharding = False
 
     if (
         os.path.exists(training_args.output_dir)
@@ -245,21 +215,29 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    if model_args.config_name:
-        config = AutoConfig.from_pretrained(
-            model_args.config_name,
-            cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-    elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-    else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
+    from transformers import GemmaConfig
+    config = GemmaConfig(
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+    )
+    # if model_args.config_name:
+    #     config = AutoConfig.from_pretrained(
+    #         model_args.config_name,
+    #         cache_dir=model_args.cache_dir,
+    #         use_auth_token=True if model_args.use_auth_token else None,
+    #     )
+    # elif model_args.model_name_or_path:
+    #     config = AutoConfig.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         cache_dir=model_args.cache_dir,
+    #         use_auth_token=True if model_args.use_auth_token else None,
+    #     )
+    # else:
+    #     config = CONFIG_MAPPING[model_args.model_type]()
+    #     logger.warning("You are instantiating a new config instance from scratch.")
 
     # Reduce vocab size to 1024
     # config.vocab_size = 1024
@@ -408,16 +386,16 @@ def main():
     # Adjust batch size and num_micro_batches for small datasets
     num_devices = alpa.get_global_num_devices()
     train_min_batch_size = (num_devices // training_args.operator_parallel //
-                            training_args.pipeline_parallel * 1)
+                            training_args.pipeline_parallel * training_args.num_micro_batches)
                         
     if training_args.do_eval:
         eval_num_micro_batches = training_args.num_micro_batches
         eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                            training_args.pipeline_parallel * 1)
+                            training_args.pipeline_parallel * eval_num_micro_batches)
         while len(eval_dataset) < eval_min_batch_size:
             eval_num_micro_batches //= 2
             eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                                training_args.pipeline_parallel * 1)
+                                training_args.pipeline_parallel * eval_num_micro_batches)
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
@@ -515,12 +493,6 @@ def main():
         use_master_copy=use_master_copy
     )
 
-    # TODO: Add config for this
-    if training_args.manual_sharding:
-        state_manual_sharding = llama_manual_sharding(config.num_hidden_layers, state)
-        ms_option = ManualShardingOption(
-            ("dp", "mp"), in_axis_resources=(state_manual_sharding, PartitionSpec("dp", None)))
-
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
 
@@ -597,17 +569,9 @@ def main():
     # Manual partition spec
     ignore_ids = (IGNORE_TOKEN_ID, )
 
-    manual_sharding_args = {}
-    if training_args.manual_sharding:
-        manual_sharding_args = {
-            "manual_sharding_option": ms_option,
-            "manual_layer_num": config.num_hidden_layers
-        }
-
     method = create_alpa_method(
         AlpaMethod(training_args.parallel_strategy), 
         training_args,
-        **manual_sharding_args
     )
 
     p_train_step = alpa.parallelize(

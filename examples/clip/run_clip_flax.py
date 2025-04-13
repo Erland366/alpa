@@ -624,17 +624,15 @@ def main():
         return loss
 
     # Define gradient update step fn
-    def train_step(state, batch, dropout_rng):
+    def train_step(state, batch):
         # Debug input shapes
         logger.info("=== Input Shapes ===")
         for k, v in batch.items():
             logger.info(f"{k}: {v.shape}")
         logger.info("===================")
 
-        dropout_rng = jax.random.fold_in(dropout_rng, state.step)
-
         def compute_loss(params):
-            outputs = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)  # Model forward pass
+            outputs = state.apply_fn(**batch, params=params, train=True)  # Model forward pass
             logits_per_image = outputs.logits_per_image
             logits_per_text = outputs.logits_per_text
             loss = clip_loss(logits_per_image, logits_per_text)
@@ -673,7 +671,7 @@ def main():
             "learning_rate": linear_decay_lr_schedule_fn(state.step),
         }
 
-        return new_state, metrics, dropout_rng
+        return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch):
@@ -758,7 +756,7 @@ def main():
             print("input_ids:", batch["input_ids"].shape)
             print("attention_mask:", batch["attention_mask"].shape)
 
-            state, train_metric, dropout_rng = p_train_step(state, batch, dropout_rng)
+            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
             if step % grad_accum_steps == 0:
@@ -792,10 +790,10 @@ def main():
 
                 # Save metrics
                 train_time += time.time() - train_start
-                if HAS_TENSORBOARD:
-                    write_train_metric(
-                        train_metrics, train_time, cur_step, summary_writer
-                    )
+                # if HAS_TENSORBOARD:
+                #     write_train_metric(
+                #         train_metrics, train_time, cur_step, summary_writer
+                #     )
 
                 train_metric = jax.tree_map(np.mean, train_metric)
 

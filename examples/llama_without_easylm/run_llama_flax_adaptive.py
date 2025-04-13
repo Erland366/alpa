@@ -20,12 +20,15 @@ Here is the full list of checkpoints on the hub that can be fine-tuned by this s
 https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+import sys
+
+sys.path.append(".")
+sys.path.append("..")
 
 import json
 import logging
 import math
 import os
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -77,6 +80,9 @@ import wandb
 import argparse
 import yaml
 from addict import Dict as AddictDict
+from utils import monkeypatch_rope_llama
+
+monkeypatch_rope_llama() # Need to monkeypatch Llama here!
 
 
 def parse_config_arg():
@@ -372,54 +378,56 @@ def create_learning_rate_fn(
 
 def monkey_patch_remat():
     # Use monkey patch to add remat for all transformer layers.
-    from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
+    from transformers.models.llama.modeling_flax_llama import FlaxLlamaDecoderLayer, FlaxLlamaLayerCollection
     from flax.linen.partitioning import remat
     from flax.linen.module import wrap_method_once
     import flax.linen as nn
 
     @wrap_method_once
     def setup(self):
-        self.layers = [
-            remat(FlaxOPTDecoderLayer, static_argnums=(2, 3, 4))(
+        self.blocks = [
+            remat(FlaxLlamaDecoderLayer, static_argnums=(2, 3, 4))(
                 self.config, name=str(i), dtype=self.dtype)
             for i in range(self.config.num_hidden_layers)
         ]
-        self.layerdrop = self.config.layerdrop
 
     def call(
         self,
         hidden_states,
-        attention_mask,
+        attention_mask=None,
+        position_ids=None,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        return_dict: bool = False,
     ):
         # decoder layers
+        all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers:
+        for block in self.blocks:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
+            layer_outputs = block(
                 hidden_states,
-                attention_mask,
-                init_cache,
-                output_attentions,
-                deterministic,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                deterministic=deterministic,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
             )
 
             hidden_states = layer_outputs[0]
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_attentions += (layer_outputs[1],)
 
-        outputs = [hidden_states, all_hidden_states, all_self_attns]
+        outputs = (hidden_states, all_hidden_states, all_attentions)
         return outputs
 
-    setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
-    setattr(FlaxOPTDecoderLayerCollection, "__call__", call)
+    setattr(FlaxLlamaLayerCollection, "setup", setup)
+    setattr(FlaxLlamaLayerCollection, "__call__", call)
 
 
 def main():
@@ -576,8 +584,8 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if training_args.use_remat:
-        monkey_patch_remat()
+    # if training_args.use_remat:
+    #     monkey_patch_remat()
 
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -896,7 +904,9 @@ def main():
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
+            # Comment deterministic first
+            # logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
+            logits = state.apply_fn(**batch, params=params)[0]
             loss = loss_fn(logits, labels)
             return loss
 

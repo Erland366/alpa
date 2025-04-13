@@ -60,6 +60,7 @@ __all__ = [
     "setup_experiment_logging",
     "create_dynamic_function",
     "monkeypatch_rope_llama",
+    "monkeypatch_rope_gemma",
     "parse_args",
 ]
 
@@ -158,7 +159,7 @@ def create_alpa_method(method: AlpaMethod, training_args, *args, **kwargs):
             *args,
             num_micro_batches=num_micro_batches,
             pipeline_schedule=training_args.pipeline_schedule,
-            stage_option="uniform",
+            stage_option="auto",
             ## Default value for layer_option here
             # layer_option=alpa.AutoLayerOption(layer_num=2),
             # layer_option="manual",
@@ -245,6 +246,7 @@ def monkeypatch_rope_llama():
     source = source.replace("query = apply", "# query = apply")
     func = create_dynamic_function(source, "__call__")
     modeling_flax_llama.FlaxLlamaRotaryEmbedding.__call__ = func
+
 
 def init_alpa(cluster: str = "ray", normalize_embedding_shape: bool = True):
 
@@ -497,6 +499,10 @@ class TrainingArguments(TrainingArguments):
     project: Optional[str] = field(
         default=None,
         metadata={"help": "Entity for wandb"}
+    )
+    manual_sharding: bool = field(
+        default=False,
+        metadata={"help": "Whether to manually shard the model or not."}
     )
     def __post_init__(self):
         import jax
@@ -860,6 +866,17 @@ def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
     for batch in tf_dataset:
         batch = {k: v._numpy() for k, v in batch.items()}
         yield batch
+
+def monkeypatch_rope_gemma():
+    exec("from transformers.models.gemma import modeling_flax_gemma", globals())
+    source = inspect.getsource(modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__)
+    start = source.find("def")
+    source = source.split("\n")
+    source = "\n".join([x[start:] for x in source])
+    source = source.replace("key = apply", "# key = apply")
+    source = source.replace("query = apply", "# query = apply")
+    func = create_dynamic_function(source, "__call__")
+    modeling_flax_gemma.FlaxGemmaRotaryEmbedding.__call__ = func
 
 
 logger = setup_logging(__name__)

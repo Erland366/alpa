@@ -7,7 +7,7 @@ python3 examples/clip/run_clip_flax.py \
      --per_device_train_batch_size 16 \
      --per_device_eval_batch_size 4 \
      --num_micro_batches 8 \
-     --dtype float16 \
+     --dtype float32 \
      --learning_rate 5e-4 \
      --weight_decay 0.0 \
      --overwrite_output_dir \
@@ -16,7 +16,7 @@ python3 examples/clip/run_clip_flax.py \
      --save_steps 3000 \
      --eval_steps 1000 \
      --use_data_sample \
-     --data_parallel 1 \
+     --data_parallel 2 \
      --parallel_strategy parallel_3d \
      --image_column image \
      --preprocessing_num_workers 2 \

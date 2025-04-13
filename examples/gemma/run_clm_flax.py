@@ -32,8 +32,7 @@ from enum import Enum
 import functools
 from itertools import chain
 from pathlib import Path
-from typing import Callable, Optional, Dict
-from torch.utils.data import DataLoader
+from typing import Callable, Optional
 
 import datasets
 import numpy as np
@@ -47,7 +46,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import transformers
-# import tensorflow as tf
+import tensorflow as tf
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import onehot, shard, shard_prng_key
@@ -62,44 +61,13 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
-from alpa.adaptdl.pollux_agent import pollux_agent
-from jax.tree_util import tree_flatten, tree_unflatten
-from alpa.adaptdl.gns_util import compute_gradient_noise_scale, get_mean_leaves
-from alpa.adaptdl.dataloader import current_dataloader
-from alpa.adaptdl.metrics import update_grad_params, update_progress
-from jax._src.config import flags
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
-import alpa.adaptdl.dataloader
-import alpa.adaptdl.epoch
-from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
-import datetime
-import wandb
-import argparse
-import yaml
-from addict import Dict as AddictDict
 
-
-def parse_config_arg():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
-    args, remaining = parser.parse_known_args()
-    sys.argv = [sys.argv[0]] + remaining  # Removing --config from sys.argv
-    return args.config
-
-config_path = parse_config_arg()
-
-with open(config_path, 'r') as file:
-    yml_config = yaml.safe_load(file)
-yml_config = AddictDict(yml_config)
-
-alpa.init(cluster="ray", copus_enabled=True, scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
-          num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,
-          namespace=yml_config.cluster_config.namespace)
+alpa.init(cluster="ray")
 
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
-# tf.config.experimental.set_visible_devices([], 'GPU')
+tf.config.experimental.set_visible_devices([], 'GPU')
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +78,10 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 @dataclass
 class TrainingArguments:
     output_dir: str = field(
-        default=yml_config.paths.output_dir,
         metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
     )
     overwrite_output_dir: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": (
                 "Overwrite the content of the output directory. "
@@ -122,29 +89,29 @@ class TrainingArguments:
             )
         },
     )
-    do_train: bool = field(default=True, metadata={"help": "Whether to run training."})
-    do_eval: bool = field(default=True, metadata={"help": "Whether to run eval on the dev set."})
+    do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
+    do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
     per_device_train_batch_size: int = field(
-        default=yml_config.dataloader.train.init_local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
+        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
-        default=yml_config.dataloader.eval.local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
+        default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
     num_micro_batches: int = field(default=1, metadata={"help": "The number of micro batches for gradient accumulation."})
     operator_parallel: int = field(default=1, metadata={"help": "The degree of operator model parallelism."})
     pipeline_parallel: int = field(default=1, metadata={"help": "The degree of pipeline model parallelism."})
     use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})
-    learning_rate: float = field(default=yml_config.training.learning_rate, metadata={"help": "The initial learning rate for AdamW."})
-    weight_decay: float = field(default=yml_config.training.weight_decay, metadata={"help": "Weight decay for AdamW if we apply some."})
-    adam_beta1: float = field(default=yml_config.training.adam_beta1, metadata={"help": "Beta1 for AdamW optimizer"})
-    adam_beta2: float = field(default=yml_config.training.adam_beta2, metadata={"help": "Beta2 for AdamW optimizer"})
+    learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
+    weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
+    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
+    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
-    num_train_epochs: float = field(default=yml_config.training.num_train_epochs, metadata={"help": "Total number of training epochs to perform."})
-    warmup_steps: int = field(default=yml_config.training.warmup_steps, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=yml_config.training.logging_steps, metadata={"help": "Log every X updates steps."})
-    save_steps: int = field(default=yml_config.training.save_steps, metadata={"help": "Save checkpoint every X updates steps."})
-    eval_steps: int = field(default=yml_config.training.eval_steps, metadata={"help": "Run an evaluation every X steps."})
+    num_train_epochs: float = field(default=3.0, metadata={"help": "Total number of training epochs to perform."})
+    warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
+    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
+    save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
+    eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
     seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
     push_to_hub: bool = field(
         default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
@@ -153,12 +120,6 @@ class TrainingArguments:
         default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
-    pretrain: bool = field(
-        default=yml_config.training.pretrain, metadata={"help": "Whether or not to pretrain."}
-    )
-    count: int = field(default=2, metadata={"help": "The number of stored grads."})
-    scale: int = field(default=1, metadata={"help": "Scale"})
-    smoothing: float = field(default=yml_config.training.smoothing, metadata={"help": "Smoothing parameter for PGNS"})
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -187,7 +148,7 @@ class ModelArguments:
     """
 
     model_name_or_path: Optional[str] = field(
-        default=yml_config.model_name_or_path,
+        default=None,
         metadata={
             "help": (
                 "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
@@ -205,14 +166,14 @@ class ModelArguments:
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
-        default=yml_config.paths.cache_dir, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
     use_fast_tokenizer: bool = field(
         default=True,
         metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
     )
     dtype: Optional[str] = field(
-        default=yml_config.training.dtype,
+        default="float32",
         metadata={
             "help": (
                 "Floating-point format in which the model weights should be initialized and trained. Choose one of"
@@ -238,10 +199,10 @@ class DataTrainingArguments:
     """
 
     dataset_name: Optional[str] = field(
-        default=yml_config.data.dataset_name, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
     dataset_config_name: Optional[str] = field(
-        default=yml_config.data.dataset_config_name, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
     train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
     validation_file: Optional[str] = field(
@@ -249,7 +210,7 @@ class DataTrainingArguments:
         metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
     )
     max_train_samples: Optional[int] = field(
-        default=yml_config.data.max_train_samples,
+        default=None,
         metadata={
             "help": (
                 "For debugging purposes or quicker training, truncate the number of training examples to this "
@@ -276,7 +237,7 @@ class DataTrainingArguments:
         },
     )
     block_size: Optional[int] = field(
-        default=yml_config.data.block_size,
+        default=None,
         metadata={
             "help": (
                 "Optional input sequence length after tokenization. "
@@ -289,14 +250,23 @@ class DataTrainingArguments:
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
     preprocessing_num_workers: Optional[int] = field(
-        default=yml_config.dataloader.train.preprocessing_num_workers,
+        default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     keep_linebreaks: bool = field(
         default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
     )
+    use_data_sample: bool = field(default=False, metadata={
+        "help" : "Whether to use data sample or not which consists only 1000 data rows"
+    })
+
 
     def __post_init__(self):
+        if self.use_data_sample:
+            self.dataset_name = "Erland/oscar_sampled_1000"
+            self.dataset_config_name = "default"
+            delattr(self, "use_data_sample")
+
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
@@ -306,17 +276,6 @@ class DataTrainingArguments:
             if self.validation_file is not None:
                 extension = self.validation_file.split(".")[-1]
                 assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
-
-@dataclass
-class RunningGradientsState:
-    store_grads: list
-    noise: float
-    scale: float
-    noise_scale: float
-    beta: float
-    running_noise: float
-    running_scale: float
-    n_batch: int
 
 
 def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
@@ -426,11 +385,6 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
-
-    try:
-        from alpa.adaptdl.gradient_noise_scale import gns
-    except Exception as e:
-        print(f'could not import gns: {e}')
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -600,8 +554,8 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    if model_args.model_name_or_path and not training_args.pretrain:
-        print(f"Finetuning mode")
+
+    if model_args.model_name_or_path:
         model = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -609,32 +563,20 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
         )
+
+        #from transformers import FlaxOPTForCausalLM
+        #config.num_hidden_layers = 2
+        #model = FlaxOPTForCausalLM(
+        #    config=config,
+        #    seed=training_args.seed,
+        #    dtype=getattr(jnp, model_args.dtype),
+        #)
     else:
-        print(f"Pretraining mode")
         model = FlaxAutoModelForCausalLM.from_config(
             config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
         )
-
-    run = wandb.init(
-        # Set the project where this run will be logged
-        project=yml_config.wandb.project,
-        config={
-            "model_name_or_path": model_args.model_name_or_path,
-            "model_args": model_args,
-            "data_args": data_args,
-            "training_args": training_args,
-            "yml_config": yml_config,
-        },
-        save_code=yml_config.wandb.save_code,
-        mode=yml_config.wandb.mode,
-    )
-
-    run.log_code(
-            os.path.dirname(os.path.dirname(alpa.__file__)),
-            exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
-            )
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -662,7 +604,7 @@ def main():
     tokenized_datasets = dataset.map(
         tokenize_function,
         batched=True,
-        num_proc=None if data_args.preprocessing_num_workers == 0 else data_args.preprocessing_num_workers,
+        num_proc=data_args.preprocessing_num_workers,
         remove_columns=column_names,
         load_from_cache_file=not data_args.overwrite_cache,
     )
@@ -711,7 +653,7 @@ def main():
     lm_datasets = tokenized_datasets.map(
         group_texts,
         batched=True,
-        num_proc=None if data_args.preprocessing_num_workers == 0 else data_args.preprocessing_num_workers,
+        num_proc=data_args.preprocessing_num_workers,
         load_from_cache_file=not data_args.overwrite_cache,
     )
 
@@ -735,17 +677,18 @@ def main():
     num_devices = alpa.get_global_num_devices()
     train_min_batch_size = (num_devices // training_args.operator_parallel //
                             training_args.pipeline_parallel * training_args.num_micro_batches)
-    eval_num_micro_batches = training_args.num_micro_batches
-    eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                           training_args.pipeline_parallel * eval_num_micro_batches)
-    while len(eval_dataset) < eval_min_batch_size:
-        eval_num_micro_batches //= 2
+                        
+    if training_args.do_eval:
+        eval_num_micro_batches = training_args.num_micro_batches
         eval_min_batch_size = (num_devices // training_args.operator_parallel //
-                               training_args.pipeline_parallel * eval_num_micro_batches)
+                            training_args.pipeline_parallel * eval_num_micro_batches)
+        while len(eval_dataset) < eval_min_batch_size:
+            eval_num_micro_batches //= 2
+            eval_min_batch_size = (num_devices // training_args.operator_parallel //
+                                training_args.pipeline_parallel * eval_num_micro_batches)
 
     # Enable tensorboard only on the master node
-    # has_tensorboard = is_tensorboard_available()
-    has_tensorboard = False
+    has_tensorboard = is_tensorboard_available()
     if has_tensorboard:
         try:
             from flax.metrics.tensorboard import SummaryWriter
@@ -773,52 +716,6 @@ def main():
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
-
-    count = training_args.count
-    scale = training_args.scale
-    theta = training_args.smoothing * scale
-    
-    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
-
-    # Set regression coefficients if specified in the config
-    fix_regressors(yml_config)
-
-    if not yml_config.dataloader.train.adaptive_data_loader.enabled:
-        train_loader = DataLoader(
-            dataset=train_dataset,
-            batch_size=train_batch_size,
-            shuffle=yml_config.dataloader.train.shuffle,
-            collate_fn=transformers.default_data_collator, # we don't need any special collator 
-            drop_last=True,
-            num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config.dataloader.train.persistent_workers,
-        )
-    else:
-        train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
-            dataset=train_dataset,
-            batch_size=train_batch_size,
-            shuffle=yml_config.dataloader.train.shuffle,
-            collate_fn=transformers.default_data_collator, # we don't need any special collator
-            drop_last=True,
-            num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config.dataloader.train.persistent_workers,
-        )
-        if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
-            train_loader.autoscale_batch_size(max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
-                                                local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices() if 
-                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
-                                                                  else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
-                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max), 
-                                                gradient_accumulation=False)
-
-    eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=eval_batch_size,
-        shuffle=yml_config.dataloader.eval.shuffle,
-        drop_last=True,
-        collate_fn=transformers.default_data_collator, # we don't need any special collator 
-        )
-
     # Create learning rate schedule
     linear_decay_lr_schedule_fn = create_learning_rate_fn(
         len(train_dataset),
@@ -827,8 +724,6 @@ def main():
         training_args.warmup_steps,
         training_args.learning_rate,
     )
-
-    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
 
     # We use Optax's "masking" functionality to not apply weight decay
     # to bias and LayerNorm scale parameters. decay_mask_fn returns a
@@ -850,13 +745,13 @@ def main():
         # We use the default parameters here to initialize adafactor,
         # For more details about the parameters please check https://github.com/deepmind/optax/blob/ed02befef9bf81cbbf236be3d2b0e032e9ed4a40/optax/_src/alias.py#L74
         optimizer = optax.adafactor(
-            learning_rate=scaled_learning_rate_fn,
+            learning_rate=linear_decay_lr_schedule_fn,
         )
     else:
         optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(
-                learning_rate=scaled_learning_rate_fn,
+                learning_rate=linear_decay_lr_schedule_fn,
                 b1=training_args.adam_beta1,
                 b2=training_args.adam_beta2,
                 eps=training_args.adam_epsilon,
@@ -875,14 +770,6 @@ def main():
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer,
                               dynamic_scale=dynamic_scale, use_master_copy=use_master_copy)
 
-    gns.initialize_gns(state=state, 
-                       init_bsz=train_batch_size, 
-                       num_workers=alpa.get_global_num_devices(), 
-                       store_grads=jnp.array(0.),
-                       count=count,
-                       scale=scale,
-                       theta=theta)
-
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
@@ -892,11 +779,12 @@ def main():
         return loss.mean()
 
     # Define gradient update step fn
-    def train_step(state, batch, variables: Dict):
+    def train_step(state, batch):
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
+            # logits = state.apply_fn(**batch, params=params, deterministic=True)[0]
+            logits = state.apply_fn(**batch, params=params)[0]
             loss = loss_fn(logits, labels)
             return loss
 
@@ -923,37 +811,35 @@ def main():
                     new_state.master_copy, state.master_copy),
                 dynamic_scale=dynamic_scale)
 
-        metrics = {
-            "loss": loss, 
-            "learning_rate": scaled_learning_rate_fn(state.step),
-        }
-
-        if yml_config.training.gns_enabled:
-            gradients = get_mean_leaves(grads)
-            gns_dict = compute_gradient_noise_scale(variables, gradients)
-            metrics.update(gns_dict)
+        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
 
         return new_state, metrics
 
-    # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-        logits = model(**batch, params=params, deterministic=True)[0]
+        logits = model(**batch, params=params)[0]
         loss = loss_fn(logits, labels)
 
-        # summarize metrics
         metrics = {"loss": loss}
         return metrics
 
-    def process_batch(batch):
-        batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
-                             batch["attention_mask"]) - 1
-        return {k: v.numpy() for k, v in batch.items()}
+    # Create parallel version of the train and eval step
+    # method = alpa.get_3d_parallel_method(
+    #         num_micro_batches=training_args.num_micro_batches,
+    #         data_parallel=-1,
+    #         operator_parallel=training_args.operator_parallel,
+    #         pipeline_parallel=training_args.pipeline_parallel)
 
-    method = get_parallel_method(yml_config)
+    method = alpa.Zero2Parallel(num_micro_batches=training_args.num_micro_batches)
 
-    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step)
+    p_train_step = alpa.parallelize(train_step,
+                                    method=method,
+                                    donate_argnums=(0,))
+    if training_args.do_eval:
+        p_eval_step = alpa.parallelize(eval_step,
+                                    method=alpa.FollowParallel(
+                                        p_train_step, num_micro_batches=eval_num_micro_batches))
+
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
     logger.info("***** Running training *****")
@@ -972,33 +858,24 @@ def main():
 
     epochs.write("Initial compilation. This might take some minutes...")
 
-    variables_dict = None
-
-    for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
+    for epoch in epochs:
         # ======================== Training ================================
         train_start = time.time()
 
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
 
+        # Generate an epoch by shuffling sampling indices from the train dataset
+        train_loader = data_loader(input_rng, train_dataset, train_batch_size,
+                                   train_min_batch_size, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
         # train
-        for step, batch in enumerate(train_loader):
-            batch = process_batch(batch)
-
-            if yml_config.training.gns_enabled:
-                variables_dict = gns.construct_gns_dict()
-
-            if pollux_agent.reallocation_approaching:
-                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
-                continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
-
-            state, train_metric = p_train_step(state, batch, variables_dict)
+        for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
+            batch = next(train_loader)
+            batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                     batch["attention_mask"]) - 1
+            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
-
-            if yml_config.training.gns_enabled:
-                gns.update_state(state, train_metric)
-                update_grad_params(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
@@ -1012,7 +889,7 @@ def main():
 
             step_ct += 1
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
-                p_train_step.get_last_executable().sync()
+                executable.sync()
                 latency = (time.time() - last_time) / step_ct
                 throughput_tokens = np.prod(batch["input_ids"].shape) / latency
                 throughput_tflops = alpa.util.compute_gpt_tflops(
@@ -1043,24 +920,25 @@ def main():
                 train_metrics = []
                 last_time = time.time()
 
-            if yml_config.evaluation.enabled:
-                pollux_agent.is_evaluating = True
+            if training_args.do_eval:
                 if cur_step % training_args.eval_steps == 0 and cur_step > 0:
                     # ======================== Evaluating ==============================
                     eval_metrics = []
-
+                    eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                            eval_min_batch_size)
                     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-                    for step, batch in enumerate(eval_loader):
+                    for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
                         # Model forward
-                        batch = process_batch(batch)
-
+                        batch = next(eval_loader)
+                        batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                                batch["attention_mask"]) - 1
                         metrics = p_eval_step(state.params, batch)
                         eval_metrics.append(metrics)
 
                         if dump_debug_info_eval_step:
                             dump_debug_info_eval_step = False
                             executable = p_eval_step.get_last_executable()
-                            executable.dump_debug_info("alpa_debug_info_eval")
+                            executable.dump_debug_info("alpa_debug_info")
 
                     # normalize eval metrics
                     eval_metrics = alpa.util.get_metrics(eval_metrics)
@@ -1077,51 +955,48 @@ def main():
                         f" {eval_metrics['perplexity']})"
                     )
                     epochs.write(desc)
-                    
-                    wandb.log({
-                        "eval_loss": eval_metrics['loss'],
-                        "eval_acc": eval_metrics['perplexity'],
-                        "epoch": cur_step / steps_per_epoch
-                                })
 
                     # Save metrics
                     if has_tensorboard:
                         write_eval_metric(summary_writer, eval_metrics, cur_step)
 
-                if cur_step % training_args.save_steps == 0 and cur_step > 0:
-                    # save checkpoint after each epoch and push checkpoint to the hub
-                    epochs.write("\nSave checkpoint...")
-                    alpa.prefetch(state.params)
-                    params = alpa.util.map_to_nparray(state.params)
-                    model.save_pretrained(training_args.output_dir, params=params)
-                    tokenizer.save_pretrained(training_args.output_dir)
-                    if training_args.push_to_hub:
-                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
-                pollux_agent.is_evaluating = False
+            if cur_step % training_args.save_steps == 0 and cur_step > 0:
+                # save checkpoint after each epoch and push checkpoint to the hub
+                epochs.write("\nSave checkpoint...")
+                alpa.prefetch(state.params)
+                params = alpa.util.map_to_nparray(state.params)
+                model.save_pretrained(training_args.output_dir, params=params)
+                tokenizer.save_pretrained(training_args.output_dir)
+                if training_args.push_to_hub:
+                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
-    # # Eval after training
-    # if training_args.do_eval:
-    #     eval_metrics = []
-    #     eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-    #     for step, batch in enumerate(eval_loader):
-    #         # Model forward
-    #         batch = process_batch(batch)
-    #         metrics = p_eval_step(state.params, batch)
-    #         eval_metrics.append(metrics)
+    # Eval after training
+    if training_args.do_eval:
+        eval_metrics = []
+        eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size,
+                                  eval_min_batch_size)
+        eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+        for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+            # Model forward
+            batch = next(eval_loader)
+            batch["position_ids"] = (batch["attention_mask"].cumsum(axis=1) *
+                                     batch["attention_mask"]) - 1
+            metrics = p_eval_step(state.params, batch)
+            eval_metrics.append(metrics)
 
-    #     # normalize eval metrics
-    #     eval_metrics = alpa.util.get_metrics(eval_metrics)
-    #     eval_metrics = jax.tree_map(lambda x: jnp.mean(x).item(), eval_metrics)
+        # normalize eval metrics
+        eval_metrics = alpa.util.get_metrics(eval_metrics)
+        eval_metrics = jax.tree_map(lambda x: jnp.mean(x).item(), eval_metrics)
 
-    #     try:
-    #         eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
-    #     except OverflowError:
-    #         eval_metrics["perplexity"] = float("inf")
+        try:
+            eval_metrics["perplexity"] = math.exp(eval_metrics["loss"])
+        except OverflowError:
+            eval_metrics["perplexity"] = float("inf")
 
-    #     eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
-    #     path = os.path.join(training_args.output_dir, "eval_results.json")
-    #     with open(path, "w") as f:
-    #         json.dump(eval_metrics, f, indent=4, sort_keys=True)
+        eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
+        path = os.path.join(training_args.output_dir, "eval_results.json")
+        with open(path, "w") as f:
+            json.dump(eval_metrics, f, indent=4, sort_keys=True)
 
     # Save the final model
     epochs.write("\nSave the final model...")
