@@ -83,10 +83,5 @@ training:
         pipeline_parallel: 1
     num_micro_batches: 1
 
-profiling:
-  enabled: true
-  min_batch_size: 1
-  max_batch_size: null
-
 evaluation:
   enabled: false
