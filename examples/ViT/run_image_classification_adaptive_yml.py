@@ -433,313 +433,443 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
         )
 
-    run = wandb.init(
-        # Set the project where this run will be logged
-        project=yml_config.wandb.project,
-        config={
-            "model_name_or_path": model_args.model_name_or_path,
-            "model_args": model_args,
-            "data_args": data_args,
-            "training_args": training_args,
-            "yml_config": yml_config,
-        },
-        save_code=yml_config.wandb.save_code,
-        mode=yml_config.wandb.mode,
-    )
-    run.log_code(
-                    os.path.dirname(os.path.dirname(alpa.__file__)),
-                    exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
-                    )
+    # Profiling config
+    profiling_config = yml_config.get("profiling", {})
+    profiling_enabled = profiling_config.get("enabled", False)
+    num_devices = alpa.get_global_num_devices()
+    num_micro_batches = training_args.num_micro_batches
 
-    # Store some constant
-    num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
-    eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
-    steps_per_epoch = len(train_dataset) // train_batch_size
-    total_train_steps = steps_per_epoch * num_epochs
-    count = training_args.count
-    scale = training_args.scale
-    theta = training_args.smoothing * scale
+    batch_sizes_to_run = []
+    if profiling_enabled:
+        # Disable wandb
+        os.environ["WANDB_MODE"] = "offline"
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example[0] for example in examples])
-        labels = torch.tensor([example[1] for example in examples])
+        # Disable preallocation of JAX
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
-        batch = {"pixel_values": pixel_values, "labels": labels}
-        batch = {k: v.numpy() for k, v in batch.items()}
+        # batch sizes
+        min_batch_size = profiling_config.get("min_batch_size", 1)
+        max_batch_size = profiling_config.get("max_batch_size", None)
 
-        return batch
+        if min_batch_size <= 0:
+            logger.warning("Minimum batch size should be greater than 0. Setting it to 1.")
+            min_batch_size = 1
 
-    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
+        current_bs = 1
+        while current_bs < min_batch_size:
+            current_bs *= 2
 
-    # Set regression coefficients if specified in the config
-    fix_regressors(yml_config)
+        logger.info(f"Starting search for profile batch sizes from {current_bs}")
+        logger.info(f"Constraints: Divisible by num_devices ({num_devices}), divisible by num_micro_batches ({num_micro_batches}), max_total_bs ({max_batch_size})")
 
-    # Create data loaders
-    if not yml_config.dataloader.train.adaptive_data_loader.enabled:
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=train_batch_size,
-            shuffle=yml_config.dataloader.train.shuffle,
-            num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config.dataloader.train.persistent_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-        )
+        while True:
+            # 1. Check max batch size limit
+            if max_batch_size is not None and current_bs > max_batch_size:
+                logger.info(f"Current batch size {current_bs} exceeds max {max_batch_size}. Stopping search.")
+                break
+
+            # 2. Check divisibility by number of devices
+            if current_bs % num_devices != 0:
+                logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_devices ({num_devices})")
+                current_bs *= 2
+                continue
+
+            # 3. Check divisibility by num_micro_batches
+            # The total batch size per step must be divisible by num_micro_batches
+            # for gradient accumulation logic.
+            if num_micro_batches > 0 and current_bs % num_micro_batches != 0:
+                 logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_micro_batches ({num_micro_batches})")
+                 current_bs *= 2
+                 continue
+            elif num_micro_batches <= 0:
+                 logger.warning("num_micro_batches is <= 0. Skipping divisibility check.")
+
+            # If all checks pass, add it to the list
+            logger.info(f"Found valid profile batch size: {current_bs}")
+            batch_sizes_to_run.append(current_bs)
+
+            # Move to the next power of 2
+            current_bs *= 2
+
+            # Safety break for extremely large numbers if max_total_bs is None
+            if current_bs > 2 ** 20: # Arbitrary large limit (~1 million)
+                logger.warning("Reached very large batch size during profiling search without max_total_bs. Stopping.")
+                break
+
+        if not batch_sizes_to_run:
+            logger.error("No valid batch sizes found for profiling based on the constraints!")
+            return # Exit if no batch sizes are viable
     else:
-        train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
-            dataset=train_dataset,
-            batch_size=train_batch_size,
-            shuffle=yml_config.dataloader.train.shuffle, # TODO: handle shuffle=True
-            collate_fn=collate_fn,
-            num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config.dataloader.train.persistent_workers,
-            drop_last=True,
+        initial_local_batch_size = yml_config.dataloader.train.init_local_batch_size
+        initial_total_batch_size = initial_local_batch_size * num_devices
+        batch_sizes_to_run = [initial_total_batch_size]
+        logger.info(f"Using initial batch size: {initial_total_batch_size} for profiling.")
+
+    for i_run, current_total_batch_size in enumerate(batch_sizes_to_run): 
+        logger.info(f"Resetting AdaptDL epoch state for profiling batch size {current_total_batch_size}")
+        alpa.adaptdl.epoch._EPOCH_STATE = None # Reset the internal state
+        alpa.adaptdl.checkpoint._STATES_TO_NAMES = {} # Reset the checkpoint state
+        alpa.adaptdl.checkpoint._NAMES_TO_STATES = {} # Reset the checkpoint state
+        
+        current_local_batch_size = current_total_batch_size // num_devices
+        current_training_args = TrainingArguments(**asdict(training_args))
+        current_training_args.per_device_train_batch_size = current_local_batch_size
+
+        if profiling_enabled:
+            logger.info(f"Running profiling with global batch size: {current_total_batch_size}")
+            logger.info(f"Running profiling with local batch size: {current_local_batch_size}")
+            current_training_args.num_train_epochs = 3
+            current_training_args.do_eval = False
+
+        yml_config.dataloader.train.init_local_batch_size = current_local_batch_size
+        yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size = current_total_batch_size
+
+        run = wandb.init(
+            # Set the project where this run will be logged
+            project=yml_config.wandb.project,
+            config={
+                "model_name_or_path": model_args.model_name_or_path,
+                "model_args": model_args,
+                "data_args": data_args,
+                "training_args": training_args,
+                "yml_config": yml_config,
+            },
+            save_code=yml_config.wandb.save_code,
+            mode=yml_config.wandb.mode,
         )
-        if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
-            train_loader.autoscale_batch_size(max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
-                                                local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices() if 
-                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
-                                                                  else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
-                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max), 
-                                                gradient_accumulation=False)
-
-    eval_loader = torch.utils.data.DataLoader(
-       eval_dataset,
-       batch_size=eval_batch_size,
-       shuffle=yml_config.dataloader.eval.shuffle,
-       num_workers=data_args.preprocessing_num_workers,
-       persistent_workers=True,
-       drop_last=True,
-       collate_fn=collate_fn,
-    )
-
-    # Enable tensorboard only on the master node
-    has_tensorboard = is_tensorboard_available()
-    if has_tensorboard and jax.process_index() == 0:
-        try:
-            from flax.metrics.tensorboard import SummaryWriter
-
-            summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir))
-        except ImportError as ie:
-            has_tensorboard = False
-            logger.warning(
-                f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
-            )
-    else:
-        logger.warning(
-            "Unable to display metrics through TensorBoard because the package is not installed: "
-            "Please run pip install tensorboard to enable."
+        run.log_code(
+            os.path.dirname(os.path.dirname(alpa.__file__)),
+            exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
         )
 
-    # Initialize our training
-    rng = jax.random.PRNGKey(training_args.seed)
-    rng, dropout_rng = jax.random.split(rng)
-
-    # Create learning rate schedule
-    linear_decay_lr_schedule_fn = create_learning_rate_fn(
-        len(train_dataset),
-        train_batch_size,
-        training_args.num_train_epochs,
-        training_args.warmup_steps,
-        training_args.learning_rate,
-    )
-
-    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
-
-    # create adam optimizer
-    adamw = optax.adamw(
-        learning_rate=scaled_learning_rate_fn,
-        b1=training_args.adam_beta1,
-        b2=training_args.adam_beta2,
-        eps=training_args.adam_epsilon,
-        weight_decay=training_args.weight_decay,
-    )
-
-    # Setup train state
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
-    gns.initialize_gns(state=state, 
-                       init_bsz=train_batch_size, 
-                       num_workers=alpa.get_global_num_devices(), 
-                       store_grads=jnp.array(0.),
-                       count=count,
-                       scale=scale,
-                       theta=theta)
-    
-    def loss_fn(logits, labels):
-        loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
-        return loss.mean()
-
-    # Define gradient update step fn
-    def train_step(state, batch, variables: Dict):
-
-        def compute_loss(params):
-            labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, train=True)[0]
-            loss = loss_fn(logits, labels)
-            return loss
-        
-        grad_fn = alpa.value_and_grad(compute_loss)
-        loss, grad = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grad)
-
-        metrics = {
-            "loss": loss, 
-            "learning_rate": scaled_learning_rate_fn(state.step),
-        }
-
-        if yml_config.training.gns_enabled:
-            gradients = get_mean_leaves(grad)
-            gns_dict = compute_gradient_noise_scale(variables, gradients)
-            metrics.update(gns_dict)
-
-        return new_state, metrics
-
-    # Define eval fn
-    def eval_step(params, batch):
-        labels = batch.pop("labels")
-        logits = model(**batch, params=params, train=False)[0]
-        loss = loss_fn(logits, labels)
-
-        # summarize metrics
-        accuracy = (jnp.argmax(logits, axis=-1) == labels).mean()
-        metrics = {"loss": loss, "accuracy": accuracy}
-        return metrics
-
-    method = get_parallel_method(yml_config)
-
-    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step)
-    dump_debug_info_train_step = dump_debug_info_eval_step = True
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {num_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
-    logger.info(f"  Total optimization steps = {total_train_steps}")
-    
-    logger.info(f"Number of parameters - {count_params(model.params)}")
-
-    train_time = 0
-    last_time = time.time()
-    epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
-
-    variables_dict = None
-
-    for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
-        # ======================== Training ================================
-        
-        train_start = time.time()
-
-        # Create sampling rng
-        rng, input_rng = jax.random.split(rng)
-        train_metrics = []
-
+        # Store some constant
+        num_epochs = int(current_training_args.num_train_epochs)
+        train_batch_size = int(current_training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
+        eval_batch_size = int(current_training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
         steps_per_epoch = len(train_dataset) // train_batch_size
-        train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
-        # train
-        for step, batch in enumerate(train_loader):
+        total_train_steps = steps_per_epoch * num_epochs
+        count = current_training_args.count
+        scale = current_training_args.scale
+        theta = current_training_args.smoothing * scale
 
-            if yml_config.training.gns_enabled:
-                variables_dict = gns.construct_gns_dict()
+        def collate_fn(examples):
+            pixel_values = torch.stack([example[0] for example in examples])
+            labels = torch.tensor([example[1] for example in examples])
 
-            if pollux_agent.reallocation_approaching:
-                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
-                continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
-            
-            state, train_metric = p_train_step(state, batch, variables_dict)
-            train_metrics.append(train_metric)
+            batch = {"pixel_values": pixel_values, "labels": labels}
+            batch = {k: v.numpy() for k, v in batch.items()}
 
-            if yml_config.training.gns_enabled:
-                gns.update_state(state, train_metric)
-                update_grad_params(train_metric)
-        
-            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+            return batch
 
-            if dump_debug_info_train_step:
-                dump_debug_info_train_step = False
-                executable = p_train_step.get_last_executable()
-                executable.sync()
-                executable.dump_debug_info("alpa_debug_info")
-                epochs.write(f"Initial compilation completed. "
-                             f"Time elapsed: {time.time() - train_start:.2f} s")
-                             
-            train_step_progress_bar.update(1)
+        pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
 
-        latency = time.time() - last_time
-        images_per_second = len(train_dataset) / latency
-        train_time += time.time() - train_start
-        last_time = time.time()
+        # Set regression coefficients if specified in the config
+        fix_regressors(yml_config)
 
-        logger.info(f"train_loss: {train_metric['loss']}")
-        
-
-        train_step_progress_bar.close()
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
-            f" {train_metric['learning_rate']}), "
-            f"Throughput: {images_per_second:.2f} images/s, "   
-        )
-        
-    
-
-        # # ======================== Evaluating ==============================
-        if yml_config.evaluation.enabled:
-            pollux_agent.is_evaluating = True
-            eval_metrics = []
-            eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-            eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
-            for batch in eval_loader:
-                # Model forward
-                metrics = p_eval_step(state.params, batch)
-                eval_metrics.append(metrics)
-
-                if dump_debug_info_eval_step:
-                    dump_debug_info_eval_step = False
-                    executable = p_eval_step.get_last_executable()
-                    executable.dump_debug_info("alpa_debug_info_eval")
-
-                eval_step_progress_bar.update(1)
-
-            # normalize eval metrics
-            eval_metrics = alpa.util.get_metrics(eval_metrics)
-            eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
-
-            logger.info(f"eval_loss: {eval_metrics['loss'].item()}")
-            logger.info(f"eval_acc: {eval_metrics['accuracy'].item()}")
-            
-            wandb.log({
-                "eval_loss": eval_metrics['loss'].item(),
-                "eval_acc": eval_metrics['accuracy'].item(),
-                "epoch": epoch
-                       })
-
-            # Print metrics and update progress bar
-            eval_step_progress_bar.close()
-            desc = (
-                f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {round(eval_metrics['loss'].item(), 4)} | "
-                f"Eval Accuracy: {round(eval_metrics['accuracy'].item(), 4)})"
+        # Create data loaders
+        if not yml_config.dataloader.train.adaptive_data_loader.enabled:
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=train_batch_size,
+                shuffle=yml_config.dataloader.train.shuffle,
+                num_workers=data_args.preprocessing_num_workers,
+                persistent_workers=yml_config.dataloader.train.persistent_workers,
+                drop_last=True,
+                collate_fn=collate_fn,
             )
-            epochs.write(desc)
-            epochs.desc = desc
+        else:
+            train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+                dataset=train_dataset,
+                batch_size=train_batch_size,
+                shuffle=yml_config.dataloader.train.shuffle, # TODO: handle shuffle=True
+                collate_fn=collate_fn,
+                num_workers=data_args.preprocessing_num_workers,
+                persistent_workers=yml_config.dataloader.train.persistent_workers,
+                drop_last=True,
+            )
+            if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
+                train_loader.autoscale_batch_size(
+                    max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
+                    local_bsz_bounds=(
+                        train_batch_size // alpa.get_global_num_devices() if 
+                        yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
+                        else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
+                        yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max
+                    ), 
+                    gradient_accumulation=False
+                )
 
-            # Save metrics
-            if has_tensorboard and jax.process_index() == 0:
-                cur_step = epoch * (len(train_dataset) // train_batch_size)
-                write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+        eval_loader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=eval_batch_size,
+            shuffle=yml_config.dataloader.eval.shuffle,
+            num_workers=data_args.preprocessing_num_workers,
+            persistent_workers=True,
+            drop_last=True,
+            collate_fn=collate_fn,
+        )
 
-            # save checkpoint after each epoch and push checkpoint to the hub
-            if jax.process_index() == 0:
-                alpa.prefetch(state.params)
-                params = alpa.util.map_to_nparray(state.params)
-                model.save_pretrained(training_args.output_dir, params=params)
-                if training_args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
-            pollux_agent.is_evaluating = False
+        # Enable tensorboard only on the master node
+        has_tensorboard = is_tensorboard_available()
+        if has_tensorboard and jax.process_index() == 0:
+            try:
+                from flax.metrics.tensorboard import SummaryWriter
 
-    
+                summary_writer = SummaryWriter(log_dir=Path(current_training_args.output_dir))
+            except ImportError as ie:
+                has_tensorboard = False
+                logger.warning(
+                    f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
+                )
+        else:
+            logger.warning(
+                "Unable to display metrics through TensorBoard because the package is not installed: "
+                "Please run pip install tensorboard to enable."
+            )
 
+        # Initialize our training
+        rng = jax.random.PRNGKey(current_training_args.seed)
+        rng, dropout_rng = jax.random.split(rng)
+
+        # Create learning rate schedule
+        linear_decay_lr_schedule_fn = create_learning_rate_fn(
+            len(train_dataset),
+            train_batch_size,
+            current_training_args.num_train_epochs,
+            current_training_args.warmup_steps,
+            current_training_args.learning_rate,
+        )
+
+        scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
+
+        # create adam optimizer
+        adamw = optax.adamw(
+            learning_rate=scaled_learning_rate_fn,
+            b1=current_training_args.adam_beta1,
+            b2=current_training_args.adam_beta2,
+            eps=current_training_args.adam_epsilon,
+            weight_decay=current_training_args.weight_decay,
+        )
+
+        # Setup train state
+        state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
+        gns.initialize_gns(state=state, 
+                        init_bsz=train_batch_size, 
+                        num_workers=alpa.get_global_num_devices(), 
+                        store_grads=jnp.array(0.),
+                        count=count,
+                        scale=scale,
+                        theta=theta)
+        
+        def loss_fn(logits, labels):
+            loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
+            return loss.mean()
+
+        # Define gradient update step fn
+        def train_step(state, batch, variables: Dict):
+
+            def compute_loss(params):
+                labels = batch.pop("labels")
+                logits = state.apply_fn(**batch, params=params, train=True)[0]
+                loss = loss_fn(logits, labels)
+                return loss
+            
+            grad_fn = alpa.value_and_grad(compute_loss)
+            loss, grad = grad_fn(state.params)
+            new_state = state.apply_gradients(grads=grad)
+
+            metrics = {
+                "loss": loss, 
+                "learning_rate": scaled_learning_rate_fn(state.step),
+            }
+
+            if yml_config.training.gns_enabled:
+                gradients = get_mean_leaves(grad)
+                gns_dict = compute_gradient_noise_scale(variables, gradients)
+                metrics.update(gns_dict)
+
+            return new_state, metrics
+
+        # Define eval fn
+        def eval_step(params, batch):
+            labels = batch.pop("labels")
+            logits = model(**batch, params=params, train=False)[0]
+            loss = loss_fn(logits, labels)
+
+            # summarize metrics
+            accuracy = (jnp.argmax(logits, axis=-1) == labels).mean()
+            metrics = {"loss": loss, "accuracy": accuracy}
+            return metrics
+
+        method = get_parallel_method(yml_config)
+
+        p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+
+        p_eval_step = alpa.parallelize(eval_step)
+        dump_debug_info_train_step = dump_debug_info_eval_step = True
+
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {len(train_dataset)}")
+        logger.info(f"  Num Epochs = {num_epochs}")
+        logger.info(f"  Instantaneous batch size per device = {current_training_args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
+        logger.info(f"  Total optimization steps = {total_train_steps}")
+        
+        logger.info(f"Number of parameters - {count_params(model.params)}")
+
+        train_time = 0
+        last_time = time.time()
+        epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+
+        variables_dict = None
+
+        for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
+            # ======================== Training ================================
+            
+            train_start = time.time()
+
+            # Create sampling rng
+            rng, input_rng = jax.random.split(rng)
+            train_metrics = []
+
+            steps_per_epoch = len(train_dataset) // train_batch_size
+            train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
+            # train
+            for step, batch in enumerate(train_loader):
+
+                if yml_config.training.gns_enabled:
+                    variables_dict = gns.construct_gns_dict()
+
+                if pollux_agent.reallocation_approaching:
+                    state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
+                    continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
+
+                if profiling_enabled:
+                    executable = p_train_step.get_executable(state, batch, variables_dict)
+                    executable.sync()
+
+                    # warmup
+                    for _ in range(10):
+                        cost_dummy = executable.profile_with_dummy_inputs()
+
+                    avg_cost = []
+                    for _ in range(10):
+                        cost_dummy = executable.profile_with_dummy_inputs()
+                        avg_cost.append(cost_dummy)
+                    avg_cost = np.mean(np.array(avg_cost))
+                    mem_gb = executable.get_total_allocation_size() / (1024**3)
+                    logger.info(f"Average cost: {avg_cost}")
+                    logger.info(f"Memory usage: {mem_gb} GB")
+
+                    if jax.process_index() == 0:
+                        with open("profiling_results.csv", "a") as f:
+                            if os.stat("profiling_results.csv").st_size == 0:
+                                f.write("run,epoch,batch_size,avg_cost,mem_gb,model_name,strategy,dp,pp,tp\n")
+                            f.write(f"{i_run},{epoch},{current_total_batch_size},{avg_cost},{mem_gb},"
+                                    f"{yml_config.model_name_or_path},{yml_config.training.parallel_method.method},"
+                                    f"{yml_config.training.parallel_method.parameters._3D.data_parallel},{yml_config.training.parallel_method.parameters._3D.operator_parallel},"
+                                    f"{yml_config.training.parallel_method.parameters._3D.operator_parallel}\n")
+
+                    if avg_cost is float("inf"):
+                        sys.exit(1)
+
+                    for _ in range(10):
+                        import gc
+                        gc.collect()
+
+                    break
+                
+                state, train_metric = p_train_step(state, batch, variables_dict)
+                train_metrics.append(train_metric)
+
+                if yml_config.training.gns_enabled:
+                    gns.update_state(state, train_metric)
+                    update_grad_params(train_metric)
+            
+                cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+
+                if dump_debug_info_train_step:
+                    dump_debug_info_train_step = False
+                    executable = p_train_step.get_last_executable()
+                    executable.sync()
+                    executable.dump_debug_info("alpa_debug_info")
+                    epochs.write(f"Initial compilation completed. "
+                                f"Time elapsed: {time.time() - train_start:.2f} s")
+                                
+                train_step_progress_bar.update(1)
+
+            if not profiling_enabled:
+                latency = time.time() - last_time
+                images_per_second = len(train_dataset) / latency
+                train_time += time.time() - train_start
+                last_time = time.time()
+
+                logger.info(f"train_loss: {train_metric['loss']}")
+                
+
+                train_step_progress_bar.close()
+                epochs.write(
+                    f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
+                    f" {train_metric['learning_rate']}), "
+                    f"Throughput: {images_per_second:.2f} images/s, "   
+                )
+                
+            
+
+                # # ======================== Evaluating ==============================
+                if yml_config.evaluation.enabled:
+                    pollux_agent.is_evaluating = True
+                    eval_metrics = []
+                    eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                    eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
+                    for batch in eval_loader:
+                        # Model forward
+                        metrics = p_eval_step(state.params, batch)
+                        eval_metrics.append(metrics)
+
+                        if dump_debug_info_eval_step:
+                            dump_debug_info_eval_step = False
+                            executable = p_eval_step.get_last_executable()
+                            executable.dump_debug_info("alpa_debug_info_eval")
+
+                        eval_step_progress_bar.update(1)
+
+                    # normalize eval metrics
+                    eval_metrics = alpa.util.get_metrics(eval_metrics)
+                    eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+
+                    logger.info(f"eval_loss: {eval_metrics['loss'].item()}")
+                    logger.info(f"eval_acc: {eval_metrics['accuracy'].item()}")
+                    
+                    wandb.log({
+                        "eval_loss": eval_metrics['loss'].item(),
+                        "eval_acc": eval_metrics['accuracy'].item(),
+                        "epoch": epoch
+                            })
+
+                    # Print metrics and update progress bar
+                    eval_step_progress_bar.close()
+                    desc = (
+                        f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {round(eval_metrics['loss'].item(), 4)} | "
+                        f"Eval Accuracy: {round(eval_metrics['accuracy'].item(), 4)})"
+                    )
+                    epochs.write(desc)
+                    epochs.desc = desc
+
+                    # Save metrics
+                    if has_tensorboard and jax.process_index() == 0:
+                        cur_step = epoch * (len(train_dataset) // train_batch_size)
+                        write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+
+                    # save checkpoint after each epoch and push checkpoint to the hub
+                    if jax.process_index() == 0:
+                        alpa.prefetch(state.params)
+                        params = alpa.util.map_to_nparray(state.params)
+                        model.save_pretrained(current_training_args.output_dir, params=params)
+                        if current_training_args.push_to_hub:
+                            repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                    pollux_agent.is_evaluating = False
 
 if __name__ == "__main__":
     main()
