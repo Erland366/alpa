@@ -7,6 +7,14 @@ from alpa.model.model_util import DynamicScale, TrainState
 from addict import Dict as AddictDict
 import numpy as np
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
+import sys
+import logging
+import yaml
+import os
+import datetime
+
+
+logger = logging.getLogger(__name__)
 
 def update_state_on_bs_change(state):
     if pollux_agent.last_state_retrieved_batch_size == pollux_agent.total_batch_size:
@@ -195,3 +203,28 @@ def do_reallocation(yml_config: AddictDict, p_train_step, variables_dict: dict, 
 
     # TODO: when changing how GNS is accessed/computed, do not forget to do the changes here too
     return state, materialized_variables_dict
+
+def dynp_profiling(yml_config: AddictDict):
+    if yml_config.training.gns_enabled:
+        alpa.shutdown()
+        raise Exception("GNS should be disabled to collect DynP profiling results")
+    dynp_results = alpa.get_last_dp_result()
+    logger.info(f"Retrieved best DynP results: {dynp_results}")
+    global_cluster = alpa.get_global_cluster()
+    host_num_devices = global_cluster.host_num_devices
+    devices_per_node, nodes = host_num_devices[0], len(host_num_devices)
+    dynp_dictionary = {
+        "devices_per_node": devices_per_node,
+        "nodes": nodes,
+        "forward_stage_layer_ids": dynp_results[1],
+        "submesh_physical_shapes": dynp_results[2],
+        "submesh_logical_shapes": dynp_results[3],
+        "submesh_autosharding_option_dicts": dynp_results[4],
+    }
+    os.makedirs(yml_config.dynp_profiling.save_dir, exist_ok=True)
+    dynp_save_path = os.path.join(yml_config.dynp_profiling.save_dir, f"dynp_results_{nodes}nodes_{devices_per_node}gpus_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.yml")
+    with open(dynp_save_path, 'w') as f:
+        yaml.dump(dynp_dictionary, f, default_flow_style=False)
+    logger.info(f"Saved DynP results to {dynp_save_path}")
+    alpa.shutdown()
+    sys.exit(1)

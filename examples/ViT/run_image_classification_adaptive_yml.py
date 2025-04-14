@@ -60,7 +60,7 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
+from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation, dynp_profiling
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -656,27 +656,8 @@ def main():
                 update_grad_params(train_metric)
         
             if yml_config.dynp_profiling.enabled and \
-                yml_config.training.parallel_method.method == "PipeshardParallel" and yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option == "auto":
-                dynp_results = alpa.get_last_dp_result()
-                logger.info(f"Retrieved best DynP results: {dynp_results}")
-                global_cluster = alpa.get_global_cluster()
-                host_num_devices = global_cluster.host_num_devices
-                devices_per_node, nodes = host_num_devices[0], len(host_num_devices)
-                dynp_dictionary = {
-                    "devices_per_node": devices_per_node,
-                    "nodes": nodes,
-                    "forward_stage_layer_ids": dynp_results[1],
-                    "submesh_physical_shapes": dynp_results[2],
-                    "submesh_logical_shapes": dynp_results[3],
-                    "submesh_autosharding_option_dicts": dynp_results[4],
-                }
-                os.makedirs(yml_config.dynp_profiling.save_dir, exist_ok=True)
-                dynp_save_path = os.path.join(yml_config.dynp_profiling.save_dir, f"dynp_results_{nodes}nodes_{devices_per_node}gpus_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.yml")
-                with open(dynp_save_path, 'w') as f:
-                    yaml.dump(dynp_dictionary, f, default_flow_style=False)
-                logger.info(f"Saved DynP results to {dynp_save_path}")
-                alpa.shutdown()
-                sys.exit(1)
+                    yml_config.training.parallel_method.method == "PipeshardParallel" and yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option == "auto":
+                dynp_profiling(yml_config)
         
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
