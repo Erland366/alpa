@@ -83,5 +83,9 @@ training:
         pipeline_parallel: 1
     num_micro_batches: 1
 
+dynp_profiling:
+  enabled: false
+  save_dir: ./dynp_profiling
+
 evaluation:
   enabled: false
