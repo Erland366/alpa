@@ -44,7 +44,8 @@ from alpa.pipeline_parallel.layer_construction import (manual_remat,
                                                        AutoLayerOption)
 from alpa.pipeline_parallel.stage_construction import (ManualStageOption,
                                                        AutoStageOption,
-                                                       UniformStageOption)
+                                                       UniformStageOption,
+                                                       get_last_dp_result)
 from alpa.shard_parallel.auto_sharding import AutoShardingOption
 from alpa.shard_parallel.manual_sharding import ManualShardingOption
 from alpa.serialization import save_checkpoint, restore_checkpoint
