@@ -224,6 +224,7 @@ def dynp_profiling(yml_config: AddictDict):
     os.makedirs(yml_config.dynp_profiling.save_dir, exist_ok=True)
     dynp_save_path = os.path.join(yml_config.dynp_profiling.save_dir, f"dynp_results_{nodes}nodes_{devices_per_node}gpus_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.yml")
     with open(dynp_save_path, 'w') as f:
+        # TODO: better format yaml
         yaml.dump(dynp_dictionary, f, default_flow_style=False)
     logger.info(f"Saved DynP results to {dynp_save_path}")
     alpa.shutdown()
