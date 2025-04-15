@@ -87,5 +87,13 @@ dynp_profiling:
   enabled: false
   save_dir: ./dynp_profiling
 
+profiling:
+  enabled: true
+  min_batch_size: 1
+  max_batch_size: null
+  warmup_steps: 10
+  profile_steps: 10
+  csv_path: ./profiling_results.csv
+
 evaluation:
   enabled: false

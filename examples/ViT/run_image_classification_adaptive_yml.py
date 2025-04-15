@@ -18,10 +18,13 @@ Pre-training/Fine-tuning ViT for image classification .
 Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
 https://huggingface.co/models?filter=vit
 """
+import sys
+
+sys.path.append(".")
+sys.path.append("..")
 
 import logging
 import os
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -70,7 +73,7 @@ import wandb
 import yaml
 from addict import Dict as AddictDict
 import argparse
-
+from utils import get_profiling_setup, reset_alpa_state, run_profile
 
 def parse_config_arg():
     parser = argparse.ArgumentParser(add_help=False)
@@ -302,6 +305,19 @@ def create_learning_rate_fn(
 def get_current_batch_size():
     return pollux_agent.total_batch_size
 
+def collate_fn(examples):
+    pixel_values = torch.stack([example[0] for example in examples])
+    labels = torch.tensor([example[1] for example in examples])
+
+    batch = {"pixel_values": pixel_values, "labels": labels}
+    batch = {k: v.numpy() for k, v in batch.items()}
+
+    return batch
+
+def loss_fn(logits, labels):
+    loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
+    return loss.mean()
+
 
 def main():
     
@@ -433,54 +449,104 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
         )
 
-    run = wandb.init(
-        # Set the project where this run will be logged
-        project=yml_config.wandb.project,
-        config={
-            "model_name_or_path": model_args.model_name_or_path,
-            "model_args": model_args,
-            "data_args": data_args,
-            "training_args": training_args,
-            "yml_config": yml_config,
-        },
-        save_code=yml_config.wandb.save_code,
-        mode=yml_config.wandb.mode,
+    profiling_config = yml_config.get("profiling", {})
+    profiling_enabled = profiling_config.get("enabled", False)
+    num_devices = alpa.get_global_num_devices()
+
+    batch_sizes_to_run = get_profiling_setup(
+        profiling_enabled=profiling_enabled,
+        yml_config=yml_config,
+        training_args=training_args,
     )
-    run.log_code(
-                    os.path.dirname(os.path.dirname(alpa.__file__)),
-                    exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
-                    )
 
-    # Store some constant
-    num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = int(training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
-    eval_batch_size = int(training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
-    steps_per_epoch = len(train_dataset) // train_batch_size
-    total_train_steps = steps_per_epoch * num_epochs
-    count = training_args.count
-    scale = training_args.scale
-    theta = training_args.smoothing * scale
+    for i_run, current_total_batch_size in enumerate(batch_sizes_to_run): 
+        logger.info(f"Resetting AdaptDL epoch state for profiling batch size {current_total_batch_size}")
+        reset_alpa_state()
+        
+        current_local_batch_size = current_total_batch_size // num_devices
+        current_training_args = TrainingArguments(**asdict(training_args))
+        current_training_args.per_device_train_batch_size = current_local_batch_size
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example[0] for example in examples])
-        labels = torch.tensor([example[1] for example in examples])
+        if profiling_enabled:
+            logger.info(f"Running profiling with global batch size: {current_total_batch_size}")
+            logger.info(f"Running profiling with local batch size: {current_local_batch_size}")
+            current_training_args.num_train_epochs = 3
+            current_training_args.do_eval = False
 
-        batch = {"pixel_values": pixel_values, "labels": labels}
-        batch = {k: v.numpy() for k, v in batch.items()}
+        yml_config.dataloader.train.init_local_batch_size = current_local_batch_size
+        yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size = current_total_batch_size
 
-        return batch
+        run = wandb.init(
+            # Set the project where this run will be logged
+            project=yml_config.wandb.project,
+            config={
+                "model_name_or_path": model_args.model_name_or_path,
+                "model_args": model_args,
+                "data_args": data_args,
+                "training_args": training_args,
+                "yml_config": yml_config,
+            },
+            save_code=yml_config.wandb.save_code,
+            mode=yml_config.wandb.mode,
+        )
+        run.log_code(
+            os.path.dirname(os.path.dirname(alpa.__file__)),
+            exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("third_party/")
+        )
 
-    pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
+        # Store some constant
+        num_epochs = int(current_training_args.num_train_epochs)
+        train_batch_size = int(current_training_args.per_device_train_batch_size) * alpa.get_global_num_devices()
+        eval_batch_size = int(current_training_args.per_device_eval_batch_size) * alpa.get_global_num_devices()
+        steps_per_epoch = len(train_dataset) // train_batch_size
+        total_train_steps = steps_per_epoch * num_epochs
+        count = current_training_args.count
+        scale = current_training_args.scale
+        theta = current_training_args.smoothing * scale
 
-    # Set regression coefficients if specified in the config
-    fix_regressors(yml_config)
 
-    # Create data loaders
-    if not yml_config.dataloader.train.adaptive_data_loader.enabled:
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=train_batch_size,
-            shuffle=yml_config.dataloader.train.shuffle,
+        pollux_agent.preset_batch_size(train_batch_size, train_batch_size, len(train_dataset))
+
+        # Set regression coefficients if specified in the config
+        fix_regressors(yml_config)
+
+        # Create data loaders
+        if not yml_config.dataloader.train.adaptive_data_loader.enabled:
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=train_batch_size,
+                shuffle=yml_config.dataloader.train.shuffle,
+                num_workers=data_args.preprocessing_num_workers,
+                persistent_workers=yml_config.dataloader.train.persistent_workers,
+                drop_last=True,
+                collate_fn=collate_fn,
+            )
+        else:
+            train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
+                dataset=train_dataset,
+                batch_size=train_batch_size,
+                shuffle=yml_config.dataloader.train.shuffle, # TODO: handle shuffle=True
+                collate_fn=collate_fn,
+                num_workers=data_args.preprocessing_num_workers,
+                persistent_workers=yml_config.dataloader.train.persistent_workers,
+                drop_last=True,
+            )
+            if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
+                train_loader.autoscale_batch_size(
+                    max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
+                    local_bsz_bounds=(
+                        train_batch_size // alpa.get_global_num_devices() if 
+                        yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
+                        else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
+                        yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max
+                    ), 
+                    gradient_accumulation=False
+                )
+
+        eval_loader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=eval_batch_size,
+            shuffle=yml_config.dataloader.eval.shuffle,
             num_workers=data_args.preprocessing_num_workers,
             persistent_workers=yml_config.dataloader.train.persistent_workers,
             drop_last=True,
@@ -741,9 +807,6 @@ def main():
                 if training_args.push_to_hub:
                     repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
             pollux_agent.is_evaluating = False
-
-    
-
 
 if __name__ == "__main__":
     main()
