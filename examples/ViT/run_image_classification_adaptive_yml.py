@@ -455,6 +455,7 @@ def main():
 
     batch_sizes_to_run = get_profiling_setup(
         profiling_enabled=profiling_enabled,
+        profiling_config=profiling_config,
         yml_config=yml_config,
         training_args=training_args,
     )
@@ -552,261 +553,242 @@ def main():
             drop_last=True,
             collate_fn=collate_fn,
         )
-    else:
-        train_loader = alpa.adaptdl.dataloader.AdaptiveDataLoader(
-            dataset=train_dataset,
-            batch_size=train_batch_size,
-            shuffle=yml_config.dataloader.train.shuffle, # TODO: handle shuffle=True
-            collate_fn=collate_fn,
-            num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=yml_config.dataloader.train.persistent_workers,
-            drop_last=True,
-        )
-        if yml_config.dataloader.train.adaptive_data_loader.autoscaler.enabled:
-            train_loader.autoscale_batch_size(max_batch_size = yml_config.dataloader.train.adaptive_data_loader.autoscaler.max_total_batch_size, 
-                                                local_bsz_bounds=(train_batch_size // alpa.get_global_num_devices() if 
-                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min_is_init_bs
-                                                                  else yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.min, 
-                                                                  yml_config.dataloader.train.adaptive_data_loader.autoscaler.local_bsz_bounds.max), 
-                                                gradient_accumulation=False)
 
-    eval_loader = torch.utils.data.DataLoader(
-       eval_dataset,
-       batch_size=eval_batch_size,
-       shuffle=yml_config.dataloader.eval.shuffle,
-       num_workers=data_args.preprocessing_num_workers,
-       persistent_workers=True,
-       drop_last=True,
-       collate_fn=collate_fn,
-    )
+        # Enable tensorboard only on the master node
+        has_tensorboard = is_tensorboard_available()
+        if has_tensorboard and jax.process_index() == 0:
+            try:
+                from flax.metrics.tensorboard import SummaryWriter
 
-    # Enable tensorboard only on the master node
-    has_tensorboard = is_tensorboard_available()
-    if has_tensorboard and jax.process_index() == 0:
-        try:
-            from flax.metrics.tensorboard import SummaryWriter
-
-            summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir))
-        except ImportError as ie:
-            has_tensorboard = False
+                summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir))
+            except ImportError as ie:
+                has_tensorboard = False
+                logger.warning(
+                    f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
+                )
+        else:
             logger.warning(
-                f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
+                "Unable to display metrics through TensorBoard because the package is not installed: "
+                "Please run pip install tensorboard to enable."
             )
-    else:
-        logger.warning(
-            "Unable to display metrics through TensorBoard because the package is not installed: "
-            "Please run pip install tensorboard to enable."
+
+        # Initialize our training
+        rng = jax.random.PRNGKey(training_args.seed)
+        rng, dropout_rng = jax.random.split(rng)
+
+        # Create learning rate schedule
+        linear_decay_lr_schedule_fn = create_learning_rate_fn(
+            len(train_dataset),
+            train_batch_size,
+            training_args.num_train_epochs,
+            training_args.warmup_steps,
+            training_args.learning_rate,
         )
 
-    # Initialize our training
-    rng = jax.random.PRNGKey(training_args.seed)
-    rng, dropout_rng = jax.random.split(rng)
+        scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
 
-    # Create learning rate schedule
-    linear_decay_lr_schedule_fn = create_learning_rate_fn(
-        len(train_dataset),
-        train_batch_size,
-        training_args.num_train_epochs,
-        training_args.warmup_steps,
-        training_args.learning_rate,
-    )
+        # create adam optimizer
+        adamw = optax.adamw(
+            learning_rate=scaled_learning_rate_fn,
+            b1=training_args.adam_beta1,
+            b2=training_args.adam_beta2,
+            eps=training_args.adam_epsilon,
+            weight_decay=training_args.weight_decay,
+        )
 
-    scaled_learning_rate_fn = get_scaled_learning_rate_fn(yml_config, linear_decay_lr_schedule_fn)
+        # Setup train state
+        state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
+        gns.initialize_gns(state=state, 
+                        init_bsz=train_batch_size, 
+                        num_workers=alpa.get_global_num_devices(), 
+                        store_grads=jnp.array(0.),
+                        count=count,
+                        scale=scale,
+                        theta=theta)
+        
+        # Define gradient update step fn
+        def train_step(state, batch, variables: Dict):
 
-    # create adam optimizer
-    adamw = optax.adamw(
-        learning_rate=scaled_learning_rate_fn,
-        b1=training_args.adam_beta1,
-        b2=training_args.adam_beta2,
-        eps=training_args.adam_epsilon,
-        weight_decay=training_args.weight_decay,
-    )
+            def compute_loss(params):
+                labels = batch.pop("labels")
+                logits = state.apply_fn(**batch, params=params, train=True)[0]
+                loss = loss_fn(logits, labels)
+                return loss
+            
+            grad_fn = alpa.value_and_grad(compute_loss)
+            loss, grad = grad_fn(state.params)
+            new_state = state.apply_gradients(grads=grad)
 
-    # Setup train state
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dynamic_scale=None)
-    gns.initialize_gns(state=state, 
-                       init_bsz=train_batch_size, 
-                       num_workers=alpa.get_global_num_devices(), 
-                       store_grads=jnp.array(0.),
-                       count=count,
-                       scale=scale,
-                       theta=theta)
-    
-    def loss_fn(logits, labels):
-        loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
-        return loss.mean()
+            metrics = {
+                "loss": loss, 
+                "learning_rate": scaled_learning_rate_fn(state.step),
+            }
 
-    # Define gradient update step fn
-    def train_step(state, batch, variables: Dict):
+            if yml_config.training.gns_enabled:
+                gradients = get_mean_leaves(grad)
+                gns_dict = compute_gradient_noise_scale(variables, gradients)
+                metrics.update(gns_dict)
 
-        def compute_loss(params):
+            return new_state, metrics
+
+        # Define eval fn
+        def eval_step(params, batch):
             labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, train=True)[0]
+            logits = model(**batch, params=params, train=False)[0]
             loss = loss_fn(logits, labels)
-            return loss
+
+            # summarize metrics
+            accuracy = (jnp.argmax(logits, axis=-1) == labels).mean()
+            metrics = {"loss": loss, "accuracy": accuracy}
+            return metrics
+
+        method = get_parallel_method(yml_config)
+
+        p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
+        p_eval_step = alpa.parallelize(eval_step)
+        dump_debug_info_train_step = dump_debug_info_eval_step = True
+
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {len(train_dataset)}")
+        logger.info(f"  Num Epochs = {num_epochs}")
+        logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
+        logger.info(f"  Total optimization steps = {total_train_steps}")
         
-        grad_fn = alpa.value_and_grad(compute_loss)
-        loss, grad = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grad)
+        logger.info(f"Number of parameters - {count_params(model.params)}")
 
-        metrics = {
-            "loss": loss, 
-            "learning_rate": scaled_learning_rate_fn(state.step),
-        }
-
-        if yml_config.training.gns_enabled:
-            gradients = get_mean_leaves(grad)
-            gns_dict = compute_gradient_noise_scale(variables, gradients)
-            metrics.update(gns_dict)
-
-        return new_state, metrics
-
-    # Define eval fn
-    def eval_step(params, batch):
-        labels = batch.pop("labels")
-        logits = model(**batch, params=params, train=False)[0]
-        loss = loss_fn(logits, labels)
-
-        # summarize metrics
-        accuracy = (jnp.argmax(logits, axis=-1) == labels).mean()
-        metrics = {"loss": loss, "accuracy": accuracy}
-        return metrics
-
-    method = get_parallel_method(yml_config)
-
-    p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step)
-    dump_debug_info_train_step = dump_debug_info_eval_step = True
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {num_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
-    logger.info(f"  Total optimization steps = {total_train_steps}")
-    
-    logger.info(f"Number of parameters - {count_params(model.params)}")
-
-    train_time = 0
-    last_time = time.time()
-    epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
-
-    variables_dict = None
-
-    for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
-        # ======================== Training ================================
-        
-        train_start = time.time()
-
-        # Create sampling rng
-        rng, input_rng = jax.random.split(rng)
-        train_metrics = []
-
-        steps_per_epoch = len(train_dataset) // train_batch_size
-        train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
-        # train
-        for step, batch in enumerate(train_loader):
-
-            if yml_config.training.gns_enabled:
-                variables_dict = gns.construct_gns_dict()
-
-            if pollux_agent.reallocation_approaching:
-                state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
-                continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
-            
-            state, train_metric = p_train_step(state, batch, variables_dict)
-            train_metrics.append(train_metric)
-
-            if yml_config.training.gns_enabled:
-                gns.update_state(state, train_metric)
-                update_grad_params(train_metric)
-        
-            if yml_config.dynp_profiling.enabled and \
-                    yml_config.training.parallel_method.method == "PipeshardParallel" and yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option == "auto":
-                dynp_profiling(yml_config)
-        
-            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
-
-            if dump_debug_info_train_step:
-                dump_debug_info_train_step = False
-                executable = p_train_step.get_last_executable()
-                executable.sync()
-                executable.dump_debug_info("alpa_debug_info")
-                epochs.write(f"Initial compilation completed. "
-                             f"Time elapsed: {time.time() - train_start:.2f} s")
-                             
-            train_step_progress_bar.update(1)
-
-        latency = time.time() - last_time
-        images_per_second = len(train_dataset) / latency
-        train_time += time.time() - train_start
+        train_time = 0
         last_time = time.time()
+        epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
 
-        logger.info(f"train_loss: {train_metric['loss']}")
-        
+        variables_dict = None
 
-        train_step_progress_bar.close()
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
-            f" {train_metric['learning_rate']}), "
-            f"Throughput: {images_per_second:.2f} images/s, "   
-        )
-        
-    
-
-        # # ======================== Evaluating ==============================
-        if yml_config.evaluation.enabled:
-            pollux_agent.is_evaluating = True
-            eval_metrics = []
-            eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
-            eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
-            for batch in eval_loader:
-                # Model forward
-                metrics = p_eval_step(state.params, batch)
-                eval_metrics.append(metrics)
-
-                if dump_debug_info_eval_step:
-                    dump_debug_info_eval_step = False
-                    executable = p_eval_step.get_last_executable()
-                    executable.dump_debug_info("alpa_debug_info_eval")
-
-                eval_step_progress_bar.update(1)
-
-            # normalize eval metrics
-            eval_metrics = alpa.util.get_metrics(eval_metrics)
-            eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
-
-            logger.info(f"eval_loss: {eval_metrics['loss'].item()}")
-            logger.info(f"eval_acc: {eval_metrics['accuracy'].item()}")
+        for epoch in alpa.adaptdl.epoch.remaining_epochs_until(num_epochs):
+            # ======================== Training ================================
             
-            wandb.log({
-                "eval_loss": eval_metrics['loss'].item(),
-                "eval_acc": eval_metrics['accuracy'].item(),
-                "epoch": epoch
-                       })
+            train_start = time.time()
 
-            # Print metrics and update progress bar
-            eval_step_progress_bar.close()
-            desc = (
-                f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {round(eval_metrics['loss'].item(), 4)} | "
-                f"Eval Accuracy: {round(eval_metrics['accuracy'].item(), 4)})"
+            # Create sampling rng
+            rng, input_rng = jax.random.split(rng)
+            train_metrics = []
+
+            steps_per_epoch = len(train_dataset) // train_batch_size
+            train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
+            # train
+            for step, batch in enumerate(train_loader):
+
+                if yml_config.training.gns_enabled:
+                    variables_dict = gns.construct_gns_dict()
+
+                if pollux_agent.reallocation_approaching:
+                    state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
+                    continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
+
+                if profiling_enabled:
+                    run_profile(
+                        p_train_step=p_train_step,
+                        state=state,
+                        batch=batch,
+                        variables_dict=variables_dict,
+                        i_run=i_run,
+                        epoch=epoch,
+                        current_total_batch_size=current_total_batch_size,
+                        yml_config=yml_config
+                    )
+                    break
+                
+                state, train_metric = p_train_step(state, batch, variables_dict)
+                train_metrics.append(train_metric)
+
+                if yml_config.training.gns_enabled:
+                    gns.update_state(state, train_metric)
+                    update_grad_params(train_metric)
+            
+                if yml_config.dynp_profiling.enabled and \
+                        yml_config.training.parallel_method.method == "PipeshardParallel" and yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option == "auto":
+                    dynp_profiling(yml_config)
+            
+                cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+
+                if dump_debug_info_train_step:
+                    dump_debug_info_train_step = False
+                    executable = p_train_step.get_last_executable()
+                    executable.sync()
+                    executable.dump_debug_info("alpa_debug_info")
+                    epochs.write(f"Initial compilation completed. "
+                                f"Time elapsed: {time.time() - train_start:.2f} s")
+                                
+                train_step_progress_bar.update(1)
+
+        if not profiling_enabled:
+            latency = time.time() - last_time
+            images_per_second = len(train_dataset) / latency
+            train_time += time.time() - train_start
+            last_time = time.time()
+
+            logger.info(f"train_loss: {train_metric['loss']}")
+            
+
+            train_step_progress_bar.close()
+            epochs.write(
+                f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate:"
+                f" {train_metric['learning_rate']}), "
+                f"Throughput: {images_per_second:.2f} images/s, "   
             )
-            epochs.write(desc)
-            epochs.desc = desc
+            
+        
+            if yml_config.evaluation.enabled:
+                pollux_agent.is_evaluating = True
+                eval_metrics = []
+                eval_steps = max(len(eval_dataset) // eval_batch_size, 1)
+                eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
+                for batch in eval_loader:
+                    # Model forward
+                    metrics = p_eval_step(state.params, batch)
+                    eval_metrics.append(metrics)
 
-            # Save metrics
-            if has_tensorboard and jax.process_index() == 0:
-                cur_step = epoch * (len(train_dataset) // train_batch_size)
-                write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+                    if dump_debug_info_eval_step:
+                        dump_debug_info_eval_step = False
+                        executable = p_eval_step.get_last_executable()
+                        executable.dump_debug_info("alpa_debug_info_eval")
 
-            # save checkpoint after each epoch and push checkpoint to the hub
-            if jax.process_index() == 0:
-                alpa.prefetch(state.params)
-                params = alpa.util.map_to_nparray(state.params)
-                model.save_pretrained(training_args.output_dir, params=params)
-                if training_args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
-            pollux_agent.is_evaluating = False
+                    eval_step_progress_bar.update(1)
+
+                # normalize eval metrics
+                eval_metrics = alpa.util.get_metrics(eval_metrics)
+                eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+
+                logger.info(f"eval_loss: {eval_metrics['loss'].item()}")
+                logger.info(f"eval_acc: {eval_metrics['accuracy'].item()}")
+                
+                wandb.log({
+                    "eval_loss": eval_metrics['loss'].item(),
+                    "eval_acc": eval_metrics['accuracy'].item(),
+                    "epoch": epoch
+                        })
+
+                # Print metrics and update progress bar
+                eval_step_progress_bar.close()
+                desc = (
+                    f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {round(eval_metrics['loss'].item(), 4)} | "
+                    f"Eval Accuracy: {round(eval_metrics['accuracy'].item(), 4)})"
+                )
+                epochs.write(desc)
+                epochs.desc = desc
+
+                # Save metrics
+                if has_tensorboard and jax.process_index() == 0:
+                    cur_step = epoch * (len(train_dataset) // train_batch_size)
+                    write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+
+                # save checkpoint after each epoch and push checkpoint to the hub
+                if jax.process_index() == 0:
+                    alpa.prefetch(state.params)
+                    params = alpa.util.map_to_nparray(state.params)
+                    model.save_pretrained(training_args.output_dir, params=params)
+                    if training_args.push_to_hub:
+                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                pollux_agent.is_evaluating = False
 
 if __name__ == "__main__":
     main()
