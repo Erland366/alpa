@@ -694,8 +694,6 @@ def main():
             state, train_metric = p_train_step(state, batch, variables_dict)
             train_metrics.append(train_metric)
 
-            p_train_step.get
-
             if yml_config.training.gns_enabled:
                 gns.update_state(state, train_metric)
                 update_grad_params(train_metric)
