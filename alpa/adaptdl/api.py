@@ -7,6 +7,7 @@ from alpa.model.model_util import DynamicScale, TrainState
 from addict import Dict as AddictDict
 import numpy as np
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
+import jax
 import sys
 import logging
 import yaml
@@ -393,9 +394,22 @@ def run_profile(
     logger.info(f"Average cost: {avg_cost}")
     logger.info(f"Memory usage: {mem_gb} GB")
 
+    global_cluster = alpa.get_global_cluster()
+    host_num_devices = global_cluster.host_num_devices
+    devices_per_node, nodes = host_num_devices[0], len(host_num_devices)
+    filename = (
+        f"csv_results_{nodes}"
+        f"nodes_{devices_per_node}"
+        f"gpus_{yml_config.dataloader.train.init_local_batch_size}"
+        f"localbsz_{yml_config.training.parallel_method.num_micro_batches}"
+        f"microbatches.csv"
+    )
+    os.makedirs(yml_config.profiling.csv_dir, exist_ok=True)
+    csv_save_path = os.path.join(yml_config.profiling.csv_dir, filename)
+
     if jax.process_index() == 0:
-        with open(yml_config.profiling.csv_path, "a") as f:
-            if os.stat(yml_config.profiling.csv_path).st_size == 0:
+        with open(csv_save_path, "a") as f:
+            if os.stat(csv_save_path).st_size == 0:
                 f.write("run,epoch,batch_size,avg_cost,mem_gb,model_name,strategy,dp,pp,tp\n")
             f.write(f"{i_run},{epoch},{current_total_batch_size},{avg_cost},{mem_gb},"
                     f"{yml_config.model_name_or_path},{yml_config.training.parallel_method.method},"

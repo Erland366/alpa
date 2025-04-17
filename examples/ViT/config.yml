@@ -70,7 +70,7 @@ training:
     enabled: true
     type: sqrt # linear, sqrt
   parallel_method:
-    method: DynP # DataParallel, ShardParallel, PipeshardParallel, 3D, DynP, DynPsingle
+    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D, DynP, DynPsingle
     parameters:
       DataParallel:
       ShardParallel:
@@ -98,7 +98,7 @@ profiling:
   warmup_steps: 10
   profile_steps: 10
   repeat_profile_steps: 3
-  csv_path: ./profiling_results.csv
+  csv_dir: ./profiling_results
 
 evaluation:
   enabled: false

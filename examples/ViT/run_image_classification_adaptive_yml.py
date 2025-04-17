@@ -60,7 +60,19 @@ from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
 #import numpy as np
 from alpa.adaptdl.pollux_agent import pollux_agent
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation, dynp_profiling, get_profiling_setup, run_profile, execute_profiling_trials
+from alpa.adaptdl.api import (
+    update_state_on_bs_change,
+    create_scaled_lr_fn,
+    reallocate_and_update_state,
+    fix_regressors,
+    get_scaled_learning_rate_fn,
+    get_parallel_method,
+    do_reallocation,
+    dynp_profiling,
+    get_profiling_setup,
+    run_profile,
+    execute_profiling_trials
+)
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
