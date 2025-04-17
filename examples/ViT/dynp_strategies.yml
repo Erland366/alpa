@@ -17,7 +17,7 @@
       - 1
       - 1
 - nodes: 1
-  devices_per_node: 4
+  devices_per_node: 2
   config:
     devices_per_node: 2
     forward_stage_layer_ids:
