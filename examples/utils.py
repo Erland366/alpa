@@ -977,6 +977,7 @@ def run_profile(
     current_total_batch_size: int,
     yml_config: Dict[str, str],
 ):
+    print("Running profiling...")
     executable = p_train_step.get_executable(state, batch, variables_dict)
     executable.sync()
 
@@ -1002,7 +1003,7 @@ def run_profile(
                     f"{yml_config.training.parallel_method.parameters._3D.data_parallel},{yml_config.training.parallel_method.parameters._3D.operator_parallel},"
                     f"{yml_config.training.parallel_method.parameters._3D.operator_parallel}\n")
 
-    if avg_cost is float("inf"):
+    if avg_cost == float("inf"):
         sys.exit(1)
 
     for _ in range(10):

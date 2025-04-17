@@ -97,6 +97,7 @@ profiling:
   max_batch_size: null
   warmup_steps: 10
   profile_steps: 10
+  repeat_profile_steps: 3
   csv_path: ./profiling_results.csv
 
 evaluation:
