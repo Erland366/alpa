@@ -627,8 +627,8 @@ def main():
         metrics = {"loss": loss, "accuracy": accuracy}
         return metrics
 
-    # method = get_parallel_method(yml_config)
-    method = alpa.parallel_method.DataParallel()
+    method = get_parallel_method(yml_config)
+    # method = alpa.parallel_method.DataParallel()
         
 
     p_train_step = alpa.parallelize(train_step, method=method, donate_argnums=(0,))
