@@ -596,8 +596,13 @@ class AdaptiveDataLoader(DataLoader, AdaptiveDataLoaderMixin):
                 self.sampler.set_epoch(
                     epoch, index=self._elastic.current_index)
                 
-                self.batch_sampler.batch_size = (self._elastic._sync_local_bsz(epoch)) * get_num_workers()
-                self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
+                if pollux_agent.force_dataloader_localbatchsize == -1:
+                    self.batch_sampler.batch_size = (self._elastic._sync_local_bsz(epoch)) * get_num_workers()
+                    self.batch_sampler.batch_size = int(jax.device_get(self.batch_sampler.batch_size).item()) if isinstance(self.batch_sampler.batch_size, jnp.DeviceArray) else self.batch_sampler.batch_size
+                else:
+                    self.batch_sampler.batch_size = pollux_agent.force_dataloader_localbatchsize * get_num_workers()
+                    pollux_agent.total_batch_size = self.batch_sampler.batch_size
+                    pollux_agent.force_dataloader_localbatchsize = -1
                 bs_changed = False
                 
                 LOG.info(f"selected Batch size - {self.batch_sampler.batch_size} at EPOCH: {epoch}")

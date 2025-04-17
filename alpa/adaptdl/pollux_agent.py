@@ -51,7 +51,7 @@ class PolluxAgent:
 
         self.config_t_iter = defaultdict(list) # dictionary of config : T_iter (from self.get_current_config())
         
-        self.periodic_bs_sync_enabled = True
+        self.periodic_bs_sync_enabled = False
         self.bs_sync_starttime = None
         self.bs_sync_interval = 30 # seconds
 
@@ -68,6 +68,7 @@ class PolluxAgent:
         self.job_id = None
         self.reallocation_approaching = False
         self.update_dataloader_batchsize = False
+        self.force_dataloader_localbatchsize = -1 # local batch size to be forced when self.update_dataloader_batchsize is True
 
         self.p_train_step = None
 

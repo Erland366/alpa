@@ -2,7 +2,7 @@ from alpa.adaptdl.pollux_agent import pollux_agent
 from alpa.adaptdl.scaling_rules import ScalingRuleBase
 import alpa
 from jax.tree_util import tree_flatten, tree_unflatten, PyTreeDef
-from typing import Callable, Optional
+from typing import Callable, Optional, List, Dict, Any
 from alpa.model.model_util import DynamicScale, TrainState
 from addict import Dict as AddictDict
 import numpy as np
@@ -151,6 +151,33 @@ def get_parallel_method(yml_config: AddictDict):
                                              data_parallel=yml_config.training.parallel_method.parameters._3D.data_parallel,
                                              operator_parallel=yml_config.training.parallel_method.parameters._3D.operator_parallel,
                                              pipeline_parallel=yml_config.training.parallel_method.parameters._3D.pipeline_parallel)
+    elif yml_config.training.parallel_method.method == 'DynP':
+        dynp_strategies_dict = load_yaml_full_loader(yml_config, yml_config.training.parallel_method.parameters.DynP.dynp_manualstages_yml_path)
+        global_cluster = alpa.get_global_cluster()
+        host_num_devices = global_cluster.host_num_devices
+        devices_per_node, nodes = host_num_devices[0], len(host_num_devices)
+        manual_stage_params_dict = find_config(dynp_strategies_dict, nodes, devices_per_node)
+        manual_stage_option = alpa.ManualStageOption(
+            forward_stage_layer_ids=manual_stage_params_dict["forward_stage_layer_ids"],
+            submesh_physical_shapes=manual_stage_params_dict["submesh_physical_shapes"],
+            submesh_logical_shapes=manual_stage_params_dict["submesh_logical_shapes"],
+            submesh_autosharding_option_dicts=manual_stage_params_dict["submesh_autosharding_option_dicts"],
+        )
+        method = alpa.PipeshardParallel(stage_option=manual_stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
+    elif yml_config.training.parallel_method.method == 'DynPsingle':
+        manual_stage_params_dict = load_yaml_full_loader(yml_config, yml_config.training.parallel_method.parameters.DynPsingle.manualstage_yml_path)
+        global_cluster = alpa.get_global_cluster()
+        host_num_devices = global_cluster.host_num_devices
+        devices_per_node, nodes = host_num_devices[0], len(host_num_devices)
+        if (nodes, devices_per_node) != (manual_stage_params_dict["nodes"], manual_stage_params_dict["devices_per_node"]):
+            raise Exception(f"Number of nodes/devices in DynP YAML ({manual_stage_params_dict['nodes']}, {manual_stage_params_dict['devices_per_node']}) does not match current cluster ({nodes}, {devices_per_node})")
+        manual_stage_option = alpa.ManualStageOption(
+            forward_stage_layer_ids=manual_stage_params_dict["forward_stage_layer_ids"],
+            submesh_physical_shapes=manual_stage_params_dict["submesh_physical_shapes"],
+            submesh_logical_shapes=manual_stage_params_dict["submesh_logical_shapes"],
+            submesh_autosharding_option_dicts=manual_stage_params_dict["submesh_autosharding_option_dicts"],
+        )
+        method = alpa.PipeshardParallel(stage_option=manual_stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
     else:
         method = alpa.DataParallel()
     
@@ -222,9 +249,39 @@ def dynp_profiling(yml_config: AddictDict):
         "submesh_autosharding_option_dicts": dynp_results[4],
     }
     os.makedirs(yml_config.dynp_profiling.save_dir, exist_ok=True)
-    dynp_save_path = os.path.join(yml_config.dynp_profiling.save_dir, f"dynp_results_{nodes}nodes_{devices_per_node}gpus_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.yml")
+    filename = (
+        f"dynp_results_{nodes}"
+        f"nodes_{devices_per_node}"
+        f"gpus_{yml_config.dataloader.train.init_local_batch_size}"
+        f"localbsz_{yml_config.training.parallel_method.num_micro_batches}"
+        f"microbatches_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.yml"
+    )
+    dynp_save_path = os.path.join(yml_config.dynp_profiling.save_dir, filename)
     with open(dynp_save_path, 'w') as f:
+        # TODO: better format yaml
         yaml.dump(dynp_dictionary, f, default_flow_style=False)
     logger.info(f"Saved DynP results to {dynp_save_path}")
     alpa.shutdown()
     sys.exit(1)
+
+def load_yaml_full_loader(yml_config: AddictDict, path):
+    """
+    Load a DynP profiling YAML (dumped with python/tuple tags) and return
+    an AddictDict with exactly the same nested types dumped previously:
+      - forward_stage_layer_ids as List[List[int]]
+      - submesh_physical_shapes as List[Tuple[int, ...]]
+      - submesh_logical_shapes as List[Tuple[int, ...]]
+      - submesh_autosharding_option_dicts as List[Dict[str, Any]]
+    """
+    with open(path, 'r') as f:
+        data = yaml.load(f, Loader=yaml.FullLoader)
+
+    return data
+
+def find_config(configs: List[Dict[str, Any]], nodes: int, devices_per_node: int) -> Dict[str, Any]:
+    """Find a specific configuration by nodes and devices_per_node."""
+    for item in configs:
+        if item['nodes'] == nodes and item['devices_per_node'] == devices_per_node:
+            return item['config']
+    
+    raise ValueError(f"No configuration found for nodes={nodes}, devices_per_node={devices_per_node}")

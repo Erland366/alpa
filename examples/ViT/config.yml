@@ -51,7 +51,7 @@ dataloader:
           min_is_init_bs: true
           min: 32
           max: 150
-    init_local_batch_size: 32
+    init_local_batch_size: 64
     shuffle: true
     preprocessing_num_workers: 32
     persistent_workers: true
@@ -70,17 +70,21 @@ training:
     enabled: true
     type: sqrt # linear, sqrt
   parallel_method:
-    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
+    method: DynP # DataParallel, ShardParallel, PipeshardParallel, 3D, DynP, DynPsingle
     parameters:
       DataParallel:
       ShardParallel:
       PipeshardParallel:
-        stage_option: uniform # uniform, auto
+        stage_option: auto # uniform, auto
         # num stages?
       _3D:
         data_parallel: -1
         operator_parallel: 1
         pipeline_parallel: 1
+      DynP:
+        dynp_manualstages_yml_path: dynp_strategies.yml
+      DynPsingle:
+        manualstage_yml_path: dynp_profiling/dynp_results_1nodes_1gpus_64localbsz_1microbatches_20250417_103259.yml
     num_micro_batches: 1
 
 dynp_profiling:
