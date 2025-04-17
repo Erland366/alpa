@@ -401,7 +401,6 @@ def run_profile(
         f"csv_results_{nodes}"
         f"nodes_{devices_per_node}"
         f"gpus_{yml_config.dataloader.train.init_local_batch_size}"
-        f"localbsz_{yml_config.training.parallel_method.num_micro_batches}"
         f"microbatches.csv"
     )
     os.makedirs(yml_config.profiling.csv_dir, exist_ok=True)
