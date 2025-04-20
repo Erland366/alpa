@@ -236,6 +236,12 @@ def do_reallocation(yml_config: AddictDict, p_train_step, variables_dict: dict, 
     return state, materialized_variables_dict
 
 def dynp_profiling(yml_config: AddictDict):
+    if not (yml_config.training.parallel_method.method == "PipeshardParallel" and yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option == "auto"):
+        alpa.shutdown()
+        raise Exception("DynP profiling is only available for PipeshardParallel with auto stage option")
+    if yml_config.profiling.enabled:
+        alpa.shutdown()
+        raise Exception("Throughput profiling should be DISABLED to collect DynP profiling results")
     if yml_config.training.gns_enabled:
         alpa.shutdown()
         raise Exception("GNS should be disabled to collect DynP profiling results")

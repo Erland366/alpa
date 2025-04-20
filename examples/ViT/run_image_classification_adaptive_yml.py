@@ -684,8 +684,7 @@ def main():
                 gns.update_state(state, train_metric)
                 update_grad_params(train_metric)
         
-            if yml_config.dynp_profiling.enabled and \
-                    yml_config.training.parallel_method.method == "PipeshardParallel" and yml_config.training.parallel_method.parameters.PipeshardParallel.stage_option == "auto":
+            if yml_config.dynp_profiling.enabled:
                 dynp_profiling(yml_config)
         
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
