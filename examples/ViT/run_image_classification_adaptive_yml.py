@@ -674,7 +674,7 @@ def main():
                 continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
 
             if yml_config.profiling.get("enabled", False):
-                i_run = execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config)
+                state = execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config)
                 continue
             
             state, train_metric = p_train_step(state, batch, variables_dict)

@@ -13,9 +13,11 @@ import logging
 import yaml
 import os
 import datetime
+import time
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
 
 def update_state_on_bs_change(state):
     if pollux_agent.last_state_retrieved_batch_size == pollux_agent.total_batch_size:
@@ -165,6 +167,7 @@ def get_parallel_method(yml_config: AddictDict):
             submesh_autosharding_option_dicts=manual_stage_params_dict["submesh_autosharding_option_dicts"],
         )
         method = alpa.PipeshardParallel(stage_option=manual_stage_option, num_micro_batches=yml_config.training.parallel_method.num_micro_batches)
+        # TODO: degenerate to 3D if list forward_stage_layer_ids has one element
     elif yml_config.training.parallel_method.method == 'DynPsingle':
         manual_stage_params_dict = load_yaml_full_loader(yml_config, yml_config.training.parallel_method.parameters.DynPsingle.manualstage_yml_path)
         global_cluster = alpa.get_global_cluster()
@@ -289,7 +292,7 @@ def find_config(configs: List[Dict[str, Any]], nodes: int, devices_per_node: int
 
 def get_profiling_setup(
     profiling_enabled: bool, 
-    profiling_config: Dict[str, Union[int, bool]],
+    profiling_config: Dict[str, Union[int, bool, Dict]],
     yml_config: Dict[str, str], 
     training_args
 ):
@@ -303,57 +306,93 @@ def get_profiling_setup(
         os.environ["WANDB_MODE"] = "offline"
 
         # Disable preallocation of JAX
-        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-        os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+        # os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        # os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
-        # batch sizes
-        min_batch_size = profiling_config.get("min_batch_size", 1)
-        max_batch_size = profiling_config.get("max_batch_size", None)
+        # Check if we should use the custom list
+        use_custom_list = profiling_config.get("custom_list", {}).get("use_list", False)
+        
+        if use_custom_list:
+            # Use the provided list of local batch sizes
+            local_batch_size_list = profiling_config.get("custom_list", {}).get("local_batch_size_list", [])
+            max_batch_size = profiling_config.get("max_batch_size", None)
+            
+            logger.info(f"Using custom local batch size list: {local_batch_size_list}")
+            logger.info(f"Constraints: Divisible by num_devices ({num_devices}), divisible by num_micro_batches ({num_micro_batches}), max_total_bs ({max_batch_size})")
+            
+            for local_bs in local_batch_size_list:
+                total_bs = local_bs * num_devices
+                
+                # 1. Check max batch size limit
+                if max_batch_size is not None and total_bs > max_batch_size:
+                    logger.info(f"Total batch size {total_bs} from local batch size {local_bs} exceeds max {max_batch_size}. Skipping.")
+                    continue
+                
+                # 2. Check divisibility by number of devices
+                if total_bs % num_devices != 0:
+                    logger.debug(f"Skipping batch size {total_bs}: Not divisible by num_devices ({num_devices})")
+                    continue
+                
+                # 3. Check divisibility by num_micro_batches
+                if num_micro_batches > 0 and total_bs % num_micro_batches != 0:
+                    logger.debug(f"Skipping batch size {total_bs}: Not divisible by num_micro_batches ({num_micro_batches})")
+                    continue
+                elif num_micro_batches <= 0:
+                    logger.warning("num_micro_batches is <= 0. Skipping divisibility check.")
+                
+                # If all checks pass, add it to the list
+                logger.info(f"Found valid profile batch size: {total_bs}")
+                batch_sizes_to_run.append(total_bs)
+        else:
+            # Use the original power-of-2 search approach
+            # batch sizes
+            min_batch_size = profiling_config.get("min_batch_size", 1)
+            max_batch_size = profiling_config.get("max_batch_size", None)
 
-        if min_batch_size <= 0:
-            logger.warning("Minimum batch size should be greater than 0. Setting it to 1.")
-            min_batch_size = 1
+            if min_batch_size <= 0:
+                logger.warning("Minimum batch size should be greater than 0. Setting it to 1.")
+                min_batch_size = 1
 
-        current_bs = 1
-        while current_bs < min_batch_size:
-            current_bs *= 2
-
-        logger.info(f"Starting search for profile batch sizes from {current_bs}")
-        logger.info(f"Constraints: Divisible by num_devices ({num_devices}), divisible by num_micro_batches ({num_micro_batches}), max_total_bs ({max_batch_size})")
-
-        while True:
-            # 1. Check max batch size limit
-            if max_batch_size is not None and current_bs > max_batch_size:
-                logger.info(f"Current batch size {current_bs} exceeds max {max_batch_size}. Stopping search.")
-                break
-
-            # 2. Check divisibility by number of devices
-            if current_bs % num_devices != 0:
-                logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_devices ({num_devices})")
+            current_bs = 1
+            while current_bs < min_batch_size:
                 current_bs *= 2
-                continue
 
-            # 3. Check divisibility by num_micro_batches
-            # The total batch size per step must be divisible by num_micro_batches
-            # for gradient accumulation logic.
-            if num_micro_batches > 0 and current_bs % num_micro_batches != 0:
-                 logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_micro_batches ({num_micro_batches})")
-                 current_bs *= 2
-                 continue
-            elif num_micro_batches <= 0:
-                 logger.warning("num_micro_batches is <= 0. Skipping divisibility check.")
+            logger.info(f"Starting search for profile batch sizes from {current_bs}")
+            logger.info(f"Constraints: Divisible by num_devices ({num_devices}), divisible by num_micro_batches ({num_micro_batches}), max_total_bs ({max_batch_size})")
 
-            # If all checks pass, add it to the list
-            logger.info(f"Found valid profile batch size: {current_bs}")
-            batch_sizes_to_run.append(current_bs)
+            while True:
+                # 1. Check max batch size limit
+                if max_batch_size is not None and current_bs > max_batch_size:
+                    logger.info(f"Current batch size {current_bs} exceeds max {max_batch_size}. Stopping search.")
+                    break
 
-            # Move to the next power of 2
-            current_bs *= 2
+                # 2. Check divisibility by number of devices
+                if current_bs % num_devices != 0:
+                    logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_devices ({num_devices})")
+                    current_bs *= 2
+                    continue
 
-            # Safety break for extremely large numbers if max_total_bs is None
-            if current_bs > 2 ** 20: # Arbitrary large limit (~1 million)
-                logger.warning("Reached very large batch size during profiling search without max_total_bs. Stopping.")
-                break
+                # 3. Check divisibility by num_micro_batches
+                # The total batch size per step must be divisible by num_micro_batches
+                # for gradient accumulation logic.
+                if num_micro_batches > 0 and current_bs % num_micro_batches != 0:
+                     logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_micro_batches ({num_micro_batches})")
+                     current_bs *= 2
+                     continue
+                elif num_micro_batches <= 0:
+                     logger.warning("num_micro_batches is <= 0. Skipping divisibility check.")
+
+                # If all checks pass, add it to the list
+                logger.info(f"Found valid profile batch size: {current_bs}")
+                batch_sizes_to_run.append(current_bs)
+
+                # Move to the next power of 2
+                current_bs *= 2
+
+                # Safety break for extremely large numbers if max_total_bs is None
+                if current_bs > 2 ** 20: # Arbitrary large limit (~1 million)
+                    logger.warning("Reached very large batch size during profiling search without max_total_bs. Stopping.")
+                    break
 
         if not batch_sizes_to_run:
             logger.error("No valid batch sizes found for profiling based on the constraints!")
@@ -378,19 +417,23 @@ def run_profile(
     yml_config: Dict[str, str],
 ):
     print("Running profiling...")
-    executable = p_train_step.get_executable(state, batch, variables_dict)
-    executable.sync()
 
     # warmup
     for _ in range(yml_config.profiling.warmup_steps):
-        cost_dummy = executable.profile_with_dummy_inputs()
-
+        state, train_metric = p_train_step(state, batch, variables_dict)
+    p_train_step.get_last_executable().sync()
     avg_cost = []
+    time_start = time.time()
     for _ in range(yml_config.profiling.profile_steps):
-        cost_dummy = executable.profile_with_dummy_inputs()
-        avg_cost.append(cost_dummy)
+        state, train_metric = p_train_step(state, batch, variables_dict)
+    p_train_step.get_last_executable().sync()
+    avg_cost = (time.time() - time_start) / yml_config.profiling.profile_steps
     avg_cost = np.mean(np.array(avg_cost))
-    mem_gb = executable.get_total_allocation_size() / (1024**3)
+    if isinstance(p_train_step.method, alpa.PipeshardParallel):
+        mem_gb = p_train_step.get_last_executable().get_stage_allocation_size()
+        mem_gb = sum(mem_gb) / (1024**3)
+    else:
+        mem_gb = p_train_step.get_last_executable().get_total_allocation_size() / (1024**3)
     logger.info(f"Average cost: {avg_cost}")
     logger.info(f"Memory usage: {mem_gb} GB")
 
@@ -422,10 +465,12 @@ def run_profile(
         import gc
         gc.collect()
 
+    return state
+
 def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config):
     current_local_batch_size = batch_sizes_to_run.pop(0)
     for i_run in range(yml_config.profiling.get("repeat_profile_steps", 1)):
-        run_profile(
+        state = run_profile(
             p_train_step=p_train_step,
             state=state,
             batch=batch,
@@ -443,3 +488,4 @@ def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, var
         alpa.shutdown()
         sys.exit(1)
     pollux_agent.force_dataloader_localbatchsize = batch_sizes_to_run[0]
+    return state
