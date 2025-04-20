@@ -92,7 +92,7 @@ dynp_profiling:
   save_dir: ./dynp_profiling
 
 profiling:
-  enabled: true
+  enabled: false
   min_batch_size: 1
   max_batch_size: null
   warmup_steps: 10

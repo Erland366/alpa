@@ -374,7 +374,7 @@ def run_profile(
     # CSV
     i_run: int,
     epoch: int,
-    current_total_batch_size: int,
+    current_local_batch_size: int,
     yml_config: Dict[str, str],
 ):
     print("Running profiling...")
@@ -400,7 +400,7 @@ def run_profile(
     filename = (
         f"csv_results_{nodes}"
         f"nodes_{devices_per_node}"
-        f"gpus_{yml_config.dataloader.train.init_local_batch_size}"
+        f"gpus_{yml_config.training.parallel_method.num_micro_batches}"
         f"microbatches.csv"
     )
     os.makedirs(yml_config.profiling.csv_dir, exist_ok=True)
@@ -410,7 +410,7 @@ def run_profile(
         with open(csv_save_path, "a") as f:
             if os.stat(csv_save_path).st_size == 0:
                 f.write("run,epoch,batch_size,avg_cost,mem_gb,model_name,strategy,dp,pp,tp\n")
-            f.write(f"{i_run},{epoch},{current_total_batch_size},{avg_cost},{mem_gb},"
+            f.write(f"{i_run},{epoch},{current_local_batch_size},{avg_cost},{mem_gb},"
                     f"{yml_config.model_name_or_path},{yml_config.training.parallel_method.method},"
                     f"{yml_config.training.parallel_method.parameters._3D.data_parallel},{yml_config.training.parallel_method.parameters._3D.operator_parallel},"
                     f"{yml_config.training.parallel_method.parameters._3D.operator_parallel}\n")
@@ -423,7 +423,7 @@ def run_profile(
         gc.collect()
 
 def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config):
-    current_total_batch_size = batch_sizes_to_run.pop(0)
+    current_local_batch_size = batch_sizes_to_run.pop(0)
     for i_run in range(yml_config.profiling.get("repeat_profile_steps", 1)):
         run_profile(
             p_train_step=p_train_step,
@@ -432,10 +432,14 @@ def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, var
             variables_dict=variables_dict,
             i_run=i_run,
             epoch=epoch,
-            current_total_batch_size=current_total_batch_size,
+            current_local_batch_size=current_local_batch_size,
             yml_config=yml_config
         )
     
     p_train_step.get_last_executable().sync()
     pollux_agent.update_dataloader_batchsize = True
-    pollux_agent.force_dataloader_localbatchsize = current_total_batch_size
+    if len(batch_sizes_to_run) == 0:
+        print(f"Finished profiling.")
+        alpa.shutdown()
+        sys.exit(1)
+    pollux_agent.force_dataloader_localbatchsize = batch_sizes_to_run[0]
