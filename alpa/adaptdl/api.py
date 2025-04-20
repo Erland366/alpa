@@ -419,8 +419,13 @@ def run_profile(
     print("Running profiling...")
 
     # warmup
+    compil_time = None
+    compil_start = time.time()
     for _ in range(yml_config.profiling.warmup_steps):
         state, train_metric = p_train_step(state, batch, variables_dict)
+        if compil_time is None:
+            p_train_step.get_last_executable().sync()
+            compil_time = time.time() - compil_start
     p_train_step.get_last_executable().sync()
     avg_cost = []
     time_start = time.time()
@@ -452,8 +457,8 @@ def run_profile(
     if jax.process_index() == 0:
         with open(csv_save_path, "a") as f:
             if os.stat(csv_save_path).st_size == 0:
-                f.write("run,epoch,batch_size,avg_cost,mem_gb,model_name,strategy,dp,pp,tp\n")
-            f.write(f"{i_run},{epoch},{current_local_batch_size},{avg_cost},{mem_gb},"
+                f.write("run,epoch,batch_size,avg_cost,mem_gb,compil_time,model_name,strategy,dp,pp,tp\n")
+            f.write(f"{i_run},{epoch},{current_local_batch_size},{avg_cost},{mem_gb},{compil_time},"
                     f"{yml_config.model_name_or_path},{yml_config.training.parallel_method.method},"
                     f"{yml_config.training.parallel_method.parameters._3D.data_parallel},{yml_config.training.parallel_method.parameters._3D.operator_parallel},"
                     f"{yml_config.training.parallel_method.parameters._3D.operator_parallel}\n")
