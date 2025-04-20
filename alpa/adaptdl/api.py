@@ -324,8 +324,8 @@ def get_profiling_setup(
                 total_bs = local_bs * num_devices
                 
                 # 1. Check max batch size limit
-                if max_batch_size is not None and total_bs > max_batch_size:
-                    logger.info(f"Total batch size {total_bs} from local batch size {local_bs} exceeds max {max_batch_size}. Skipping.")
+                if max_batch_size is not None and total_bs > (max_batch_size * num_devices):
+                    logger.info(f"Total batch size {total_bs} from local batch size {local_bs} exceeds max {max_batch_size * num_devices}. Skipping.")
                     continue
                 
                 # 2. Check divisibility by number of devices
@@ -341,8 +341,8 @@ def get_profiling_setup(
                     logger.warning("num_micro_batches is <= 0. Skipping divisibility check.")
                 
                 # If all checks pass, add it to the list
-                logger.info(f"Found valid profile batch size: {total_bs}")
-                batch_sizes_to_run.append(total_bs)
+                logger.info(f"Found valid profile total batch size: {total_bs}, local batch size: {local_bs}")
+                batch_sizes_to_run.append(local_bs)
         else:
             # Use the original power-of-2 search approach
             # batch sizes
@@ -353,44 +353,44 @@ def get_profiling_setup(
                 logger.warning("Minimum batch size should be greater than 0. Setting it to 1.")
                 min_batch_size = 1
 
-            current_bs = 1
-            while current_bs < min_batch_size:
-                current_bs *= 2
+            total_bs = 1
+            while total_bs < (min_batch_size * num_devices):
+                total_bs *= 2
 
-            logger.info(f"Starting search for profile batch sizes from {current_bs}")
+            logger.info(f"Starting search for profile batch sizes from {total_bs}")
             logger.info(f"Constraints: Divisible by num_devices ({num_devices}), divisible by num_micro_batches ({num_micro_batches}), max_total_bs ({max_batch_size})")
 
             while True:
                 # 1. Check max batch size limit
-                if max_batch_size is not None and current_bs > max_batch_size:
-                    logger.info(f"Current batch size {current_bs} exceeds max {max_batch_size}. Stopping search.")
+                if max_batch_size is not None and total_bs > (max_batch_size * num_devices):
+                    logger.info(f"Current batch size {total_bs} exceeds max {max_batch_size * num_devices}. Stopping search.")
                     break
 
                 # 2. Check divisibility by number of devices
-                if current_bs % num_devices != 0:
-                    logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_devices ({num_devices})")
-                    current_bs *= 2
+                if total_bs % num_devices != 0:
+                    logger.debug(f"Skipping batch size {total_bs}: Not divisible by num_devices ({num_devices})")
+                    total_bs *= 2
                     continue
 
                 # 3. Check divisibility by num_micro_batches
                 # The total batch size per step must be divisible by num_micro_batches
                 # for gradient accumulation logic.
-                if num_micro_batches > 0 and current_bs % num_micro_batches != 0:
-                     logger.debug(f"Skipping batch size {current_bs}: Not divisible by num_micro_batches ({num_micro_batches})")
-                     current_bs *= 2
+                if num_micro_batches > 0 and total_bs % num_micro_batches != 0:
+                     logger.debug(f"Skipping batch size {total_bs}: Not divisible by num_micro_batches ({num_micro_batches})")
+                     total_bs *= 2
                      continue
                 elif num_micro_batches <= 0:
                      logger.warning("num_micro_batches is <= 0. Skipping divisibility check.")
 
                 # If all checks pass, add it to the list
-                logger.info(f"Found valid profile batch size: {current_bs}")
-                batch_sizes_to_run.append(current_bs)
+                logger.info(f"Found valid profile batch size: {total_bs}")
+                batch_sizes_to_run.append(int(total_bs / num_devices))
 
                 # Move to the next power of 2
-                current_bs *= 2
+                total_bs *= 2
 
                 # Safety break for extremely large numbers if max_total_bs is None
-                if current_bs > 2 ** 20: # Arbitrary large limit (~1 million)
+                if total_bs > 2 ** 20: # Arbitrary large limit (~1 million)
                     logger.warning("Reached very large batch size during profiling search without max_total_bs. Stopping.")
                     break
 
