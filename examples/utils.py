@@ -13,10 +13,11 @@ import logging
 import typing
 import tensorflow as tf
 import transformers
+import numpy as np
 from datasets import Dataset
 
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Callable, Union, Dict, cast, Protocol, Literal
+from typing import Optional, Callable, Union, Dict, cast, Protocol, Literal, Any
 from enum import Enum
 
 import optax
@@ -62,6 +63,9 @@ __all__ = [
     "monkeypatch_rope_llama",
     "monkeypatch_rope_gemma",
     "parse_args",
+    "get_profiling_setup",
+    "reset_alpa_state",
+    "run_profile"
 ]
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -866,6 +870,11 @@ def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int,
     for batch in tf_dataset:
         batch = {k: v._numpy() for k, v in batch.items()}
         yield batch
+
+def reset_alpa_state():
+    alpa.adaptdl.epoch._EPOCH_STATE = None # Reset the internal state
+    alpa.adaptdl.checkpoint._STATES_TO_NAMES = {} # Reset the checkpoint state
+    alpa.adaptdl.checkpoint._NAMES_TO_STATES = {} # Reset the checkpoint state
 
 def monkeypatch_rope_gemma():
     exec("from transformers.models.gemma import modeling_flax_gemma", globals())

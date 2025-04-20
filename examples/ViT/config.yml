@@ -70,7 +70,7 @@ training:
     enabled: true
     type: sqrt # linear, sqrt
   parallel_method:
-    method: DynP # DataParallel, ShardParallel, PipeshardParallel, 3D, DynP, DynPsingle
+    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D, DynP, DynPsingle
     parameters:
       DataParallel:
       ShardParallel:
@@ -90,6 +90,15 @@ training:
 dynp_profiling:
   enabled: false
   save_dir: ./dynp_profiling
+
+profiling:
+  enabled: true
+  min_batch_size: 1
+  max_batch_size: null
+  warmup_steps: 10
+  profile_steps: 10
+  repeat_profile_steps: 3
+  csv_dir: ./profiling_results
 
 evaluation:
   enabled: false
