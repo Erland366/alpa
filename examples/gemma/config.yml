@@ -14,7 +14,7 @@ cluster_config:
   num_devices_per_node: null
   namespace: null # alpa_default_space by default
 
-model_name_or_path: google/gemma-1.1-2b-it
+model_name_or_path: Erland/gemma-7b-JAX # Erland/gemma-2b-JAX
 
 data:
   dataset_name: wikitext
