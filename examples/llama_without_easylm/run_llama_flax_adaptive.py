@@ -71,7 +71,19 @@ from alpa.adaptdl.gns_util import compute_gradient_noise_scale, get_mean_leaves
 from alpa.adaptdl.dataloader import current_dataloader
 from alpa.adaptdl.metrics import update_grad_params, update_progress
 from jax._src.config import flags
-from alpa.adaptdl.api import update_state_on_bs_change, create_scaled_lr_fn, reallocate_and_update_state, fix_regressors, get_scaled_learning_rate_fn, get_parallel_method, do_reallocation
+from alpa.adaptdl.api import (
+    update_state_on_bs_change,
+    create_scaled_lr_fn,
+    reallocate_and_update_state,
+    fix_regressors,
+    get_scaled_learning_rate_fn,
+    get_parallel_method,
+    do_reallocation,
+    dynp_profiling,
+    get_profiling_setup,
+    run_profile,
+    execute_profiling_trials
+)
 import alpa.adaptdl.dataloader
 import alpa.adaptdl.epoch
 from alpa.adaptdl.scaling_rules import ScalingRuleBase, LinearScale, SqrtScale
@@ -624,6 +636,13 @@ def main():
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
         )
+        
+    batch_sizes_to_run = get_profiling_setup(
+        profiling_enabled=yml_config.profiling.get("enabled", False),
+        profiling_config=yml_config.get("profiling", {}),
+        yml_config=yml_config,
+        training_args=training_args,
+    )
 
     run = wandb.init(
         # Set the project where this run will be logged
@@ -775,7 +794,12 @@ def main():
     rng, dropout_rng = jax.random.split(rng)
 
     # Store some constant
-    num_epochs = int(training_args.num_train_epochs)
+    if not yml_config.profiling.get("enabled", False):
+        num_epochs = int(training_args.num_train_epochs)                                
+    else:
+        num_epochs = 1
+        pollux_agent.update_dataloader_batchsize = True
+        pollux_agent.force_dataloader_localbatchsize = batch_sizes_to_run[0]s
     train_batch_size = int(training_args.per_device_train_batch_size) * num_devices
     eval_batch_size = int(training_args.per_device_eval_batch_size) * num_devices
     steps_per_epoch = len(train_dataset) // train_batch_size
@@ -1002,6 +1026,10 @@ def main():
             if pollux_agent.reallocation_approaching:
                 state, variables_dict = do_reallocation(yml_config, p_train_step, variables_dict, gns, state)
                 continue # TODO: doing this temporarily to force dataloader batch size change, discards current batch size
+            
+            if yml_config.profiling.get("enabled", False):
+                state = execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config)
+                continue
 
             state, train_metric = p_train_step(state, batch, variables_dict)
             train_metrics.append(train_metric)
@@ -1009,6 +1037,9 @@ def main():
             if yml_config.training.gns_enabled:
                 gns.update_state(state, train_metric)
                 update_grad_params(train_metric)
+                
+            if yml_config.dynp_profiling.enabled:
+                dynp_profiling(yml_config)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
