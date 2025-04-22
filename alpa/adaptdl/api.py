@@ -421,6 +421,7 @@ def run_profile(
     epoch: int,
     current_local_batch_size: int,
     yml_config: Dict[str, str],
+    rng=None
 ):
     print("Running profiling...")
 
@@ -428,7 +429,11 @@ def run_profile(
     compil_time = None
     compil_start = time.time()
     for _ in range(yml_config.profiling.warmup_steps):
-        state, train_metric = p_train_step(state, batch, variables_dict)
+        if rng:
+            dropout_rng, rng = jax.random.split(rng)
+            state, train_metric = p_train_step(state, batch, dropout_rng, variables_dict)
+        else:
+            state, train_metric = p_train_step(state, batch, variables_dict)
         if compil_time is None:
             p_train_step.get_last_executable().sync()
             compil_time = time.time() - compil_start
@@ -436,7 +441,11 @@ def run_profile(
     avg_cost = []
     time_start = time.time()
     for _ in range(yml_config.profiling.profile_steps):
-        state, train_metric = p_train_step(state, batch, variables_dict)
+        if rng:
+            dropout_rng, rng = jax.random.split(rng)
+            state, train_metric = p_train_step(state, batch, dropout_rng, variables_dict)
+        else:
+            state, train_metric = p_train_step(state, batch, variables_dict)
     p_train_step.get_last_executable().sync()
     avg_cost = (time.time() - time_start) / yml_config.profiling.profile_steps
     avg_cost = np.mean(np.array(avg_cost))
@@ -478,7 +487,7 @@ def run_profile(
 
     return state
 
-def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config):
+def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, variables_dict, epoch, yml_config, rng=None):
     current_local_batch_size = batch_sizes_to_run.pop(0)
     for i_run in range(yml_config.profiling.get("repeat_profile_steps", 1)):
         state = run_profile(
@@ -489,7 +498,8 @@ def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, var
             i_run=i_run,
             epoch=epoch,
             current_local_batch_size=current_local_batch_size,
-            yml_config=yml_config
+            yml_config=yml_config,
+            rng=rng
         )
     
     p_train_step.get_last_executable().sync()
