@@ -144,16 +144,16 @@ class TrainingArguments:
         default=yml_config.dataloader.eval.local_batch_size, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
     learning_rate: float = field(default=yml_config.training.learning_rate, metadata={"help": "The initial learning rate for AdamW."})
-    weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
-    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
-    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
+    weight_decay: float = field(default=yml_config.training.weight_decay, metadata={"help": "Weight decay for AdamW if we apply some."})
+    adam_beta1: float = field(default=yml_config.training.adam_beta1, metadata={"help": "Beta1 for AdamW optimizer"})
+    adam_beta2: float = field(default=yml_config.training.adam_beta2, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     adafactor: bool = field(default=False, metadata={"help": "Whether or not to replace AdamW by Adafactor."})
     num_train_epochs: float = field(default=yml_config.training.num_train_epochs, metadata={"help": "Total number of training epochs to perform."})
-    warmup_steps: int = field(default=0, metadata={"help": "Linear warmup over warmup_steps."})
-    logging_steps: int = field(default=500, metadata={"help": "Log every X updates steps."})
-    save_steps: int = field(default=500, metadata={"help": "Save checkpoint every X updates steps."})
-    eval_steps: int = field(default=None, metadata={"help": "Run an evaluation every X steps."})
+    warmup_steps: int = field(default=yml_config.training.warmup_steps, metadata={"help": "Linear warmup over warmup_steps."})
+    logging_steps: int = field(default=yml_config.training.logging_steps, metadata={"help": "Log every X updates steps."})
+    save_steps: int = field(default=yml_config.training.save_steps, metadata={"help": "Save checkpoint every X updates steps."})
+    eval_steps: int = field(default=yml_config.training.eval_steps, metadata={"help": "Run an evaluation every X steps."})
     seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
     push_to_hub: bool = field(
         default=False, metadata={"help": "Whether or not to upload the trained model to the model hub after training."}
@@ -167,7 +167,7 @@ class TrainingArguments:
     )
     count: int = field(default=2, metadata={"help": "The number of stored grads."})
     scale: int = field(default=1, metadata={"help": "Scale"})
-    smoothing: float = field(default=0.999, metadata={"help": "Smoothing parameter for PGNS"})
+    smoothing: float = field(default=yml_config.training.smoothing, metadata={"help": "Smoothing parameter for PGNS"})
 
     def __post_init__(self):
         if self.output_dir is not None:
