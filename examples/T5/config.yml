@@ -69,7 +69,7 @@ training:
   adam_beta1: 0.9
   adam_beta2: 0.98
   weight_decay: 0.01
-  smoothing: 0.9
+  smoothing: 0.999
   gns_enabled: true
   logging_steps: 50
   save_steps: 32
@@ -83,13 +83,33 @@ training:
       DataParallel:
       ShardParallel:
       PipeshardParallel:
-        stage_option: uniform # uniform, auto
+        stage_option: auto # uniform, auto
         # num stages?
       _3D:
         data_parallel: -1
         operator_parallel: 1
         pipeline_parallel: 1
+      DynP:
+        dynp_manualstages_yml_path: dynp_strategies.yml
+      DynPsingle:
+        manualstage_yml_path: dynp_profiling/dynp_results_1nodes_1gpus_64localbsz_1microbatches_20250417_103259.yml
     num_micro_batches: 1
+
+dynp_profiling:
+  enabled: false
+  save_dir: ./dynp_profiling
+
+profiling:
+  enabled: false
+  min_batch_size: 1
+  max_batch_size: null
+  custom_list:
+    use_list: false
+    local_batch_size_list: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+  warmup_steps: 10
+  profile_steps: 10
+  repeat_profile_steps: 3
+  csv_dir: ./profiling_results
 
 evaluation:
   enabled: false
