@@ -799,7 +799,7 @@ def main():
     else:
         num_epochs = 1
         pollux_agent.update_dataloader_batchsize = True
-        pollux_agent.force_dataloader_localbatchsize = batch_sizes_to_run[0]s
+        pollux_agent.force_dataloader_localbatchsize = batch_sizes_to_run[0]
     train_batch_size = int(training_args.per_device_train_batch_size) * num_devices
     eval_batch_size = int(training_args.per_device_eval_batch_size) * num_devices
     steps_per_epoch = len(train_dataset) // train_batch_size
