@@ -20,12 +20,12 @@ data:
   dataset_name: wikitext
   dataset_config_name: wikitext-2-raw-v1
   block_size: 1024
-  max_train_samples: 20000
+  max_train_samples: null
 
 
 paths:
   output_dir: ./output
-  cache_dir: ./cache_350m
+  cache_dir: ./cache
 
 pollux_agent:
   regression_coefficients:
