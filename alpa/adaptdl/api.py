@@ -242,9 +242,9 @@ def dynp_profiling(yml_config: AddictDict):
     if yml_config.profiling.enabled:
         alpa.shutdown()
         raise Exception("Throughput profiling should be DISABLED to collect DynP profiling results")
-    if yml_config.training.gns_enabled:
-        alpa.shutdown()
-        raise Exception("GNS should be disabled to collect DynP profiling results")
+    # if yml_config.training.gns_enabled:
+    #     alpa.shutdown()
+    #     raise Exception("GNS should be disabled to collect DynP profiling results")
     dynp_results = alpa.get_last_dp_result()
     logger.info(f"Retrieved best DynP results: {dynp_results}")
     global_cluster = alpa.get_global_cluster()
