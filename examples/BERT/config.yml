@@ -1,8 +1,8 @@
 # TODO: wandb configuration
 
 wandb:
-  mode: online # online, offline, disabled
-  project: "OPT_adaptive"
+  mode: disabled # online, offline, disabled
+  project: "BERT_adaptive"
   save_code: false
 
 scheduler:
@@ -14,7 +14,8 @@ cluster_config:
   num_devices_per_node: null
   namespace: null # alpa_default_space by default
 
-model_name_or_path: facebook/opt-350m
+model_name_or_path: google-bert/bert-base-uncased
+# model_name_or_path: google-bert/bert-large-uncased
 
 data:
   dataset_name: squad
@@ -78,7 +79,7 @@ training:
     enabled: true
     type: sqrt # linear, sqrt
   parallel_method:
-    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
+    method: PipeshardParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
     parameters:
       DataParallel:
       ShardParallel:
