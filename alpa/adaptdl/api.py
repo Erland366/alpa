@@ -14,6 +14,8 @@ import yaml
 import os
 import datetime
 import time
+import subprocess
+import threading
 
 
 logger = logging.getLogger(__name__)
@@ -429,7 +431,7 @@ def run_profile(
     compil_time = None
     compil_start = time.time()
     for _ in range(yml_config.profiling.warmup_steps):
-        if rng:
+        if rng is not None and rng.all():
             dropout_rng, rng = jax.random.split(rng)
             state, train_metric = p_train_step(state, batch, dropout_rng, variables_dict)
         else:
@@ -439,14 +441,31 @@ def run_profile(
             compil_time = time.time() - compil_start
     p_train_step.get_last_executable().sync()
     avg_cost = []
+
     time_start = time.time()
-    for _ in range(yml_config.profiling.profile_steps):
-        if rng:
-            dropout_rng, rng = jax.random.split(rng)
-            state, train_metric = p_train_step(state, batch, dropout_rng, variables_dict)
-        else:
-            state, train_metric = p_train_step(state, batch, variables_dict)
-    p_train_step.get_last_executable().sync()
+    max_result = {}  # Shared dictionary for results
+    stop_event = threading.Event() # Use an event to signal the thread to stop
+    memory_thread = threading.Thread(target=get_max_gpu_memory, args=(["utilization.gpu", "utilization.memory"], max_result, stop_event))
+    memory_thread.daemon = True # Set the thread as a daemon
+    memory_thread.start()
+
+    max_utilization = 0
+    max_memory = 0
+    try:
+        for _ in range(yml_config.profiling.profile_steps):
+            if rng is not None and rng.all():
+                dropout_rng, rng = jax.random.split(rng)
+                state, train_metric = p_train_step(state, batch, dropout_rng, variables_dict)
+            else:
+                state, train_metric = p_train_step(state, batch, variables_dict)
+            # No need to call nvsmi here anymore, the thread is doing it
+
+        p_train_step.get_last_executable().sync()
+    finally:
+        stop_event.set() # Signal the thread to stop
+        memory_thread.join() # Wait for the thread to finish
+        max_utilization = max_result.get("utilization.gpu", 0)
+        max_memory = max_result.get("utilization.memory", 0)
     avg_cost = (time.time() - time_start) / yml_config.profiling.profile_steps
     avg_cost = np.mean(np.array(avg_cost))
     if isinstance(p_train_step.method, alpa.PipeshardParallel):
@@ -472,11 +491,12 @@ def run_profile(
     if jax.process_index() == 0:
         with open(csv_save_path, "a") as f:
             if os.stat(csv_save_path).st_size == 0:
-                f.write("run,epoch,batch_size,avg_cost,mem_gb,compil_time,model_name,strategy,dp,pp,tp\n")
+                f.write("run,epoch,batch_size,avg_cost,mem_gb,compil_time,model_name,strategy,dp,pp,tp,max_memory,max_utilization\n")
             f.write(f"{i_run},{epoch},{current_local_batch_size},{avg_cost},{mem_gb},{compil_time},"
                     f"{yml_config.model_name_or_path},{yml_config.training.parallel_method.method},"
                     f"{yml_config.training.parallel_method.parameters._3D.data_parallel},{yml_config.training.parallel_method.parameters._3D.operator_parallel},"
-                    f"{yml_config.training.parallel_method.parameters._3D.operator_parallel}\n")
+                    f"{yml_config.training.parallel_method.parameters._3D.operator_parallel},"
+                    f"{max_memory},{max_utilization}\n")
 
     if avg_cost == float("inf"):
         sys.exit(1)
@@ -510,3 +530,34 @@ def execute_profiling_trials(batch_sizes_to_run, p_train_step, state, batch, var
         sys.exit(1)
     pollux_agent.force_dataloader_localbatchsize = batch_sizes_to_run[0]
     return state
+
+def _nvsmi(attrs, index=0):
+    attrs = ','.join(attrs)
+    cmd = ['nvidia-smi', '-i', f'{index}', '--query-gpu=' + attrs, '--format=csv,noheader,nounits']
+    out = subprocess.check_output(cmd)
+    ret = out.decode(sys.stdout.encoding).split(',')
+    ret = [int(x) for x in ret]
+    return ret
+
+def nvsmi(attrs):
+    devices = jax.device_count()
+    result = {}
+    for i in range(devices):
+        result_nvsmi = _nvsmi(attrs)
+        result[i] = {k: v for k, v in zip(attrs, result_nvsmi)}
+    
+    return result
+
+def get_max_gpu_memory(attrs, max_result, stop_event):
+    local_max_result = {k : 0 for k in attrs}
+    while not stop_event.is_set():
+        nvsmi_result = nvsmi([attrs] if isinstance(attrs, str) else attrs)
+        for key in nvsmi_result:
+            for inner_key, value in nvsmi_result[key].items():
+                local_max_result[inner_key] = max(local_max_result[inner_key], value)
+        time.sleep(0.1)
+    for key, value in local_max_result.items():
+        max_result[key] = max(max_result.get(key, 0), value)
+        
+
+
