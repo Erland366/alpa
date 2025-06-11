@@ -21,6 +21,7 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 import sys
+from omegaconf import OmegaConf
 
 sys.path.append(".")
 sys.path.append("..")
@@ -101,14 +102,16 @@ def parse_config_arg():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
     args, remaining = parser.parse_known_args()
-    sys.argv = [sys.argv[0]] + remaining  # Removing --config from sys.argv
-    return args.config
+    final_conf = OmegaConf.create()
+    if args.config:
+        file_based_conf = OmegaConf.load(args.config)
+        final_conf.merge_with(file_based_conf)
+    cli_conf = OmegaConf.from_dotlist(remaining)
+    final_conf.merge_with(cli_conf)
+    sys.argv = [sys.argv[0]]
+    return final_conf
 
-config_path = parse_config_arg()
-
-with open(config_path, 'r') as file:
-    yml_config = yaml.safe_load(file)
-yml_config = AddictDict(yml_config)
+yml_config = parse_config_arg()
 
 alpa.init(cluster="ray", copus_enabled=True, scheduler_address=yml_config.scheduler.address if yml_config.scheduler.enabled else None,
           num_nodes=yml_config.cluster_config.num_nodes, num_devices_per_node=yml_config.cluster_config.num_devices_per_node,

@@ -1,0 +1,54 @@
+- nodes: 1
+  devices_per_node: 1
+  config:
+    devices_per_node: 1
+    forward_stage_layer_ids:
+    - - 0
+      - 1
+    nodes: 1
+    submesh_autosharding_option_dicts:
+    - {}
+    submesh_logical_shapes:
+    - !!python/tuple
+      - 1
+      - 1
+    submesh_physical_shapes:
+    - !!python/tuple
+      - 1
+      - 1
+- nodes: 1
+  devices_per_node: 2
+  config:
+    devices_per_node: 2
+    forward_stage_layer_ids:
+    - - 0
+      - 1
+    nodes: 1
+    submesh_autosharding_option_dicts:
+    - {}
+    submesh_logical_shapes:
+    - !!python/tuple
+      - 2
+      - 1
+    submesh_physical_shapes:
+    - !!python/tuple
+      - 1
+      - 2
+- nodes: 1
+  devices_per_node: 4
+  config:
+    devices_per_node: 4
+    forward_stage_layer_ids:
+    - - 0
+      - 1
+    nodes: 1
+    submesh_autosharding_option_dicts:
+    - {}
+    submesh_logical_shapes:
+    - !!python/tuple
+      - 4
+      - 1
+    submesh_physical_shapes:
+    - !!python/tuple
+      - 1
+      - 4

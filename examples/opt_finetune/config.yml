@@ -1,7 +1,7 @@
 # TODO: wandb configuration
 
 wandb:
-  mode: online # online, offline, disabled
+  mode: disabled # online, offline, disabled
   project: "OPT_adaptive"
   save_code: false
 
@@ -10,16 +10,15 @@ scheduler:
   address: http://127.0.0.1:8000
 
 cluster_config:
-  num_nodes: null
-  num_devices_per_node: null
+  num_nodes: 1
+  num_devices_per_node: 4
   namespace: null # alpa_default_space by default
 
-model_name_or_path: facebook/opt-350m
-
+model_name_or_path: facebook/opt-6.7b
 data:
   dataset_name: wikitext
   dataset_config_name: wikitext-2-raw-v1
-  block_size: 1024
+  block_size: 512
   max_train_samples: null
 
 
@@ -51,7 +50,7 @@ dataloader:
           min_is_init_bs: true
           min: 20
           max: 78
-    init_local_batch_size: 20
+    init_local_batch_size: 1
     shuffle: true
     preprocessing_num_workers: 0
     persistent_workers: false
@@ -78,7 +77,7 @@ training:
     enabled: true
     type: sqrt # linear, sqrt
   parallel_method:
-    method: DataParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
+    method: PipeshardParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
     parameters:
       DataParallel:
       ShardParallel:
@@ -96,8 +95,8 @@ training:
     num_micro_batches: 1
 
 dynp_profiling:
-  enabled: false
-  save_dir: ./dynp_profiling
+  enabled: true
+  save_dir: ./profiling_results/profiling_results_opt_6_7B
 
 profiling:
   enabled: false
@@ -105,7 +104,7 @@ profiling:
   max_batch_size: null
   custom_list:
     use_list: false
-    local_batch_size_list: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    local_batch_size_list: [1, 2, 4]
   warmup_steps: 10
   profile_steps: 10
   repeat_profile_steps: 3

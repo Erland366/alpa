@@ -63,7 +63,6 @@ __all__ = [
     "monkeypatch_rope_llama",
     "monkeypatch_rope_gemma",
     "parse_args",
-    "get_profiling_setup",
     "reset_alpa_state",
     "run_profile"
 ]

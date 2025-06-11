@@ -1,7 +1,7 @@
 # TODO: wandb configuration
 
 wandb:
-  mode: online # online, offline, disabled
+  mode: disabled # online, offline, disabled
   project: "GEMMA_adaptive"
   save_code: false
 
@@ -10,16 +10,16 @@ scheduler:
   address: http://127.0.0.1:8000
 
 cluster_config:
-  num_nodes: null
-  num_devices_per_node: null
+  num_nodes: 1
+  num_devices_per_node: 4
   namespace: null # alpa_default_space by default
 
-model_name_or_path: Erland/gemma-7b-JAX # Erland/gemma-2b-JAX
+model_name_or_path: Erland/gemma-2b-JAX # Erland/gemma-2b-JAX
 
 data:
   dataset_name: wikitext
   dataset_config_name: wikitext-2-raw-v1
-  block_size: 1024
+  block_size: 128
   max_train_samples: null
 
 
@@ -46,7 +46,7 @@ dataloader:
       enabled: true
       autoscaler: 
         enabled: false
-        max_total_batch_size: 4
+        max_total_batch_size: 1
         local_bsz_bounds:
           min_is_init_bs: true
           min: 20
@@ -70,7 +70,7 @@ training:
   adam_beta2: 0.98
   weight_decay: 0.01
   smoothing: 0.999
-  gns_enabled: true
+  gns_enabled: false
   logging_steps: 50
   save_steps: 32
   eval_steps: 32
@@ -78,7 +78,7 @@ training:
     enabled: true
     type: sqrt # linear, sqrt
   parallel_method:
-    method: 3D # DataParallel, ShardParallel, PipeshardParallel, 3D
+    method: PipeshardParallel # DataParallel, ShardParallel, PipeshardParallel, 3D
     parameters:
       DataParallel:
       ShardParallel:
@@ -87,7 +87,7 @@ training:
         # num stages?
       _3D:
         data_parallel: -1
-        operator_parallel: 4
+        operator_parallel: 1
         pipeline_parallel: 1
       DynP:
         dynp_manualstages_yml_path: dynp_strategies.yml
@@ -96,16 +96,16 @@ training:
     num_micro_batches: 1
 
 dynp_profiling:
-  enabled: false
-  save_dir: ./dynp_profiling
+  enabled: true
+  save_dir: ./dynp_profiling/dynp_profiling_gemma_7b
 
 profiling:
   enabled: false
   min_batch_size: 1
   max_batch_size: null
   custom_list:
-    use_list: false
-    local_batch_size_list: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    use_list: true
+    local_batch_size_list: [1]
   warmup_steps: 10
   profile_steps: 10
   repeat_profile_steps: 3

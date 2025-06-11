@@ -24,6 +24,7 @@ import math
 import os
 import random
 import sys
+from omegaconf import OmegaConf
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -95,14 +96,16 @@ def parse_config_arg():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str, required=True, help="Path to the config.yml file")
     args, remaining = parser.parse_known_args()
-    sys.argv = [sys.argv[0]] + remaining  # Removing --config from sys.argv
-    return args.config
+    final_conf = OmegaConf.create()
+    if args.config:
+        file_based_conf = OmegaConf.load(args.config)
+        final_conf.merge_with(file_based_conf)
+    cli_conf = OmegaConf.from_dotlist(remaining)
+    final_conf.merge_with(cli_conf)
+    sys.argv = [sys.argv[0]]
+    return final_conf
 
-config_path = parse_config_arg()
-
-with open(config_path, 'r') as file:
-    yml_config = yaml.safe_load(file)
-yml_config = AddictDict(yml_config)
+yml_config = parse_config_arg()
 
 class QADataset(Dataset):
     def __init__(self, hf_dataset):

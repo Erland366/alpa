@@ -1,0 +1,20 @@
+devices_per_node: 2
+forward_stage_layer_ids:
+- - 0
+- - 1
+nodes: 1
+submesh_autosharding_option_dicts:
+- force_batch_dim_to_mesh_dim: 0
+- {}
+submesh_logical_shapes:
+- !!python/tuple
+  - 1
+  - 1
+- !!python/tuple
+  - 1
+  - 1
+submesh_physical_shapes:
+- &id001 !!python/tuple
+  - 1
+  - 1
+- *id001
